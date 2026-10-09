@@ -1,0 +1,22 @@
+[package]
+name = "oxydome-wallet-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JSON-RPC wire types shared by the Oxydome walletd daemon and its clients."
+
+[dependencies]
+oxydome-core.workspace = true
+oxydome-crypto.workspace = true
+oxydome-currency.workspace = true
+oxydome-net.workspace = true
+oxydome-wallet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bech32.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+oxydome-wallet.workspace = true
+proptest.workspace = true

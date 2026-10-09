@@ -1,0 +1,95 @@
+//! Async TCP server for a master node.
+//!
+//! Masters accept admission requests and liveness pings. They never store or serve block
+//! bodies, so the server deliberately handles only the messages a master is responsible for.
+
+use crate::MasterNode;
+use oxydome_net::{recv_message, send_message, Message};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use tokio::net::{TcpListener, TcpStream};
+
+/// Runs the master accept loop until the process exits.
+pub async fn run(addr: &str, node: MasterNode) -> std::io::Result<SocketAddr> {
+    let listener = TcpListener::bind(addr).await?;
+    let _local = listener.local_addr()?;
+    let shared = Arc::new(Mutex::new(node));
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move {
+            let _ = handle_connection(stream, shared).await;
+        });
+    }
+}
+
+async fn handle_connection(
+    mut stream: TcpStream,
+    node: Arc<Mutex<MasterNode>>,
+) -> std::io::Result<()> {
+    loop {
+        let msg = match recv_message(&mut stream).await {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
+        // Compute any reply synchronously so no mutex guard is held across an await point.
+        let reply: Option<Message> = match msg {
+            Message::Ping { nonce } => Some(Message::Pong { nonce }),
+            Message::AdmitRequest {
+                node: requester,
+                manifest_root,
+                manifest,
+                timestamp,
+                ..
+            } => {
+                let computed = manifest.root();
+                if computed != manifest_root {
+                    Some(Message::AdmitResponse {
+                        certificate: None,
+                        reason: Some("manifest root does not match submitted manifest".into()),
+                    })
+                } else {
+                    let result = {
+                        let mut guard = node.lock().unwrap();
+                        guard.handle_admission(requester, manifest_root, timestamp)
+                    };
+                    Some(match result {
+                        Ok(cert) => Message::AdmitResponse {
+                            certificate: Some(Box::new(cert)),
+                            reason: None,
+                        },
+                        Err(reason) => Message::AdmitResponse {
+                            certificate: None,
+                            reason: Some(reason),
+                        },
+                    })
+                }
+            }
+            // Masters serve header metadata only, never block bodies.
+            Message::GetHeaders { .. } => Some(Message::HeadersResponse { blocks: Vec::new() }),
+            // A leader asks the masters to audit a proposed block.
+            Message::Proposal { package, .. } => {
+                let result = {
+                    let guard = node.lock().unwrap();
+                    guard.audit(&package)
+                };
+                match result {
+                    Ok(attestation) => Some(Message::Attestation { attestation }),
+                    Err(e) => {
+                        eprintln!("audit failed: {e}");
+                        None
+                    }
+                }
+            }
+            // A finalized block extends the master's header chain.
+            Message::FinalizedBlock { block } => {
+                node.lock().unwrap().on_finalized(&block);
+                None
+            }
+            _ => None,
+        };
+        if let Some(reply) = reply {
+            send_message(&mut stream, &reply).await.ok();
+        }
+    }
+}

@@ -1,0 +1,276 @@
+//! Master node: software-integrity admission, epoch governance, header-only block auditing
+//! and the periodic deep-audit coordination.
+//!
+//! Masters do **not** store block bodies or the UTXO set. They store the block header chain
+//! (which commits to the state root and window statistics), the admission registry and the
+//! governance set, and audit each proposed block through Merkle proofs supplied by the
+//! proposer.
+
+pub mod server;
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use oxydome_audit::{
+    audit_root, header_audit, AuditAttestation, AuditError, AuditPackage, AuditReport,
+    HeaderAuditContext,
+};
+use oxydome_consensus::{masters_root, AdmissionCertificate, EpochTransition, MasterProposal};
+use oxydome_core::{
+    Amount, Block, BlockHeader, ChainParams, GenesisConfig, GovernanceSet, Hash, PublicKey,
+    ValueIndex,
+};
+use oxydome_crypto::KeyPair;
+use oxydome_currency::WindowStats;
+
+/// The admission registry: which software is approved, which nodes are admitted or revoked.
+#[derive(Debug, Clone, Default)]
+pub struct MasterRegistry {
+    /// Approved `CodeManifest` roots.
+    pub approved_manifests: BTreeSet<Hash>,
+    /// Issued admission certificates by node key.
+    pub certificates: BTreeMap<PublicKey, AdmissionCertificate>,
+    /// Revoked node keys.
+    pub revoked: BTreeSet<PublicKey>,
+}
+
+impl MasterRegistry {
+    pub fn approve_manifest(&mut self, root: Hash) {
+        self.approved_manifests.insert(root);
+    }
+
+    pub fn is_manifest_approved(&self, root: &Hash) -> bool {
+        self.approved_manifests.contains(root)
+    }
+
+    pub fn revoke(&mut self, node: &PublicKey) {
+        self.revoked.insert(*node);
+    }
+}
+
+/// The master's lightweight view of the chain: headers plus accrued window statistics.
+#[derive(Debug, Clone)]
+pub struct HeaderChain {
+    pub headers: Vec<BlockHeader>,
+    stats: VecDeque<WindowStats>,
+    pub supply: Amount,
+    pub value_index: ValueIndex,
+    pub generation: u64,
+    pub epoch: u64,
+    pub genesis_supply: Amount,
+    pub epoch_minted: Amount,
+    pub epoch_burned: Amount,
+    pub epoch_withdrawn: Amount,
+}
+
+impl HeaderChain {
+    pub fn from_genesis(genesis: &Block, params: &ChainParams) -> Self {
+        Self {
+            headers: vec![genesis.header.clone()],
+            stats: VecDeque::new(),
+            supply: genesis.header.supply,
+            value_index: genesis.header.value_index,
+            generation: genesis.header.generation,
+            epoch: genesis.header.epoch,
+            genesis_supply: params.genesis_supply,
+            epoch_minted: 0,
+            epoch_burned: 0,
+            epoch_withdrawn: 0,
+        }
+    }
+
+    pub fn head(&self) -> &BlockHeader {
+        self.headers.last().expect("chain always has genesis")
+    }
+
+    pub fn prev_state_root(&self) -> Hash {
+        self.head().state_root
+    }
+
+    /// Sum of the last `block_window - 1` blocks' statistics (the current block is added by
+    /// the audit function).
+    pub fn previous_window(&self, params: &ChainParams) -> WindowStats {
+        let take = params.block_window.saturating_sub(1).max(1) as usize;
+        let mut acc = WindowStats::default();
+        for s in self.stats.iter().rev().take(take) {
+            acc.volume = acc.volume.saturating_add(s.volume);
+            acc.tx_count = acc.tx_count.saturating_add(s.tx_count);
+            acc.exit_amount = acc.exit_amount.saturating_add(s.exit_amount);
+        }
+        acc
+    }
+
+    /// Records a finalized block header.
+    pub fn append(&mut self, block: &Block, params: &ChainParams) {
+        if block.header.epoch != self.epoch {
+            self.epoch = block.header.epoch;
+            self.epoch_minted = 0;
+            self.epoch_burned = 0;
+            self.epoch_withdrawn = 0;
+        }
+        self.stats.push_back(WindowStats {
+            volume: block.header.volume,
+            tx_count: block.header.tx_count,
+            exit_amount: block.header.exit_amount,
+        });
+        let w = params.block_window.max(1) as usize;
+        while self.stats.len() > w {
+            self.stats.pop_front();
+        }
+        // Accrue governance counters from the operations carried in the block.
+        for op in &block.operations {
+            match op {
+                oxydome_core::Operation::Mint(m) => {
+                    self.epoch_minted = self.epoch_minted.saturating_add(m.amount)
+                }
+                oxydome_core::Operation::Burn(b) => {
+                    self.epoch_burned = self.epoch_burned.saturating_add(b.amount)
+                }
+                oxydome_core::Operation::Withdraw(w) => {
+                    self.epoch_withdrawn = self.epoch_withdrawn.saturating_add(w.amount)
+                }
+                oxydome_core::Operation::Rewards(_) => {}
+            }
+        }
+        self.supply = block.header.supply;
+        self.value_index = block.header.value_index;
+        self.generation = block.header.generation;
+        self.headers.push(block.header.clone());
+    }
+}
+
+/// A running master node.
+#[derive(Debug)]
+pub struct MasterNode {
+    pub key: KeyPair,
+    pub gov: GovernanceSet,
+    pub params: ChainParams,
+    pub epoch: u64,
+    pub registry: MasterRegistry,
+    pub chain: HeaderChain,
+}
+
+impl MasterNode {
+    /// Creates a master from genesis configuration. The genesis block must be the one built by
+    /// [`oxydome_state::ChainState::genesis`] from the same config.
+    pub fn new(key: KeyPair, gov: GovernanceSet, params: ChainParams, genesis: &Block) -> Self {
+        Self {
+            key,
+            gov,
+            params: params.clone(),
+            epoch: genesis.header.epoch,
+            registry: MasterRegistry::default(),
+            chain: HeaderChain::from_genesis(genesis, &params),
+        }
+    }
+
+    pub fn public(&self) -> PublicKey {
+        self.key.public()
+    }
+
+    pub fn masters_root(&self) -> Hash {
+        masters_root(&self.gov.masters)
+    }
+
+    /// Handles an admission request. Returns a certificate when the manifest is approved and
+    /// the node is not revoked.
+    pub fn handle_admission(
+        &mut self,
+        node: PublicKey,
+        manifest_root: Hash,
+        now: u64,
+    ) -> Result<AdmissionCertificate, String> {
+        if self.registry.revoked.contains(&node) {
+            return Err("node is revoked".into());
+        }
+        if !self.registry.is_manifest_approved(&manifest_root) {
+            return Err("software manifest is not approved".into());
+        }
+        let cert = AdmissionCertificate::issue(
+            &self.key,
+            node,
+            manifest_root,
+            self.epoch,
+            now,
+            now + 86_400,
+        );
+        self.registry.certificates.insert(node, cert.clone());
+        Ok(cert)
+    }
+
+    /// Audits a proposed block and returns the master's signed attestation.
+    pub fn audit(&self, package: &AuditPackage) -> Result<AuditAttestation, AuditError> {
+        let epoch_changed = package.block.header.epoch != self.chain.epoch;
+        let ctx = HeaderAuditContext {
+            pre_state_root: self.chain.prev_state_root(),
+            prev_supply: self.chain.supply,
+            prev_value_index: self.chain.value_index,
+            prev_generation: self.chain.generation,
+            previous_window: self.chain.previous_window(&self.params),
+            genesis_supply: self.chain.genesis_supply,
+            epoch_minted: if epoch_changed {
+                0
+            } else {
+                self.chain.epoch_minted
+            },
+            epoch_burned: if epoch_changed {
+                0
+            } else {
+                self.chain.epoch_burned
+            },
+            epoch_withdrawn: if epoch_changed {
+                0
+            } else {
+                self.chain.epoch_withdrawn
+            },
+            gov: &self.gov,
+            params: &self.params,
+        };
+        let report: AuditReport = header_audit(&ctx, package)?;
+        Ok(AuditAttestation::sign(&report, &self.key))
+    }
+
+    /// Records a finalized block (header only).
+    pub fn on_finalized(&mut self, block: &Block) {
+        self.chain.append(block, &self.params);
+    }
+
+    /// Co-signs an epoch transition to change the master set.
+    pub fn sign_transition(&self, transition: &mut EpochTransition) {
+        transition.add_master_signature(&self.key);
+    }
+
+    /// Applies an epoch transition if it is validly co-signed.
+    pub fn apply_transition(&mut self, transition: &EpochTransition) -> Result<(), String> {
+        if !transition.is_valid(&self.gov, &self.params) {
+            return Err("epoch transition lacks master super-majority".into());
+        }
+        self.gov.masters = transition.masters.clone();
+        self.epoch = transition.epoch;
+        Ok(())
+    }
+
+    /// Returns the admission registry's approved manifests.
+    pub fn approved_manifests(&self) -> Vec<Hash> {
+        self.registry.approved_manifests.iter().copied().collect()
+    }
+
+    /// Verifies a node's certificate against the current policy.
+    pub fn verify_certificate(&self, cert: &AdmissionCertificate, now: u64) -> bool {
+        let approved: Vec<Hash> = self.approved_manifests();
+        cert.is_valid(&self.gov, &approved, now) && !self.registry.revoked.contains(&cert.node)
+    }
+
+    /// The audit root for logging/comparison.
+    pub fn audit_root_of(package: &AuditPackage) -> Hash {
+        audit_root(package)
+    }
+}
+
+/// Builds a genesis-derived master set from a config.
+pub fn genesis_master(key: KeyPair, config: &GenesisConfig, genesis: &Block) -> MasterNode {
+    let gov = GovernanceSet::new(config.masters.clone(), config.nodes.clone());
+    MasterNode::new(key, gov, config.params.clone(), genesis)
+}
+
+/// Convenience alias for [`MasterProposal`] re-export.
+pub type Proposal = MasterProposal;

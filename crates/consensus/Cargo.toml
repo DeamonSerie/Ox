@@ -1,0 +1,16 @@
+[package]
+name = "oxydome-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxydome-core.workspace = true
+oxydome-crypto.workspace = true
+oxydome-currency.workspace = true
+oxydome-state.workspace = true
+oxydome-treasury.workspace = true
+oxydome-rewards.workspace = true
+oxydome-audit.workspace = true
+serde.workspace = true
+thiserror.workspace = true

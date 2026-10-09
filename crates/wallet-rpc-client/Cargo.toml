@@ -1,0 +1,19 @@
+[package]
+name = "oxydome-wallet-rpc-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP and WebSocket client for the Oxydome walletd JSON-RPC service."
+
+[dependencies]
+oxydome-core.workspace = true
+oxydome-crypto.workspace = true
+oxydome-wallet-rpc.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+anyhow.workspace = true

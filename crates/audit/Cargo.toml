@@ -1,0 +1,13 @@
+[package]
+name = "oxydome-audit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxydome-core.workspace = true
+oxydome-crypto.workspace = true
+oxydome-state.workspace = true
+oxydome-currency.workspace = true
+serde.workspace = true
+thiserror.workspace = true

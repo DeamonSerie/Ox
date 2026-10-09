@@ -1,0 +1,19 @@
+[package]
+name = "oxydome-master"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxydome-core.workspace = true
+oxydome-crypto.workspace = true
+oxydome-currency.workspace = true
+oxydome-state.workspace = true
+oxydome-audit.workspace = true
+oxydome-consensus.workspace = true
+oxydome-net.workspace = true
+oxydome-treasury.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+hex.workspace = true

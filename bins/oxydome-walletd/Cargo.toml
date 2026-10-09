@@ -1,0 +1,40 @@
+[package]
+name = "oxydome-walletd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Oxydome wallet-makers API daemon: Ethereum-class JSON-RPC and WebSocket service backed by an oxydome node."
+
+[lib]
+name = "oxydome_walletd"
+
+[[bin]]
+name = "oxydome-walletd"
+path = "src/main.rs"
+
+[dependencies]
+oxydome-core.workspace = true
+oxydome-crypto.workspace = true
+oxydome-currency.workspace = true
+oxydome-net.workspace = true
+oxydome-wallet.workspace = true
+oxydome-wallet-rpc.workspace = true
+axum = { workspace = true, features = ["ws"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+futures-util = { workspace = true, features = ["sink"] }
+anyhow.workspace = true
+thiserror.workspace = true
+oxydome-node.workspace = true
+aes-gcm = "0.10"
+bip39 = "2"
+hmac = "0.12"
+scrypt = "0.11"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

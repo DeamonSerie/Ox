@@ -1,0 +1,12 @@
+[package]
+name = "oxydome-treasury"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+oxydome-core.workspace = true
+oxydome-crypto.workspace = true
+oxydome-currency.workspace = true
+serde.workspace = true
+thiserror.workspace = true

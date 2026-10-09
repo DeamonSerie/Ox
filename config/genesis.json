@@ -1,0 +1,108 @@
+{
+  "params": {
+    "genesis_supply": 1000000000,
+    "block_window": 100,
+    "rebound_lock_blocks": 100,
+    "audit_checkpoint_blocks": 50,
+    "fee_master_bps": 400,
+    "bft_num": 2,
+    "bft_den": 3,
+    "master_approval_num": 2,
+    "master_approval_den": 3,
+    "node_approval_num": 2,
+    "node_approval_den": 3,
+    "alpha_bps": 6000,
+    "beta_bps": 4000,
+    "gamma_bps": 5000,
+    "eta_bps": 500,
+    "lambda_bps": 1000,
+    "t_ref": 10000,
+    "a_ref": 100,
+    "e_ref": 10000,
+    "initial_value_index": 1000000000000,
+    "value_impact_limit_bps": 200,
+    "supply_change_limit_bps": 10,
+    "fee_affordability_bps": 100,
+    "min_tx_amount": 100,
+    "withdraw_limit_bps": 10,
+    "base_fee": 1
+  },
+  "timestamp": 0,
+  "allocations": [
+    {
+      "recipient": "c14f885c5a866343d5358843ef0b91ad884f1af3ac6d0d1a601bd8c3172dfdb8",
+      "amount": 200000000
+    },
+    {
+      "recipient": "8edf67c3e4a330bf1a3546bc7e322f0f986f010304f7f5e4d418360be0274f0e",
+      "amount": 200000000
+    },
+    {
+      "recipient": "c7b58e581dda469d582ef3fd8da574d9c861df964ea261120dba42e1af646725",
+      "amount": 200000000
+    },
+    {
+      "recipient": "5cdb42bd4d09ea6a647c1ab14010d7538875b7fe3befbb87084cbfffc87e354f",
+      "amount": 200000000
+    },
+    {
+      "recipient": "b87abff2fcd5405def65a222c93bbcc40ea4cc672ab20b1daee1ad0a91ad303b",
+      "amount": 200000000
+    }
+  ],
+  "masters": [
+    {
+      "name": "master-0",
+      "key": "b87abff2fcd5405def65a222c93bbcc40ea4cc672ab20b1daee1ad0a91ad303b",
+      "seed": "47934ab656a298aff7b2d8b5833e1e7136383c3c26ed4d8f83fb5655495243a2",
+      "addr": ""
+    },
+    {
+      "name": "master-1",
+      "key": "091617c040994fef8136559bc09d92107b7657ac12060bc5f34e742730b36e11",
+      "seed": "0f4211c90bc0feba421ef4b8fe9d3e09797628d74a78b1e207c194031ca9add6",
+      "addr": ""
+    },
+    {
+      "name": "master-2",
+      "key": "e00a24c1cfa67e0ed8395893bc69d1c132e298ffe5a617aa71043c714f5f3e2b",
+      "seed": "b8b5e0ea9874e2f3a0c8928418a693601e1828a33227c2266c7b1e80561de47c",
+      "addr": ""
+    },
+    {
+      "name": "master-3",
+      "key": "d6c44eaae65162db0faaed59476815228c9ae81243804c12d493a05bc5496e19",
+      "seed": "acfc575d15b0a89be93a2726227548e6016a25d18b0a2b6f050f5271e690e009",
+      "addr": ""
+    }
+  ],
+  "nodes": [
+    {
+      "name": "node-0",
+      "key": "c14f885c5a866343d5358843ef0b91ad884f1af3ac6d0d1a601bd8c3172dfdb8",
+      "seed": "7567b89e11e1ea19261e340d9cd6fd8728aa14af2d13a2c9dd73b2a1e96ac134",
+      "addr": ""
+    },
+    {
+      "name": "node-1",
+      "key": "8edf67c3e4a330bf1a3546bc7e322f0f986f010304f7f5e4d418360be0274f0e",
+      "seed": "6434115efa019926a9c83e6880e69a7a287d11238b32e311aea6b45814fe437b",
+      "addr": ""
+    },
+    {
+      "name": "node-2",
+      "key": "c7b58e581dda469d582ef3fd8da574d9c861df964ea261120dba42e1af646725",
+      "seed": "a0ba8c147c8a031ce77379da50b1bd079ac6b7149eb155aa5ca0703bec0f931d",
+      "addr": ""
+    },
+    {
+      "name": "node-3",
+      "key": "5cdb42bd4d09ea6a647c1ab14010d7538875b7fe3befbb87084cbfffc87e354f",
+      "seed": "ac376b236355cc3ca219439c274dc27d2bbd95cd3f9297f2b931cdc36fbe689b",
+      "addr": ""
+    }
+  ],
+  "approved_manifests": [
+    "0f97e1b71d4e749989807c8be19ddaf9dc7167a54db610f939d29893e2020a6a229226412b51050f25281ef909d9cd6dc50a4f9978ed84f61165a2fca1a04759"
+  ]
+}
