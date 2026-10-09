@@ -1,8 +1,8 @@
-use crate::ast::{self, Type, Visibility, Statement, Expr, LValue, Param, Block, Event};
+use crate::ast::{Type, Visibility, Statement, Expr, LValue};
 
 /// Generate Rust source code from a contract AST
 pub fn rust_source(contract: &crate::ast::Contract) -> String {
-    let name = &contract.name;
+    let name = &contract.name_;
     let parents = &contract.parents;
     let vars = &contract.variables;
     let funcs = &contract.functions;
@@ -12,7 +12,7 @@ pub fn rust_source(contract: &crate::ast::Contract) -> String {
 
     // Add license/header
     output.push_str("// Auto-generated from Solidity-like DSL\n");
-    output.push_str(&format!("\ncontract {} {{\n", name)));
+    output.push_str(&format!("\ncontract {} {{\n", name));
 
     // Parents
     if !parents.is_empty() {
@@ -113,14 +113,11 @@ fn format_statement(stmt: &Statement, indent: usize) -> String {
             format!("{}let {}: {} = {};\n", spaces, name, type_to_rust(ty), init_str)
         }
         Statement::Assign { target, value } => {
-            let target = match target {
-                LValue::Ident(n) => n.clone(),
-                LValue::Index { base, index } => format!("{}[{}]", expr_to_rust(base), expr_to_rust(index)),
-            };
+            let target = lvalue_to_rust(target);
             format!("{} {} = {};\n", spaces, target, expr_to_rust(value))
         }
         Statement::If { condition, true_block, false_block } => {
-            let mut result = format!("{}if {} {{\n", spaces, expr_to_rust(condition)));
+            let mut result = format!("{}if {} {{\n", spaces, expr_to_rust(condition));
             for stmt in &true_block.statements {
                 result.push_str(&format_statement(stmt, indent + 4));
             }
@@ -158,7 +155,7 @@ fn format_statement(stmt: &Statement, indent: usize) -> String {
         Statement::Emitevent { event, args } => {
             let args_str: Vec<String> = args
                 .iter()
-                .map(|(name, expr)| format!("{} {}", type_to_rust(&Expr::Ident(name.clone())), expr_to_rust(expr)))
+                .map(|(_, expr)| expr_to_rust(expr))
                 .collect();
             format!("{}emit {}({});\n", spaces, event, args_str.join(", "))
         }
@@ -174,7 +171,7 @@ fn expr_to_rust(expr: &Expr) -> String {
         Expr::LitInt(n) => n.to_string(),
         Expr::LitBool(b) => b.to_string(),
         Expr::LitString(s) => format!("\"{}\"", s),
-        Expr::Address(addr) => {
+        Expr::Address(_addr) => {
             // Simplified: just return a placeholder
             "address".to_string()
         }
@@ -199,5 +196,14 @@ fn expr_to_rust(expr: &Expr) -> String {
             format!("{}({})", func, args_str.join(", "))
         }
         Expr::Access { target, field } => format!("{}.{}", target, field),
+    }
+}
+
+fn lvalue_to_rust(target: &LValue) -> String {
+    match target {
+        LValue::Ident(name) => name.clone(),
+        LValue::Index { base, index } => {
+            format!("{}[{}]", lvalue_to_rust(base), expr_to_rust(index))
+        }
     }
 }

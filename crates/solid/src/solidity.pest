@@ -1,116 +1,96 @@
-source_unit
-  : ("pragma" solidity_version "\n")? contract_item*
+source_unit = { SOI ~ pragma? ~ contract_definition ~ EOI }
 
-contract_item
-  : function_def
-  | var_decl
-  | event_decl
-  | ";"*
+pragma = { "pragma" ~ "solidity" ~ solidity_version ~ ";" }
+solidity_version = { "0." ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 
-function_def
-  : (visibility)? "function" identifier "(" (parameter ("," parameter)*)? ")" ("returns" "(" type_name ("," type_name)? ")")? "{" block "}"
+contract_definition = {
+    "contract" ~ identifier ~ inheritance? ~ "{" ~ contract_item* ~ "}"
+}
+inheritance = { "is" ~ identifier ~ ("," ~ identifier)* }
+contract_item = { function_definition | event_definition | variable_declaration }
 
-visibility
-  : "public" | "internal" | "private"
+function_definition = {
+    "function" ~ identifier ~ "(" ~ parameter_list? ~ ")" ~ visibility? ~
+    returns_clause? ~ block
+}
+visibility = { "public" | "internal" | "private" }
+parameter_list = { parameter ~ ("," ~ parameter)* }
+parameter = { type_name ~ identifier }
+returns_clause = { "returns" ~ "(" ~ type_list? ~ ")" }
+type_list = { type_name ~ ("," ~ type_name)* }
 
-parameter
-  : type_name identifier (":" type_name)?
+variable_declaration = {
+    type_name ~ identifier ~ ("=" ~ expression)? ~ ";"
+}
+event_definition = {
+    "event" ~ identifier ~ "(" ~ event_parameter_list? ~ ")" ~ ";"
+}
+event_parameter_list = { event_parameter ~ ("," ~ event_parameter)* }
+event_parameter = { type_name ~ "indexed"? ~ identifier }
 
-var_decl
-  : (type_name | ("mapping" "<" type_name "," type_name ">") ) identifier ("=" expression)?
+type_name = {
+    mapping_type | primitive_type ~ array_suffix*
+}
+mapping_type = {
+    "mapping" ~ "(" ~ primitive_type ~ "=>" ~ type_name ~ ")"
+}
+primitive_type = {
+    "address" | "uint256" | "uint64" | "uint" | "bool" | "string"
+}
+array_suffix = { "[" ~ ASCII_DIGIT* ~ "]" }
 
-event_decl
-  : "event" identifier "(" (event_param ("," event_param)*)? ")" ";"
+block = { "{" ~ statement* ~ "}" }
+statement = {
+    if_statement
+    | for_statement
+    | while_statement
+    | return_statement
+    | emit_statement
+    | assert_statement
+    | variable_declaration
+    | assignment_statement
+    | expression_statement
+}
+if_statement = {
+    "if" ~ "(" ~ expression ~ ")" ~ block ~ ("else" ~ block)?
+}
+for_statement = {
+    "for" ~ "(" ~ expression? ~ ";" ~ expression? ~ ";" ~ expression? ~ ")" ~ block
+}
+while_statement = { "while" ~ "(" ~ expression ~ ")" ~ block }
+return_statement = { "return" ~ expression? ~ ";" }
+emit_statement = { "emit" ~ identifier ~ "(" ~ argument_list? ~ ")" ~ ";" }
+assert_statement = { "assert" ~ "(" ~ expression ~ ("," ~ string_literal)? ~ ")" ~ ";" }
+assignment_statement = { lvalue ~ assignment_operator ~ expression ~ ";" }
+assignment_operator = { "=" | "+=" | "-=" | "*=" | "/=" }
+lvalue = { identifier ~ ("[" ~ expression ~ "]")* }
+expression_statement = { expression ~ ";" }
 
-event_param
-  : type_name identifier ("indexed")?
+expression = { logical_or }
+logical_or = { logical_and ~ ("||" ~ logical_and)* }
+logical_and = { equality ~ ("&&" ~ equality)* }
+equality = { comparison ~ (("==" | "!=") ~ comparison)* }
+comparison = { term ~ (("<=" | ">=" | "<" | ">") ~ term)* }
+term = { factor ~ (("+" | "-") ~ factor)* }
+factor = { unary ~ (("*" | "/" | "%") ~ unary)* }
+unary = { ("!" | "-")* ~ primary }
+primary = {
+    literal
+    | function_call
+    | member_access
+    | identifier
+    | "(" ~ expression ~ ")"
+}
+function_call = { identifier ~ "(" ~ argument_list? ~ ")" }
+member_access = { identifier ~ "." ~ identifier }
+argument_list = { expression ~ ("," ~ expression)* }
+literal = { address_literal | string_literal | boolean_literal | number_literal }
+address_literal = { "0x" ~ ASCII_HEX_DIGIT{40} }
+string_literal = { "\"" ~ ("\\" ~ ANY | !("\"" | NEWLINE) ~ ANY)* ~ "\"" }
+boolean_literal = { "true" | "false" }
+number_literal = { ASCII_DIGIT+ }
 
-block
-  : "{" (statement)* "}"
+identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
-statement
-  : for_statement
-  | while_statement
-  | if_statement
-  | expression_statement
-  | "return" (expression)? ";"
-  | "emitevent" identifier "(" (expression ("," expression)*)? ")" ";"
-  | "assert" "(" expression "," string_literal? ")";"
-
-for_statement
-  : "for" "(" (expression? ":" expression?)? ";" expression? ";" (expression)? ")" block
-
-while_statement
-  : "while" "(" expression ")" block
-
-if_statement
-  : "if" "(" expression ")" block ("else" block)?
-
-expression_statement
-  : expression ";"
-
-expression
-  : logical_or
-
-logical_or
-  : logical_and ("or" logical_and)*
-
-logical_and
-  : equality ("and" equality)*
-
-equality
-  : comparison ("==" comparison | "!=" comparison)*
-
-comparison
-  : term ("<" term | "<=" term | ">" term | ">=" term)*
-
-term
-  : factor ("*" factor | "/" factor | "%" factor)*
-
-factor
-  : unary ("**" unary)?
-
-unary
-  : ("-" | "!")? unary primary
-  | primary
-
-primary
-  : number_lit
-  | address_lit
-  | string_lit
-  | identifier
-  | "(" expression ")"
-  | primary "(" args? ")"
-
-args
-  : (expression ("," expression)*)?
-
-identifier
-  : /[a-zA-Z_][a-zA-Z0-9_]*/
-
-number_lit
-  : /[0-9]+/
-
-address_lit
-  : "0x" /[0-9a-fA-F]{40}/
-
-string_lit
-  : "\"" /([^"\n\\]|\\.)*("\""/
-
-type_name
-  : "address" | "uint" | "int" | "bool" | "string" | "bytes"
-
-modifier
-  : "pure" | "view" | "payable" | "virtual" | "override"
-
-source_unit
-  : (Pragma)? (Import)? contract_item*
-
-Pragma
-  : "pragma" solidity_version
-
-solidity_version
-  : "0." /[0-9]+/ "." /[0-9]+/
-
-Import
-  : "import" string_lit ";"
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "//" ~ (!NEWLINE ~ ANY)* | "/*" ~ (!"*/" ~ ANY)* ~ "*/" }

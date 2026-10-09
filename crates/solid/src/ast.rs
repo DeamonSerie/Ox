@@ -56,6 +56,21 @@ pub struct Event {
     pub indexed: Vec<String>,
 }
 
+/// Parsed contract definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Contract {
+    #[serde(rename = "name")]
+    pub name_: String,
+    #[serde(rename = "parents")]
+    pub parents: Vec<String>,
+    #[serde(rename = "variables")]
+    pub variables: Vec<Variable>,
+    #[serde(rename = "functions")]
+    pub functions: Vec<Function>,
+    #[serde(rename = "events")]
+    pub events: Vec<Event>,
+}
+
 /// Block statements
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
@@ -83,7 +98,7 @@ pub enum LValue {
 }
 
 /// Expression types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
     LitInt(u64),
     LitBool(bool),
