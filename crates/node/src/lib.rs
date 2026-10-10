@@ -309,6 +309,13 @@ impl Node {
                 "persisted tip snapshots do not match replayed state".into(),
             ));
         }
+        let (gas, gas_supply, ox_price, last_airdrop_height) = store
+            .load_gas_state(current_height)
+            .map_err(|error| NodeError::Ledger(error.to_string()))?;
+        self.state.gas = gas;
+        self.state.gas_supply = gas_supply;
+        self.state.ox_price = ox_price;
+        self.state.last_airdrop_height = last_airdrop_height;
 
         self.blocks = blocks;
         self.finality_evidence = restored_evidence;
@@ -654,6 +661,26 @@ impl Node {
         self.ohm_blocks.get(hash)
     }
 
+    /// Returns the GAS balance of the given account.
+    pub fn gas_balance(&self, owner: &PublicKey) -> Amount {
+        self.state.gas_balance(owner)
+    }
+
+    /// Returns the total circulating GAS supply.
+    pub fn gas_supply(&self) -> Amount {
+        self.state.gas_supply
+    }
+
+    /// Returns the on-chain Ox price oracle value used to size airdrops.
+    pub fn gas_price(&self) -> Amount {
+        self.state.ox_price
+    }
+
+    /// Returns the height of the most recent GAS airdrop.
+    pub fn last_airdrop_height(&self) -> u64 {
+        self.state.last_airdrop_height
+    }
+
     /// The private OVM contract `contract_id` hosted by OHM `ohm_id`, if any.
     pub fn ohm_contract(&self, ohm_id: &Hash, contract_id: &Hash) -> Option<&OhmContract> {
         self.ohm_ledger(ohm_id)?.contract(contract_id)
@@ -876,6 +903,12 @@ impl Node {
                     &next.contracts,
                     &next.daos,
                     &next.ohm_states,
+                    &(
+                        next.gas.clone(),
+                        next.gas_supply,
+                        next.ox_price,
+                        next.last_airdrop_height,
+                    ),
                     &block,
                     &encoded_evidence,
                 )
@@ -1373,6 +1406,12 @@ mod recovery_tests {
                 &next.utxo,
                 &ledger_diff(&node.state.utxo, &next.utxo),
                 &next.contracts,
+                &(
+                    next.gas.clone(),
+                    next.gas_supply,
+                    next.ox_price,
+                    next.last_airdrop_height,
+                ),
                 &block,
             )
             .unwrap();
@@ -1446,6 +1485,12 @@ mod recovery_tests {
                 &state1.contracts,
                 &state1.daos,
                 &state1.ohm_states,
+                &(
+                    state1.gas.clone(),
+                    state1.gas_supply,
+                    state1.ox_price,
+                    state1.last_airdrop_height,
+                ),
                 &block1,
             )
             .unwrap();
@@ -1499,6 +1544,12 @@ mod recovery_tests {
                 &state2.contracts,
                 &state2.daos,
                 &state2.ohm_states,
+                &(
+                    state2.gas.clone(),
+                    state2.gas_supply,
+                    state2.ox_price,
+                    state2.last_airdrop_height,
+                ),
                 &block2,
             )
             .unwrap();
@@ -1575,18 +1626,24 @@ mod recovery_tests {
             .as_mut()
             .unwrap()
             .save_version_with_ohm_and_block(
-                state1.height,
-                block1.hash(),
-                &state1.utxo,
-                &ledger_diff(&node.state.utxo, &state1.utxo),
-                &state1.contracts,
-                &state1.daos,
-                &state1.ohm_states,
-                &block1,
+                state2.height,
+                block2.hash(),
+                &state2.utxo,
+                &ledger_diff(&node.state.utxo, &state2.utxo),
+                &state2.contracts,
+                &state2.daos,
+                &state2.ohm_states,
+                &(
+                    state2.gas.clone(),
+                    state2.gas_supply,
+                    state2.ox_price,
+                    state2.last_airdrop_height,
+                ),
+                &block2,
             )
             .unwrap();
-        node.state = state1;
-        node.ohm_ledgers = ohm1;
+        node.state = state2;
+        node.ohm_ledgers = ohm2;
         node.pending_ops.clear();
 
         // Deploy a named contract and call it inside a single private OHM block.
@@ -1681,6 +1738,12 @@ mod recovery_tests {
                 &state2.contracts,
                 &state2.daos,
                 &state2.ohm_states,
+                &(
+                    state2.gas.clone(),
+                    state2.gas_supply,
+                    state2.ox_price,
+                    state2.last_airdrop_height,
+                ),
                 &block2,
             )
             .unwrap();

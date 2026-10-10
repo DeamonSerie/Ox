@@ -1015,6 +1015,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxydome-gas"
+version = "0.1.0"
+dependencies = [
+ "oxydome-core",
+ "oxydome-crypto",
+]
+
+[[package]]
 name = "oxydome-master"
 version = "0.1.0"
 dependencies = [
@@ -1168,6 +1176,7 @@ dependencies = [
  "oxydome-core",
  "oxydome-crypto",
  "oxydome-currency",
+ "oxydome-gas",
  "oxydome-ovm",
  "oxydome-rewards",
  "serde",

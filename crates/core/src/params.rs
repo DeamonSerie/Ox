@@ -25,6 +25,23 @@ pub struct ChainParams {
     #[serde(default = "default_smart_contract_activation_height")]
     pub smart_contract_activation_height: u64,
 
+    // ---- GAS fuel currency ----
+    /// Height at which GAS minting, burning and airdrops become active.
+    #[serde(default = "default_one")]
+    pub gas_activation_height: u64,
+    /// Share of every server-node reward converted from Ox into GAS, in basis points.
+    #[serde(default = "default_gas_server_fee_bps")]
+    pub gas_server_fee_bps: u32,
+    /// Number of blocks between automatic GAS airdrops (`0` disables airdrops).
+    #[serde(default = "default_airdrop_interval_blocks")]
+    pub airdrop_interval_blocks: u64,
+    /// Base airdrop size as basis points of the current circulating GAS supply.
+    #[serde(default = "default_airdrop_base_bps")]
+    pub airdrop_base_bps: u32,
+    /// Normalizing reference for the Ox price oracle in the airdrop formula.
+    #[serde(default = "default_amount_one")]
+    pub ox_price_reference: Amount,
+
     // ---- fee split ----
     /// Share of block fees paid to masters, in basis points (`400` = 4%).
     pub fee_master_bps: u32,
@@ -89,6 +106,26 @@ fn default_smart_contract_activation_height() -> u64 {
     u64::MAX
 }
 
+fn default_one() -> u64 {
+    1
+}
+
+fn default_amount_one() -> Amount {
+    1
+}
+
+fn default_gas_server_fee_bps() -> u32 {
+    2_000
+}
+
+fn default_airdrop_interval_blocks() -> u64 {
+    100
+}
+
+fn default_airdrop_base_bps() -> u32 {
+    100
+}
+
 impl ChainParams {
     pub fn execution_version_at(&self, height: u64) -> u32 {
         if height >= self.smart_contract_activation_height {
@@ -109,6 +146,11 @@ impl ChainParams {
             audit_checkpoint_blocks: 50,
             ovm_activation_height: 1,
             smart_contract_activation_height: 1,
+            gas_activation_height: 1,
+            gas_server_fee_bps: 2_000,
+            airdrop_interval_blocks: 100,
+            airdrop_base_bps: 100,
+            ox_price_reference: 1,
             fee_master_bps: 400,
             bft_num: 2,
             bft_den: 3,

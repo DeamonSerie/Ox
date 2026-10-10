@@ -154,8 +154,12 @@ pub mod methods {
     pub const GET_OHM_BALANCE: &str = "ox_getOhmBalance";
     pub const SUBMIT_OHM_OPERATION: &str = "ox_submitOhmOperation";
     pub const SUBMIT_OHM_BLOCK: &str = "ox_submitOhmBlock";
-    pub const GET_OHM_CONTRACT: &str = "ox_getOhmContract";
-    pub const CALL_OHM_CONTRACT: &str = "ox_callOhmContract";
+pub const GET_OHM_CONTRACT: &str = "ox_getOhmContract";
+pub const CALL_OHM_CONTRACT: &str = "ox_callOhmContract";
+pub const GET_GAS_BALANCE: &str = "ox_getGasBalance";
+pub const GET_GAS_SUPPLY: &str = "ox_getGasSupply";
+pub const GET_GAS_PRICE: &str = "ox_getGasPrice";
+pub const GET_GAS_AIRDROP_INFO: &str = "ox_airdropInfo";
 
     // Vault methods
     pub const VAULT_CREATE: &str = "ox_vaultCreate";

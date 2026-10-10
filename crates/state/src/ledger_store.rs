@@ -15,10 +15,10 @@
 
 use crate::chain::OvmContract;
 use crate::utxo::{Summary, UtxoEntry, UtxoLedger, VNode};
-use oxydome_core::{Amount, DaoState, OhmBlock, OhmState, OutPoint};
+use oxydome_core::{Amount, DaoState, GasAccount, OhmBlock, OhmState, OutPoint, PublicKey};
 use oxydome_crypto::{merkle_leaf_hash, merkle_node_hash, Hash};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// A persisted tree node. The node hash itself is the storage key; `Internal` children are
@@ -55,6 +55,15 @@ pub struct OhmSnapshot {
     pub states: std::collections::BTreeMap<Hash, OhmState>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GasSnapshot {
+    pub height: u64,
+    pub accounts: BTreeMap<PublicKey, GasAccount>,
+    pub gas_supply: Amount,
+    pub ox_price: Amount,
+    pub last_airdrop_height: u64,
+}
+
 /// The committed summary of a specific ledger version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRecord {
@@ -89,6 +98,7 @@ const PREFIX_DAO: u8 = 7u8;
 const PREFIX_OHM_STATE: u8 = 8u8;
 /// Content-addressed private OHM blocks, keyed by OHM block hash.
 const PREFIX_OHM_BLOCK: u8 = 9u8;
+const PREFIX_GAS: u8 = 10u8;
 const KEY_CURRENT: [u8; 1] = [3u8];
 
 fn node_key(hash: &Hash) -> Vec<u8> {
@@ -271,6 +281,30 @@ impl LedgerStore {
                 Ok(snapshot.states)
             }
             None => Ok(Default::default()),
+        }
+    }
+
+    pub fn load_gas_state(
+        &self,
+        height: u64,
+    ) -> Result<(BTreeMap<PublicKey, GasAccount>, Amount, Amount, u64), LedgerError> {
+        match self.tree.get(height_key(PREFIX_GAS, height))? {
+            Some(raw) => {
+                let snapshot: GasSnapshot = Self::decode(&raw)?;
+                if snapshot.height != height {
+                    return Err(LedgerError::Corrupt(format!(
+                        "GAS snapshot height {} stored at {height}",
+                        snapshot.height
+                    )));
+                }
+                Ok((
+                    snapshot.accounts,
+                    snapshot.gas_supply,
+                    snapshot.ox_price,
+                    snapshot.last_airdrop_height,
+                ))
+            }
+            None => Ok((Default::default(), 0, 0, 0)),
         }
     }
 
@@ -541,8 +575,18 @@ impl LedgerStore {
             spent: Vec::new(),
             created: ledger.iter().cloned().collect(),
         };
-        self.save_version_with_ovm_and_block(0, block.hash(), ledger, &delta, contracts, block)
+        self.save_version_with_ovm_and_block(
+            0,
+            block.hash(),
+            ledger,
+            &delta,
+            contracts,
+            &Default::default(),
+            block,
+        )
     }
+
+    /// Loads the GAS state committed at `height`.
 
     /// Atomically commits a new ledger version at `height` together with its delta.
     ///
@@ -555,7 +599,14 @@ impl LedgerStore {
         ledger: &UtxoLedger,
         delta: &LedgerDelta,
     ) -> Result<(), LedgerError> {
-        self.save_version_with_ovm(height, block_hash, ledger, delta, &Default::default())
+        self.save_version_with_ovm(
+            height,
+            block_hash,
+            ledger,
+            delta,
+            &Default::default(),
+            &Default::default(),
+        )
     }
 
     /// Atomically commits UTXO and OVM state for a finalized height.
@@ -566,6 +617,7 @@ impl LedgerStore {
         ledger: &UtxoLedger,
         delta: &LedgerDelta,
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+        gas: &(BTreeMap<PublicKey, GasAccount>, Amount, Amount, u64),
     ) -> Result<(), LedgerError> {
         self.save_version_contents(
             height,
@@ -575,6 +627,7 @@ impl LedgerStore {
             contracts,
             &Default::default(),
             &Default::default(),
+            gas,
             None,
             None,
         )
@@ -588,6 +641,7 @@ impl LedgerStore {
         ledger: &UtxoLedger,
         delta: &LedgerDelta,
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+        gas: &(BTreeMap<PublicKey, GasAccount>, Amount, Amount, u64),
         block: &oxydome_core::Block,
     ) -> Result<(), LedgerError> {
         if block.header.height != height || block.hash() != block_hash {
@@ -603,6 +657,7 @@ impl LedgerStore {
             contracts,
             &Default::default(),
             &Default::default(),
+            gas,
             Some(block),
             None,
         )
@@ -620,6 +675,7 @@ impl LedgerStore {
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
         daos: &std::collections::BTreeMap<Hash, DaoState>,
         ohm_states: &std::collections::BTreeMap<Hash, OhmState>,
+        gas: &(BTreeMap<PublicKey, GasAccount>, Amount, Amount, u64),
         block: &oxydome_core::Block,
     ) -> Result<(), LedgerError> {
         if block.header.height != height || block.hash() != block_hash {
@@ -635,6 +691,7 @@ impl LedgerStore {
             contracts,
             daos,
             ohm_states,
+            gas,
             Some(block),
             None,
         )
@@ -651,6 +708,7 @@ impl LedgerStore {
         ledger: &UtxoLedger,
         delta: &LedgerDelta,
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+        gas: &(BTreeMap<PublicKey, GasAccount>, Amount, Amount, u64),
         block: &oxydome_core::Block,
         finality_evidence: &[u8],
     ) -> Result<(), LedgerError> {
@@ -670,6 +728,7 @@ impl LedgerStore {
             contracts,
             &Default::default(),
             &Default::default(),
+            gas,
             block,
             finality_evidence,
         )
@@ -686,6 +745,7 @@ impl LedgerStore {
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
         daos: &std::collections::BTreeMap<Hash, DaoState>,
         ohm_states: &std::collections::BTreeMap<Hash, OhmState>,
+        gas: &(BTreeMap<PublicKey, GasAccount>, Amount, Amount, u64),
         block: &oxydome_core::Block,
         finality_evidence: &[u8],
     ) -> Result<(), LedgerError> {
@@ -705,6 +765,7 @@ impl LedgerStore {
             contracts,
             daos,
             ohm_states,
+            gas,
             Some(block),
             Some(finality_evidence),
         )
@@ -720,6 +781,7 @@ impl LedgerStore {
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
         daos: &std::collections::BTreeMap<Hash, DaoState>,
         ohm_states: &std::collections::BTreeMap<Hash, OhmState>,
+        gas: &(BTreeMap<PublicKey, GasAccount>, Amount, Amount, u64),
         block: Option<&oxydome_core::Block>,
         finality_evidence: Option<&[u8]>,
     ) -> Result<(), LedgerError> {
@@ -818,6 +880,16 @@ impl LedgerStore {
                 height,
                 root: oxydome_crypto::hash_value(&("oxydome-ohm-state-v1", ohm_states)),
                 states: ohm_states.clone(),
+            })?,
+        );
+        batch.insert(
+            height_key(PREFIX_GAS, height),
+            Self::encode(&GasSnapshot {
+                height,
+                accounts: gas.0.clone(),
+                gas_supply: gas.1,
+                ox_price: gas.2,
+                last_airdrop_height: gas.3,
             })?,
         );
         if let Some(block) = block {
@@ -1062,6 +1134,7 @@ mod tests {
                 &ledger,
                 &ledger_diff(&UtxoLedger::new(), &ledger),
                 &contracts,
+                &Default::default(),
             )
             .unwrap();
 

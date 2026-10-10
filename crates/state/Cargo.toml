@@ -9,6 +9,7 @@ oxydome-core.workspace = true
 oxydome-crypto.workspace = true
 oxydome-ovm.workspace = true
 oxydome-currency.workspace = true
+oxydome-gas.workspace = true
 serde.workspace = true
 bincode.workspace = true
 thiserror.workspace = true

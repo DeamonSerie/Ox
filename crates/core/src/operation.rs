@@ -5,7 +5,7 @@
 //! nodes for withdrawals). Fee rewards are validated against the block's collected fees.
 
 use crate::tx::TxOutput;
-use crate::{Amount, DaoAction, DaoOperation, OhmAction, OhmOperation, OutPoint};
+use crate::{Amount, DaoAction, DaoOperation, GasAction, GasOperation, OhmAction, OhmOperation, OutPoint};
 use oxydome_crypto::{hash_value, verify, Hash, PublicKey, Sig};
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +127,11 @@ enum SignableOperation {
         actor: PublicKey,
         action: OhmAction,
     },
+    Gas {
+        actor: PublicKey,
+        nonce: u64,
+        action: GasAction,
+    },
 }
 
 /// A block operation.
@@ -138,6 +143,7 @@ pub enum Operation {
     Rewards(RewardDistribution),
     Dao(DaoOperation),
     Ohm(OhmOperation),
+    Gas(GasOperation),
 }
 
 impl Operation {
@@ -170,6 +176,11 @@ impl Operation {
                 actor: op.actor,
                 action: op.action.clone(),
             },
+            Operation::Gas(op) => SignableOperation::Gas {
+                actor: op.actor,
+                nonce: op.nonce,
+                action: op.action.clone(),
+            },
         };
         hash_value(&signable)
     }
@@ -178,6 +189,7 @@ impl Operation {
         match self {
             Operation::Mint(m) => &m.approvals,
             Operation::Burn(b) => &b.approvals,
+            Operation::Gas(g) => &g.approvals,
             _ => &[],
         }
     }
@@ -217,6 +229,7 @@ impl Operation {
                 | Operation::Withdraw(_)
                 | Operation::Dao(_)
                 | Operation::Ohm(_)
+                | Operation::Gas(_)
         )
     }
 

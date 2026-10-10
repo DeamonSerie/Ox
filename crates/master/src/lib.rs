@@ -134,6 +134,7 @@ impl HeaderChain {
                 oxydome_core::Operation::Rewards(_) 
                 | oxydome_core::Operation::Dao(_) 
                 | oxydome_core::Operation::Ohm(_) => {}
+                | oxydome_core::Operation::Gas(_) => {}
             }
         }
         self.supply = block.header.supply;

@@ -6,6 +6,7 @@
 pub mod block;
 pub mod config;
 pub mod dao;
+pub mod gas;
 pub mod genesis;
 pub mod governance;
 pub mod ohm;
@@ -22,6 +23,10 @@ pub use dao::{
     DaoAction, DaoCurrency, DaoOperation, DaoPeg, DaoPolicy, DaoProposal, DaoProposalAction,
     DaoProposalStatus, DaoState, DaoWindowStats, DAO_POLICY_VERSION, MAX_DAO_CURRENCY_SYMBOL_BYTES,
     MAX_DAO_HOLDERS, MAX_DAO_MAKERS, MAX_DAO_PROPOSALS, MAX_DAO_PROPOSAL_HEIGHTS,
+};
+pub use gas::{
+    conversion_split, conversion_split_with_bps, GasAccount, GasAction, GasOperation,
+    GAS_BPS_DENOMINATOR, GAS_SERVER_FEE_BPS,
 };
 pub use genesis::{GenesisAllocation, GenesisConfig};
 pub use governance::GovernanceSet;

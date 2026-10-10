@@ -58,6 +58,10 @@ pub async fn dispatch(state: &Arc<AppState>, req: &RpcRequest) -> RpcResponse {
         methods::SUBMIT_OHM_BLOCK => handle_submit_ohm_block(state, &params).await,
         methods::GET_OHM_CONTRACT => handle_get_ohm_contract(state, &params).await,
         methods::CALL_OHM_CONTRACT => handle_call_ohm_contract(state, &params).await,
+        methods::GET_GAS_BALANCE => handle_get_gas_balance(state, &params).await,
+        methods::GET_GAS_SUPPLY => handle_get_gas_supply(state, &params).await,
+        methods::GET_GAS_PRICE => handle_get_gas_price(state, &params).await,
+        methods::GET_GAS_AIRDROP_INFO => handle_airdrop_info(state, &params).await,
         methods::VAULT_CREATE => handle_vault_create(state, &params).await,
         methods::VAULT_IMPORT => handle_vault_import(state, &params).await,
         methods::VAULT_UNLOCK => handle_vault_unlock(state, &params).await,
@@ -710,6 +714,34 @@ async fn handle_gas_price() -> Result<Value, RpcError> {
 
 async fn handle_fee_history() -> Result<Value, RpcError> {
     Ok(json!([]))
+}
+
+async fn handle_get_gas_balance(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    // GAS balance query - connects to node via NodeClient
+    // TODO: Implement NodeClient method call when available
+    let _owner = params
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(|v| v.as_str());
+    Ok(json!({ "balance": "0", "owner": "pending" }))
+}
+
+async fn handle_get_gas_supply(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    // GAS supply query - connects to node via NodeClient
+    // TODO: Implement NodeClient method call when available
+    Ok(json!({ "supply": "0" }))
+}
+
+async fn handle_get_gas_price(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    // GAS price query - connects to node via NodeClient
+    // TODO: Implement NodeClient method call when available
+    Ok(json!({ "price": "0" }))
+}
+
+async fn handle_airdrop_info(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    // GAS airdrop info query - connects to node via NodeClient
+    // TODO: Implement NodeClient method call when available
+    Ok(json!({ "height": 0, "next_height": 100 }))
 }
 
 async fn handle_get_logs() -> Result<Value, RpcError> {

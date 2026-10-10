@@ -212,6 +212,23 @@ pub enum Message {
         logs: Vec<OvmLog>,
         error: Option<String>,
     },
+    // -- GAS (walletd <-> node) --
+    GetGasBalance {
+        owner: PublicKey,
+    },
+    GasBalanceResponse {
+        amount: Amount,
+    },
+    GetGasSupply,
+    GasSupplyResponse {
+        amount: Amount,
+    },
+    GetGasPrice,
+    GasPriceResponse,
+    GetGasAirdropInfo,
+    GasAirdropInfoResponse {
+        height: u64,
+    },
     GetOvmCode {
         contract_id: Hash,
     },

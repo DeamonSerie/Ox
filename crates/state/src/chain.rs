@@ -3,16 +3,18 @@
 
 use crate::utxo::{UtxoEntry, UtxoLedger};
 use oxydome_core::{
-    Amount, Block, ChainParams, DaoAction, DaoOperation, DaoPeg, DaoPolicy, DaoProposal,
-    DaoProposalAction, DaoProposalStatus, DaoState, DaoWindowStats, GovernanceSet, OhmAction,
-    OhmOperation, OhmPolicy, OhmState, OhmUtxoEntry, Operation, OutPoint, OvmAction,
-    OvmFailureCode, OvmLog, OvmReceipt, PublicKey, RewardDistribution, Transaction, TxOutput,
-    ValueIndex, MAX_DAO_PROPOSALS, MAX_DAO_PROPOSAL_HEIGHTS, MAX_OVM_BLOCK_GAS_LIMIT,
+    conversion_split_with_bps, Amount, Block, ChainParams, DaoAction, DaoOperation, DaoPeg, DaoPolicy,
+    DaoProposal, DaoProposalAction, DaoProposalStatus, DaoState, DaoWindowStats, GasAccount,
+    GasAction, GasOperation, GovernanceSet, OhmAction, OhmOperation, OhmPolicy, OhmState,
+    OhmUtxoEntry, Operation, OutPoint, OvmAction, OvmFailureCode, OvmLog, OvmReceipt, PublicKey,
+    RewardDistribution, Transaction, TxOutput, ValueIndex, MAX_DAO_PROPOSALS,
+    MAX_DAO_PROPOSAL_HEIGHTS, MAX_OVM_BLOCK_GAS_LIMIT,
 };
 use oxydome_core::{
     build_ohm_server_outputs, compute_ohm_fee_split, ohm_genesis_hash, ohm_state_root,
     ohm_treasury_outpoint,
 };
+use oxydome_gas::{airdrop_amount, distribute_airdrop};
 use oxydome_crypto::{hash_value, verify, Hash};
 use oxydome_currency::{
     compute_value, max_withdraw_per_account, rebound_utxo_spendable, supply_change_cap,
@@ -115,6 +117,16 @@ pub enum StateError {
     Dao(String),
     #[error("OHM operation invalid: {0}")]
     Ohm(String),
+    #[error("GAS operation invalid: {0}")]
+    Gas(String),
+    #[error("GAS is not active at this height")]
+    GasInactive,
+    #[error("GAS transfer nonce {0} does not match expected {1}")]
+    GasNonce(u64, u64),
+    #[error("account {0:?} has insufficient GAS")]
+    GasUnderfunded(PublicKey),
+    #[error("OVM transaction caller {0:?} does not hold enough GAS for the gas limit")]
+    OvmGasUnderfunded(PublicKey),
 }
 
 /// The complete accounting state of the chain.
@@ -138,6 +150,14 @@ pub struct ChainState {
     pub epoch_minted: Amount,
     pub epoch_burned: Amount,
     pub epoch_withdrawn: Amount,
+    /// GAS account balances (account-based currency, not committed into `state_root`).
+    pub gas: BTreeMap<PublicKey, GasAccount>,
+    /// Total circulating GAS supply.
+    pub gas_supply: Amount,
+    /// On-chain Ox price oracle used to size GAS airdrops.
+    pub ox_price: Amount,
+    /// Height of the most recent GAS airdrop.
+    pub last_airdrop_height: u64,
 }
 
 impl ChainState {
@@ -202,6 +222,10 @@ impl ChainState {
             epoch_minted: 0,
             epoch_burned: 0,
             epoch_withdrawn: 0,
+            gas: BTreeMap::new(),
+            gas_supply: 0,
+            ox_price: config.params.ox_price_reference,
+            last_airdrop_height: 0,
         };
         let gov = GovernanceSet::new(config.masters.clone(), config.nodes.clone());
         Ok((state, block, gov))
@@ -245,6 +269,43 @@ impl ChainState {
                 ohm_root
             ))
         }
+    }
+
+    /// Returns the GAS balance for `owner`.
+    pub fn gas_balance(&self, owner: &PublicKey) -> Amount {
+        self.gas.get(owner).map_or(0, |account| account.balance)
+    }
+
+    /// The nonce expected on the next GAS transfer from `owner`.
+    pub fn gas_nonce(&self, owner: &PublicKey) -> u64 {
+        self.gas.get(owner).map_or(0, |account| account.nonce)
+    }
+
+    /// Mints `amount` GAS to `owner`, increasing the circulating GAS supply.
+    fn mint_gas(&mut self, owner: PublicKey, amount: Amount) {
+        if amount == 0 {
+            return;
+        }
+        let entry = self.gas.entry(owner).or_default();
+        entry.balance = entry.balance.saturating_add(amount);
+        self.gas_supply = self.gas_supply.saturating_add(amount);
+    }
+
+    /// Burns `amount` GAS from `owner`, decreasing the circulating GAS supply.
+    fn burn_gas(&mut self, owner: &PublicKey, amount: Amount) -> Result<(), StateError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let entry = self
+            .gas
+            .get_mut(owner)
+            .ok_or(StateError::GasUnderfunded(*owner))?;
+        if entry.balance < amount {
+            return Err(StateError::GasUnderfunded(*owner));
+        }
+        entry.balance -= amount;
+        self.gas_supply = self.gas_supply.saturating_sub(amount);
+        Ok(())
     }
 
     /// The summed statistics over the measurement window.
@@ -324,21 +385,15 @@ impl ChainState {
                     .filter(|total| *total <= MAX_OVM_BLOCK_GAS_LIMIT)
                     .ok_or(StateError::OvmBlockGasLimit)?;
                 let required = oxydome_core::transfer_fee(&tx.outputs)
-                    .map_err(|error| StateError::BadTransaction(tx_index, error.to_string()))?
-                    .checked_add(u128::from(action.gas_limit()))
-                    .ok_or_else(|| {
-                        StateError::BadTransaction(tx_index, "required fee overflows".into())
-                    })?;
+                    .map_err(|error| StateError::BadTransaction(tx_index, error.to_string()))?;
                 if tx.fee != required {
                     return Err(StateError::BadTransaction(
                         tx_index,
-                        "fee does not equal the transfer fee plus OVM gas limit".into(),
+                        "fee does not equal the transfer fee".into(),
                     ));
                 }
-                let receipt =
-                    self.apply_ovm_action(&mut execution_state, action, tx.txid(), tx_index, tx)?;
-                let refund = action.gas_limit().saturating_sub(receipt.gas_used);
-                tx.fee.saturating_sub(u128::from(refund))
+                let _ = self.apply_ovm_action(&mut execution_state, action, tx.txid(), tx_index, tx)?;
+                tx.fee
             } else {
                 tx.fee
             };
@@ -418,15 +473,11 @@ impl ChainState {
                     return Err(StateError::OvmBlockGasLimit);
                 }
                 let expected_fee = oxydome_core::transfer_fee(&tx.outputs)
-                    .map_err(|error| StateError::BadTransaction(tx_idx, error.to_string()))?
-                    .checked_add(u128::from(action.gas_limit()))
-                    .ok_or_else(|| {
-                        StateError::BadTransaction(tx_idx, "required fee overflows".into())
-                    })?;
+                    .map_err(|error| StateError::BadTransaction(tx_idx, error.to_string()))?;
                 if tx.fee != expected_fee {
                     return Err(StateError::BadTransaction(
                         tx_idx,
-                        "fee does not equal the transfer fee plus OVM gas limit".into(),
+                        "fee does not equal the transfer fee".into(),
                     ));
                 }
             }
@@ -474,23 +525,29 @@ impl ChainState {
             }
 
             if let Some(action) = &tx.ovm_action {
-                let receipt = self.apply_ovm_action(&mut next, action, tx.txid(), tx_idx, tx)?;
-                let refund = action.gas_limit().saturating_sub(receipt.gas_used);
-                if refund > 0 {
-                    let owner = tx.inputs[0].owner;
-                    let outpoint = OutPoint::new(tx.txid(), tx.outputs.len() as u32);
-                    next.utxo = next.utxo.insert(UtxoEntry::new(
-                        outpoint,
-                        TxOutput::spendable(u128::from(refund), owner),
-                        new_height,
-                    ));
+                if block.header.height >= params.gas_activation_height {
+                    if let Some(caller) = ovm_caller(tx, action) {
+                        let gas_limit = u128::from(action.gas_limit());
+                        if next.gas_balance(caller) < gas_limit {
+                            return Err(StateError::OvmGasUnderfunded(*caller));
+                        }
+                        let receipt =
+                            self.apply_ovm_action(&mut next, action, tx.txid(), tx_idx, tx)?;
+                        next.burn_gas(caller, receipt.gas_used as Amount)?;
+                        next.ovm_receipts.push(receipt);
+                    } else {
+                        let receipt =
+                            self.apply_ovm_action(&mut next, action, tx.txid(), tx_idx, tx)?;
+                        next.ovm_receipts.push(receipt);
+                    }
+                } else {
+                    let receipt =
+                        self.apply_ovm_action(&mut next, action, tx.txid(), tx_idx, tx)?;
+                    next.ovm_receipts.push(receipt);
                 }
-                total_fees = total_fees
-                    .checked_add(tx.fee.saturating_sub(refund as Amount))
-                    .ok_or_else(|| {
-                        StateError::BadTransaction(tx_idx, "block fee total overflows".into())
-                    })?;
-                next.ovm_receipts.push(receipt);
+                total_fees = total_fees.checked_add(tx.fee).ok_or_else(|| {
+                    StateError::BadTransaction(tx_idx, "block fee total overflows".into())
+                })?;
             } else {
                 total_fees = total_fees.checked_add(tx.fee).ok_or_else(|| {
                     StateError::BadTransaction(tx_idx, "block fee total overflows".into())
@@ -556,6 +613,9 @@ impl ChainState {
                         gov,
                         block.header.producer,
                     )?;
+                }
+                Operation::Gas(gas_operation) => {
+                    apply_gas_operation(&mut next, gas_operation, op, new_height, params, gov)?;
                 }
                 Operation::Mint(m) => {
                     let approvals = count_master_approvals(op, gov);
@@ -698,6 +758,32 @@ impl ChainState {
         }
 
         update_dao_value_indices(&mut next.daos, &dao_block_stats, params);
+
+        // ---- 3b. GAS airdrop ----
+        if new_height >= params.gas_activation_height && params.airdrop_interval_blocks > 0 {
+            let interval = params.airdrop_interval_blocks;
+            let since_last = new_height.saturating_sub(next.last_airdrop_height);
+            if since_last >= interval {
+                let amount = airdrop_amount(
+                    next.gas_supply,
+                    params.airdrop_base_bps,
+                    next.ox_price,
+                    params.ox_price_reference,
+                );
+                if amount > 0 {
+                    let balances: BTreeMap<PublicKey, Amount> = next
+                        .gas
+                        .iter()
+                        .map(|(key, account)| (*key, account.balance))
+                        .collect();
+                    let grants = distribute_airdrop(&balances, amount);
+                    for (recipient, grant) in grants {
+                        next.mint_gas(recipient, grant);
+                    }
+                    next.last_airdrop_height = new_height;
+                }
+            }
+        }
 
         // ---- 4. Value index ----
         let transition = compute_value(
@@ -1022,11 +1108,35 @@ fn apply_rewards(
         }
     }
     let op_id = Operation::Rewards(r.clone()).id();
-    for (i, output) in r.all_outputs().enumerate() {
-        let outpoint = OutPoint::new(op_id, i as u32);
+    let convert = height >= params.gas_activation_height && params.gas_server_fee_bps > 0;
+    let mut out_idx = 0u32;
+    for output in &r.master_outputs {
+        let outpoint = OutPoint::new(op_id, out_idx);
         next.utxo = next
             .utxo
             .insert(UtxoEntry::new(outpoint, output.clone(), height));
+        out_idx += 1;
+    }
+    for output in &r.node_outputs {
+        let (ox_kept, gas_minted) = if convert {
+            conversion_split_with_bps(output.amount, params.gas_server_fee_bps)
+        } else {
+            (output.amount, 0)
+        };
+        if ox_kept > 0 {
+            let mut kept = output.clone();
+            kept.amount = ox_kept;
+            let outpoint = OutPoint::new(op_id, out_idx);
+            next.utxo = next
+                .utxo
+                .insert(UtxoEntry::new(outpoint, kept, height));
+        }
+        if gas_minted > 0 {
+            // Burn the converted Ox and mint the GAS fuel to the same recipient.
+            next.supply = next.supply.saturating_sub(gas_minted);
+            next.mint_gas(output.recipient, gas_minted);
+        }
+        out_idx += 1;
     }
     Ok(())
 }
@@ -1056,6 +1166,8 @@ mod tests {
         let mut params = ChainParams::default_local();
         params.block_window = 10;
         params.rebound_lock_blocks = 3;
+        // Disable GAS by default so existing tests exercise the legacy OVM fee path.
+        params.gas_activation_height = u64::MAX;
         let config = GenesisConfig {
             params: params.clone(),
             allocations: vec![
@@ -1229,10 +1341,12 @@ mod tests {
         }
         .encode()
         .unwrap();
+        let deploy_outputs = vec![TxOutput::spendable(amount - 1, node.public())];
+        let deploy_fee = oxydome_core::transfer_fee(&deploy_outputs).unwrap();
         let mut deploy = Transaction::new_unsigned(
             vec![(genesis_outpoint, node.public())],
-            vec![TxOutput::spendable(amount - 1001, node.public())],
-            1001,
+            deploy_outputs,
+            deploy_fee,
         );
         deploy.ovm_action = Some(OvmAction::Deploy {
             code: program,
@@ -1242,10 +1356,12 @@ mod tests {
         let contract_id = oxydome_ovm::contract_id(deploy.txid());
 
         let deploy_outpoint = OutPoint::new(deploy.txid(), 0);
+        let call_outputs = vec![TxOutput::spendable(amount - 2, node.public())];
+        let call_fee = oxydome_core::transfer_fee(&call_outputs).unwrap();
         let mut call = Transaction::new_unsigned(
             vec![(deploy_outpoint, node.public())],
-            vec![TxOutput::spendable(amount - 1102, node.public())],
-            101,
+            call_outputs,
+            call_fee,
         );
         call.ovm_action = Some(OvmAction::Call {
             contract_id,
@@ -1307,10 +1423,11 @@ mod tests {
         .encode()
         .unwrap();
         let deploy_gas = 5_000;
-        let deploy_fee = deploy_gas as u128 + 1;
+        let deploy_outputs = vec![TxOutput::spendable(amount - 1, node.public())];
+        let deploy_fee = oxydome_core::transfer_fee(&deploy_outputs).unwrap();
         let mut deploy = Transaction::new_unsigned(
             vec![(genesis_outpoint, node.public())],
-            vec![TxOutput::spendable(amount - deploy_fee, node.public())],
+            deploy_outputs,
             deploy_fee,
         );
         deploy.ovm_action = Some(OvmAction::DeployContract {
@@ -1321,13 +1438,11 @@ mod tests {
         let contract_id = oxydome_ovm::contract_id(deploy.txid());
 
         let call_gas = 1_000;
-        let call_fee = call_gas as u128 + 1;
+        let call_outputs = vec![TxOutput::spendable(amount - 2, node.public())];
+        let call_fee = oxydome_core::transfer_fee(&call_outputs).unwrap();
         let mut call = Transaction::new_unsigned(
             vec![(OutPoint::new(deploy.txid(), 0), node.public())],
-            vec![TxOutput::spendable(
-                amount - deploy_fee - call_fee,
-                node.public(),
-            )],
+            call_outputs,
             call_fee,
         );
         call.ovm_action = Some(OvmAction::CallContract {
@@ -1374,11 +1489,9 @@ mod tests {
         .unwrap();
         let txs = (0..11u128)
             .map(|index| {
-                let mut tx = Transaction::new_unsigned(
-                    Vec::new(),
-                    vec![TxOutput::spendable(index + 1, node.public())],
-                    1_000_001,
-                );
+                let outputs = vec![TxOutput::spendable(index + 1, node.public())];
+                let fee = oxydome_core::transfer_fee(&outputs).unwrap();
+                let mut tx = Transaction::new_unsigned(Vec::new(), outputs, fee);
                 tx.ovm_action = Some(OvmAction::Deploy {
                     code: code.clone(),
                     gas_limit: 1_000_000,
@@ -1410,15 +1523,11 @@ mod tests {
         .encode()
         .unwrap();
         let gas_limit = 100;
-        let deploy_fee = oxydome_core::transfer_fee(&[TxOutput::spendable(
-            amount - gas_limit as u128 - 1,
-            node.public(),
-        )])
-        .unwrap()
-            + gas_limit as u128;
+        let deploy_outputs = vec![TxOutput::spendable(amount - 1, node.public())];
+        let deploy_fee = oxydome_core::transfer_fee(&deploy_outputs).unwrap();
         let mut deploy = Transaction::new_unsigned(
             vec![(genesis_outpoint, node.public())],
-            vec![TxOutput::spendable(amount - deploy_fee, node.public())],
+            deploy_outputs,
             deploy_fee,
         );
         deploy.ovm_action = Some(OvmAction::Deploy { code, gas_limit });
@@ -1428,10 +1537,11 @@ mod tests {
             (OutPoint::new(deploy.txid(), 0), deploy.outputs[0].amount);
 
         let call_gas = 100;
-        let call_fee = 1 + call_gas as u128;
+        let call_outputs = vec![TxOutput::spendable(output_amount - 1, node.public())];
+        let call_fee = oxydome_core::transfer_fee(&call_outputs).unwrap();
         let mut call = Transaction::new_unsigned(
             vec![(deploy_output, node.public())],
-            vec![TxOutput::spendable(output_amount - call_fee, node.public())],
+            call_outputs,
             call_fee,
         );
         call.ovm_action = Some(OvmAction::Call {
@@ -1459,14 +1569,7 @@ mod tests {
         assert_eq!(next.ovm_receipts[1].failure, Some(OvmFailureCode::Reverted));
         assert_eq!(next.ovm_receipts[1].logs, Vec::new());
         assert!(next.contracts[&contract_id].storage.is_empty());
-        let refund = next
-            .utxo
-            .get(&OutPoint::new(block.transactions[1].txid(), 1))
-            .unwrap();
-        assert_eq!(
-            refund.output.amount,
-            call_gas as u128 - next.ovm_receipts[1].gas_used as u128
-        );
+        assert!(next.ovm_receipts[1].gas_used <= call_gas);
     }
 
     #[test]
@@ -1583,6 +1686,71 @@ fn ohm_error(message: impl Into<String>) -> StateError {
     StateError::Ohm(message.into())
 }
 
+fn gas_error(message: impl Into<String>) -> StateError {
+    StateError::Gas(message.into())
+}
+
+/// Determines the account that pays GAS for an OVM transaction. For `CallContract` the
+/// authority input's owner pays; otherwise the first input's owner pays.
+fn ovm_caller<'a>(tx: &'a Transaction, action: &OvmAction) -> Option<&'a PublicKey> {
+    match action {
+        OvmAction::CallContract {
+            authority_input, ..
+        } => tx
+            .inputs
+            .get(*authority_input as usize)
+            .map(|input| &input.owner)
+            .or_else(|| tx.inputs.first().map(|input| &input.owner)),
+        _ => tx.inputs.first().map(|input| &input.owner),
+    }
+}
+
+fn apply_gas_operation(
+    chain: &mut ChainState,
+    operation: &GasOperation,
+    op: &Operation,
+    height: u64,
+    params: &ChainParams,
+    gov: &GovernanceSet,
+) -> Result<(), StateError> {
+    if height < params.gas_activation_height {
+        return Err(StateError::GasInactive);
+    }
+    if !operation.is_valid() {
+        return Err(gas_error("signature or action encoding is invalid"));
+    }
+    match &operation.action {
+        GasAction::SetOxPrice { price } => {
+            let approvals = count_master_approvals(op, gov);
+            let threshold = gov.master_threshold(params);
+            if approvals < threshold {
+                return Err(StateError::MasterApprovalMissing(approvals, threshold));
+            }
+            chain.ox_price = *price;
+        }
+        GasAction::Transfer { to, amount } => {
+            let account = chain
+                .gas
+                .get(&operation.actor)
+                .copied()
+                .unwrap_or_default();
+            if account.nonce != operation.nonce {
+                return Err(StateError::GasNonce(operation.nonce, account.nonce));
+            }
+            if account.balance < *amount {
+                return Err(StateError::GasUnderfunded(operation.actor));
+            }
+            let mut from = account;
+            from.balance -= amount;
+            from.nonce += 1;
+            chain.gas.insert(operation.actor, from);
+            let to_account = chain.gas.entry(*to).or_default();
+            to_account.balance = to_account.balance.saturating_add(*amount);
+        }
+    }
+    Ok(())
+}
+
 fn apply_dao_operation(
     _chain: &mut ChainState,
     _operation: &DaoOperation,
@@ -1598,7 +1766,7 @@ fn apply_ohm_operation(
     operation: &OhmOperation,
     operation_id: Hash,
     height: u64,
-    _params: &ChainParams,
+    params: &ChainParams,
     gov: &GovernanceSet,
     proposer: PublicKey,
 ) -> Result<(), StateError> {
@@ -1684,16 +1852,32 @@ fn apply_ohm_operation(
             // share is minted as `LockedReward` outputs for the Ox server nodes and the remainder
             // is credited to the OHM treasury. The weighted distribution can leave rounding dust,
             // which the treasury retains so that the value minted equals the fee total exactly.
-            // Both legs enter the Ox ledger, so supply grows by exactly the fee total.
+            // Both legs enter the Ox ledger, so supply grows by exactly the fee total. When GAS
+            // is active, the server share is additionally converted: `gas_server_fee_bps` of
+            // each server reward is burned from Ox and minted as GAS to the same recipient.
             let fee_total = *fee_total;
             let (server_share, _) = compute_ohm_fee_split(fee_total);
             let server_outputs = build_ohm_server_outputs(fee_total, &gov.nodes, &proposer);
             let server_total: Amount = server_outputs.iter().map(|o| o.amount).sum();
             debug_assert!(server_total <= server_share);
             let ohm_share = fee_total.saturating_sub(server_total);
+            let convert = height >= params.gas_activation_height && params.gas_server_fee_bps > 0;
             for (i, output) in server_outputs.into_iter().enumerate() {
-                let outpoint = OutPoint::new(operation_id, i as u32);
-                chain.utxo = chain.utxo.insert(UtxoEntry::new(outpoint, output, height));
+                let (ox_kept, gas_minted) = if convert {
+                    conversion_split_with_bps(output.amount, params.gas_server_fee_bps)
+                } else {
+                    (output.amount, 0)
+                };
+                if ox_kept > 0 {
+                    let mut kept = output.clone();
+                    kept.amount = ox_kept;
+                    let outpoint = OutPoint::new(operation_id, i as u32);
+                    chain.utxo = chain.utxo.insert(UtxoEntry::new(outpoint, kept, height));
+                }
+                if gas_minted > 0 {
+                    chain.supply = chain.supply.saturating_sub(gas_minted);
+                    chain.mint_gas(output.recipient, gas_minted);
+                }
             }
 
             let treasury_balance = new_treasury

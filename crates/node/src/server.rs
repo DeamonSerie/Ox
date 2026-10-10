@@ -289,6 +289,34 @@ async fn handle_connection(
                     storage,
                 })
             }
+            Message::GetGasBalance { owner } => {
+                let amount = {
+                    let guard = node.lock().unwrap();
+                    guard.gas_balance(&owner)
+                };
+                Some(Message::GasBalanceResponse { amount })
+            }
+            Message::GetGasSupply => {
+                let amount = {
+                    let guard = node.lock().unwrap();
+                    guard.gas_supply()
+                };
+                Some(Message::GasSupplyResponse { amount })
+            }
+            Message::GetGasPrice => {
+                let amount = {
+                    let guard = node.lock().unwrap();
+                    guard.gas_price()
+                };
+                Some(Message::GasPriceResponse {})
+            }
+            Message::GetGasAirdropInfo => {
+                let height = {
+                    let guard = node.lock().unwrap();
+                    guard.last_airdrop_height()
+                };
+                Some(Message::GasAirdropInfoResponse { height })
+            }
             Message::CallOhmContract {
                 ohm_id,
                 contract_id,
