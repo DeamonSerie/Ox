@@ -339,7 +339,7 @@ fn end_to_end_blocks_and_governance() {
     let li = w.nodes.iter().position(|n| n.public() == leader).unwrap();
     let fresh = w.nodes[li].produce_block(100).unwrap();
     let mut tampered_pkg = w.nodes[0].audit_package(&fresh).unwrap();
-    tampered_pkg.pre_state_root = Hash::zero();
+    tampered_pkg.pre_utxo_root = Hash::zero();
     assert!(w.masters[0].audit(&tampered_pkg).is_err());
 }
 

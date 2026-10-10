@@ -82,8 +82,8 @@ impl HeaderChain {
         self.headers.last().expect("chain always has genesis")
     }
 
-    pub fn prev_state_root(&self) -> Hash {
-        self.head().state_root
+    pub fn prev_utxo_root(&self) -> Hash {
+        self.head().utxo_root
     }
 
     /// Sum of the last `block_window - 1` blocks' statistics (the current block is added by
@@ -201,7 +201,7 @@ impl MasterNode {
     pub fn audit(&self, package: &AuditPackage) -> Result<AuditAttestation, AuditError> {
         let epoch_changed = package.block.header.epoch != self.chain.epoch;
         let ctx = HeaderAuditContext {
-            pre_state_root: self.chain.prev_state_root(),
+            pre_utxo_root: self.chain.prev_utxo_root(),
             prev_supply: self.chain.supply,
             prev_value_index: self.chain.value_index,
             prev_generation: self.chain.generation,

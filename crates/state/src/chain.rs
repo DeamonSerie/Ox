@@ -162,6 +162,7 @@ impl ChainState {
             config.params.smart_contract_activation_height,
             Hash::zero(),
             state_root,
+            state_root,
             config.params.genesis_supply,
             0,
             0,
@@ -247,6 +248,7 @@ impl ChainState {
             params.smart_contract_activation_height,
             self.block_hash,
             Hash::zero(),
+            Hash::zero(),
             0,
             self.epoch,
             self.generation,
@@ -259,6 +261,7 @@ impl ChainState {
         let next = self.apply_inner(&block, gov, params, false)?;
         block.ovm_receipts = next.ovm_receipts.clone();
         block.header.ovm_receipt_root = block.ovm_receipt_root();
+        block.header.utxo_root = next.utxo_root();
         block.header.state_root = next.state_root();
         block.header.supply = next.supply;
         block.header.value_index = next.value_index;
@@ -674,6 +677,9 @@ impl ChainState {
         // ---- 6. Commit ----
         if enforce_header && next.supply != block.header.supply {
             return Err(StateError::SupplyMismatch(next.supply, block.header.supply));
+        }
+        if enforce_header && next.utxo_root() != block.header.utxo_root {
+            return Err(StateError::StateRootMismatch);
         }
         let computed_root = next.state_root();
         if enforce_header && computed_root != block.header.state_root {
@@ -1128,6 +1134,7 @@ mod tests {
         assert_eq!(next.ovm_receipts[0].failure, None);
         assert_eq!(next.ovm_receipts[1].failure, None);
         assert_ne!(next.state_root(), next.utxo_root());
+        assert_eq!(block.header.utxo_root, next.utxo_root());
         assert_eq!(block.header.state_root, next.state_root());
     }
 

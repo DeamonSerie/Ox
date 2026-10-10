@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const VALUE_SCALE: u128 = 1_000_000_000_000;
 pub const LEGACY_EXECUTION_VERSION: u32 = 1;
 pub const OVM_EXECUTION_VERSION: u32 = 2;
-pub const SMART_CONTRACT_EXECUTION_VERSION: u32 = 3;
+pub const SMART_CONTRACT_EXECUTION_VERSION: u32 = 4;
 
 /// The Ox value index, encoded as a fixed-point `u128` with [`VALUE_SCALE`] precision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -59,6 +59,9 @@ pub struct BlockHeader {
     pub tx_root: Hash,
     pub operation_root: Hash,
     pub ovm_receipt_root: Hash,
+    /// Commits the UTXO tree separately so header-only input proofs remain verifiable when
+    /// `state_root` also commits to contract code and storage.
+    pub utxo_root: Hash,
     pub state_root: Hash,
     pub supply: Amount,
     pub epoch: u64,
@@ -141,6 +144,7 @@ impl Block {
         ovm_activation_height: u64,
         smart_contract_activation_height: u64,
         prev_hash: Hash,
+        utxo_root: Hash,
         state_root: Hash,
         supply: Amount,
         epoch: u64,
@@ -180,6 +184,7 @@ impl Block {
                 tx_root,
                 operation_root,
                 ovm_receipt_root: merkle_root(&[]),
+                utxo_root,
                 state_root,
                 supply,
                 epoch,

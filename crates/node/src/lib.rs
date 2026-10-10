@@ -341,7 +341,7 @@ impl Node {
 
     /// Builds the audit package (with Merkle proofs) for a proposed block.
     pub fn audit_package(&self, block: &Block) -> Result<AuditPackage, NodeError> {
-        let pre_state_root = self.state.utxo_root();
+        let pre_utxo_root = self.state.utxo_root();
         let mut inputs = Vec::new();
         for tx in &block.transactions {
             for input in &tx.inputs {
@@ -365,7 +365,7 @@ impl Node {
         }
         Ok(AuditPackage {
             block: block.clone(),
-            pre_state_root,
+            pre_utxo_root,
             inputs,
         })
     }

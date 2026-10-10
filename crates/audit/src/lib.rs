@@ -1,9 +1,9 @@
 //! Master-node audit layer.
 //!
 //! Before a block is appended, masters must account for every input against the full prior
-//! history. This is done with Merkle inclusion proofs against the previous `state_root` (which
-//! commits to all funds since genesis), a deterministic replay of the block, the lineage
-//! invariant `sum(live UTXO) == supply`, and periodic literal deep replay.
+//! history. This is done with Merkle inclusion proofs against the previous UTXO root, a
+//! deterministic replay of the block, the lineage invariant `sum(live UTXO) == supply`, and
+//! periodic literal deep replay.
 
 use oxydome_core::{
     Amount, Block, ChainParams, GovernanceSet, Operation, OutPoint, PublicKey, Sig, ValueIndex,
@@ -60,8 +60,8 @@ pub struct InputProof {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditPackage {
     pub block: Block,
-    /// The state root the proofs are against (must equal the previous block's state root).
-    pub pre_state_root: Hash,
+    /// The UTXO root the proofs are against (must equal the previous block's UTXO root).
+    pub pre_utxo_root: Hash,
     pub inputs: Vec<InputProof>,
 }
 
@@ -141,7 +141,7 @@ pub fn audit_package(
     package: &AuditPackage,
 ) -> Result<AuditReport, AuditError> {
     let pre_root = state_before.utxo_root();
-    if pre_root != package.pre_state_root {
+    if pre_root != package.pre_utxo_root {
         return Err(AuditError::PreStateRootMismatch);
     }
 
@@ -179,7 +179,7 @@ pub fn audit_package(
 
     Ok(AuditReport {
         block_hash: package.block.hash(),
-        state_root: after.utxo_root(),
+        state_root: after.state_root(),
         audit_root: audit_root(package),
     })
 }
@@ -229,12 +229,14 @@ pub fn report_id(report: &AuditReport) -> Hash {
 
 /// Context a header-only master needs to audit a block without storing the UTXO set.
 ///
+/// `pre_utxo_root` must equal the previous header's UTXO-root commitment. The complete state
+/// root may additionally commit to OVM state and is not the Merkle root used by UTXO proofs.
 /// `previous_window` must be the sum of the last `block_window - 1` blocks' statistics (the
 /// function adds the current block's statistics to it), so that the window matches exactly the
 /// one the state machine used.
 #[derive(Debug, Clone)]
 pub struct HeaderAuditContext<'a> {
-    pub pre_state_root: Hash,
+    pub pre_utxo_root: Hash,
     pub prev_supply: Amount,
     pub prev_value_index: ValueIndex,
     pub prev_generation: u64,
@@ -261,7 +263,7 @@ pub fn header_audit(
     package: &AuditPackage,
 ) -> Result<AuditReport, AuditError> {
     let block = &package.block;
-    if package.pre_state_root != ctx.pre_state_root {
+    if package.pre_utxo_root != ctx.pre_utxo_root {
         return Err(AuditError::PreStateRootMismatch);
     }
 
@@ -269,7 +271,7 @@ pub fn header_audit(
     let mut proof_index: std::collections::BTreeMap<OutPoint, &InputProof> =
         std::collections::BTreeMap::new();
     for p in &package.inputs {
-        if !oxydome_state::UtxoLedger::verify_inclusion(&ctx.pre_state_root, &p.entry, &p.proof) {
+        if !oxydome_state::UtxoLedger::verify_inclusion(&ctx.pre_utxo_root, &p.entry, &p.proof) {
             return Err(AuditError::BadProof(p.outpoint));
         }
         proof_index.insert(p.outpoint, p);
