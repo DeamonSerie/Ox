@@ -203,8 +203,34 @@ pub enum Message {
     },
     /// A finalized block being broadcast to masters (who keep headers) and peers (who sync).
     FinalizedBlock {
-        block: Block,
+        finalized: Box<FinalizedBlockRecord>,
     },
+    GetFinalizedBlocks {
+        from_height: u64,
+        limit: u8,
+    },
+    FinalizedBlocksResponse {
+        blocks: Vec<FinalizedBlockRecord>,
+        tip_height: u64,
+        error: Option<String>,
+    },
+}
+
+/// Evidence accompanying a finalized block. Recipients must verify every quorum and
+/// independently execute the block before advancing full-node state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalityEvidence {
+    pub attestations: Vec<AuditAttestation>,
+    pub prepare_qc: QuorumCertificate,
+    pub commit_qc: QuorumCertificate,
+    pub master_checks: Vec<MasterCheck>,
+}
+
+/// A block plus the consensus evidence required to safely relay it to another node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizedBlockRecord {
+    pub block: Block,
+    pub evidence: FinalityEvidence,
 }
 
 /// A wallet's balances, split by output class, at the queried height.

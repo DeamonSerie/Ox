@@ -17,11 +17,12 @@ use oxydome_core::{
 use oxydome_crypto::{CodeManifest, KeyPair, SparseProof};
 use oxydome_currency::rebound_utxo_spendable;
 use oxydome_net::{
-    BalanceInfo, HistoryEntry, NodeEvent, TxLocation, TxStatus, UtxoInfo, ValueIndexInfo,
+    BalanceInfo, FinalityEvidence, FinalizedBlockRecord, HistoryEntry, NodeEvent, TxLocation,
+    TxStatus, UtxoInfo, ValueIndexInfo,
 };
 use oxydome_rewards::{participation_weights, split_fees};
 use oxydome_state::{ledger_diff, ChainState, LedgerStore, StateError, UtxoEntry};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use tokio::sync::broadcast;
 
 /// Errors raised by a node.
@@ -62,6 +63,8 @@ pub struct Node {
     pub params: ChainParams,
     pub state: ChainState,
     pub blocks: Vec<Block>,
+    /// Finality certificates retained for safe peer history serving.
+    pub finality_evidence: BTreeMap<u64, FinalityEvidence>,
     pub mempool: Vec<Transaction>,
     pub pending_ops: Vec<Operation>,
     pub admission: Option<AdmissionCertificate>,
@@ -105,6 +108,7 @@ impl Node {
             params: config.params.clone(),
             state,
             blocks: vec![genesis.clone()],
+            finality_evidence: BTreeMap::new(),
             mempool: Vec::new(),
             pending_ops: Vec::new(),
             admission,
@@ -140,6 +144,41 @@ impl Node {
         self.content_store =
             ContentStore::open(path).map_err(|error| NodeError::Ledger(error.to_string()))?;
         Ok(self)
+    }
+
+    fn verify_finality_evidence(
+        &self,
+        block: &Block,
+        evidence: &FinalityEvidence,
+    ) -> Result<(), NodeError> {
+        if !attestation_quorum(block, &evidence.attestations, &self.gov, &self.params) {
+            return Err(NodeError::NoAttestationQuorum);
+        }
+        let prepare = &evidence.prepare_qc;
+        let commit = &evidence.commit_qc;
+        if prepare.height != block.header.height
+            || prepare.block_hash != block.hash()
+            || prepare.kind != VoteKind::Prepare
+            || !prepare.has_quorum(&self.gov, &self.params)
+            || commit.height != block.header.height
+            || commit.block_hash != block.hash()
+            || commit.kind != VoteKind::Commit
+            || commit.view != prepare.view
+            || !commit.has_quorum(&self.gov, &self.params)
+        {
+            return Err(NodeError::BadCommitCertificate);
+        }
+        let expected_root = oxydome_consensus::masters_root(&self.gov.masters);
+        if !oxydome_consensus::votes::master_check_quorum(
+            &evidence.master_checks,
+            block.header.epoch,
+            expected_root,
+            &self.gov,
+            &self.params,
+        ) {
+            return Err(NodeError::NoMasterCheckQuorum);
+        }
+        Ok(())
     }
 
     pub fn get_content(&self, hash: &Hash) -> Option<Vec<u8>> {
@@ -184,6 +223,7 @@ impl Node {
         self.verify_persisted_height(&store, &blocks[0])?;
 
         let mut restored_index = WalletIndex::new();
+        let mut restored_evidence = BTreeMap::new();
         for block in blocks.iter().skip(1) {
             if block.header.height != self.state.height + 1 {
                 return Err(NodeError::Ledger(format!(
@@ -202,6 +242,25 @@ impl Node {
                     ))
                 })?;
             self.verify_persisted_height(&store, block)?;
+            if let Some(bytes) = store
+                .finality_evidence(block.header.height)
+                .map_err(|error| NodeError::Ledger(error.to_string()))?
+            {
+                let evidence: FinalityEvidence = bincode::deserialize(&bytes).map_err(|error| {
+                    NodeError::Ledger(format!(
+                        "invalid persisted finality evidence at height {}: {error}",
+                        block.header.height
+                    ))
+                })?;
+                self.verify_finality_evidence(block, &evidence)
+                    .map_err(|error| {
+                        NodeError::Ledger(format!(
+                            "invalid persisted finality evidence at height {}: {error}",
+                            block.header.height
+                        ))
+                    })?;
+                restored_evidence.insert(block.header.height, evidence);
+            }
         }
 
         let current_height = store
@@ -229,6 +288,7 @@ impl Node {
         }
 
         self.blocks = blocks;
+        self.finality_evidence = restored_evidence;
         self.wallet_index = restored_index;
         self.store = Some(store);
         self.index_store = index_store;
@@ -236,6 +296,48 @@ impl Node {
             index_store.save(&self.wallet_index)?;
         }
         Ok(self)
+    }
+
+    /// Builds the authenticated history records needed to serve peer catch-up.
+    pub fn finalized_blocks_from(
+        &self,
+        from_height: u64,
+        limit: u8,
+    ) -> Result<Vec<FinalizedBlockRecord>, String> {
+        if from_height == 0 {
+            return Err("finalized history starts after the configured genesis".into());
+        }
+        if limit == 0 || limit > 32 {
+            return Err("finalized history batch limit must be between 1 and 32".into());
+        }
+        self.blocks
+            .iter()
+            .filter(|block| block.header.height >= from_height)
+            .take(limit as usize)
+            .map(|block| {
+                let evidence = self
+                    .finality_evidence
+                    .get(&block.header.height)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "finality evidence is unavailable at height {}",
+                            block.header.height
+                        )
+                    })?;
+                self.verify_finality_evidence(block, &evidence)
+                    .map_err(|error| {
+                        format!(
+                            "invalid finality evidence at height {}: {error}",
+                            block.header.height
+                        )
+                    })?;
+                Ok(FinalizedBlockRecord {
+                    block: block.clone(),
+                    evidence,
+                })
+            })
+            .collect()
     }
 
     fn verify_persisted_height(&self, store: &LedgerStore, block: &Block) -> Result<(), NodeError> {
@@ -534,32 +636,21 @@ impl Node {
         &mut self,
         block: Block,
         attestations: &[AuditAttestation],
+        prepare_qc: &QuorumCertificate,
         commit_qc: &QuorumCertificate,
         master_checks: &[MasterCheck],
     ) -> Result<(), NodeError> {
         if block.header.prev_hash != self.state.block_hash {
             return Err(NodeError::NotOnTip);
         }
-        if !attestation_quorum(&block, attestations, &self.gov, &self.params) {
-            return Err(NodeError::NoAttestationQuorum);
-        }
-        if commit_qc.height != block.header.height
-            || commit_qc.block_hash != block.hash()
-            || !commit_qc.has_quorum(&self.gov, &self.params)
-        {
-            return Err(NodeError::BadCommitCertificate);
-        }
-        let expected_root = oxydome_consensus::masters_root(&self.gov.masters);
-        if !oxydome_consensus::votes::master_check_quorum(
-            master_checks,
-            block.header.epoch,
-            expected_root,
-            &self.gov,
-            &self.params,
-        ) {
-            return Err(NodeError::NoMasterCheckQuorum);
-        }
-
+        let evidence = FinalityEvidence {
+            attestations: attestations.to_vec(),
+            prepare_qc: prepare_qc.clone(),
+            commit_qc: commit_qc.clone(),
+            master_checks: master_checks.to_vec(),
+        };
+        self.verify_finality_evidence(&block, &evidence)?;
+        let encoded_evidence = oxydome_crypto::encode(&evidence);
         let next = self.state.apply_block(&block, &self.gov, &self.params)?;
 
         // Persist the new version before swapping it in: a failed store write leaves the node
@@ -567,13 +658,14 @@ impl Node {
         if let Some(store) = &mut self.store {
             let delta = ledger_diff(&self.state.utxo, &next.utxo);
             store
-                .save_version_with_ovm_and_block(
+                .save_version_with_finality(
                     next.height,
                     block.hash(),
                     &next.utxo,
                     &delta,
                     &next.contracts,
                     &block,
+                    &encoded_evidence,
                 )
                 .map_err(|e| NodeError::Ledger(e.to_string()))?;
         }
@@ -666,6 +758,7 @@ impl Node {
 
         self.state = next;
         self.blocks.push(block.clone());
+        self.finality_evidence.insert(block.header.height, evidence);
         self.epoch = block.header.epoch;
         Ok(())
     }

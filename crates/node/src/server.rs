@@ -30,7 +30,7 @@ pub async fn run(addr: &str, node: Node) -> std::io::Result<SocketAddr> {
     run_with_peers(addr, node, Vec::new()).await
 }
 
-/// Runs the node accept loop with static peer addresses for optional asset retrieval.
+/// Runs the node accept loop with peers for authenticated block sync and optional asset retrieval.
 pub async fn run_with_peers(
     addr: &str,
     node: Node,
@@ -117,6 +117,23 @@ async fn handle_connection(
                         .collect()
                 };
                 Some(Message::HeadersResponse { blocks })
+            }
+            Message::GetFinalizedBlocks { from_height, limit } => {
+                let guard = node.lock().unwrap();
+                let tip_height = guard.state.height;
+                let result = guard.finalized_blocks_from(from_height, limit);
+                Some(match result {
+                    Ok(blocks) => Message::FinalizedBlocksResponse {
+                        blocks,
+                        tip_height,
+                        error: None,
+                    },
+                    Err(error) => Message::FinalizedBlocksResponse {
+                        blocks: Vec::new(),
+                        tip_height,
+                        error: Some(error),
+                    },
+                })
             }
             Message::GetBalance { owner } => {
                 let info = {
@@ -253,6 +270,19 @@ async fn handle_connection(
                 };
                 Some(Message::StoreContentResponse { stored, error })
             }
+            Message::FinalizedBlock { finalized } => {
+                let result = node.lock().unwrap().finalize_block(
+                    finalized.block,
+                    &finalized.evidence.attestations,
+                    &finalized.evidence.prepare_qc,
+                    &finalized.evidence.commit_qc,
+                    &finalized.evidence.master_checks,
+                );
+                if let Err(error) = result {
+                    eprintln!("rejected finalized peer block: {error}");
+                }
+                None
+            }
             Message::Subscribe { kinds } => {
                 let rx = { node.lock().unwrap().events.subscribe() };
                 send_message(
@@ -369,6 +399,9 @@ pub async fn request_admission(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxydome_consensus::{QuorumCertificate, VoteKind};
+    use oxydome_core::{OvmAction, Transaction, TxOutput};
+    use oxydome_master::MasterNode;
     use oxydome_net::{recv_message, send_message};
 
     #[tokio::test]
@@ -404,9 +437,152 @@ mod tests {
             other => panic!("unexpected content response: {other:?}"),
         }
     }
+
+    async fn finalized_source() -> (
+        Node,
+        oxydome_core::GenesisConfig,
+        oxydome_crypto::KeyPair,
+        tempfile::TempDir,
+    ) {
+        let config = crate::default_config(1, 1, 100_000);
+        let genesis = config.genesis().unwrap();
+        let node_key = config.nodes[0].keypair().unwrap();
+        let follower_key = config.nodes[0].keypair().unwrap();
+        let (mut node, block_zero) = Node::new(node_key, &genesis, None).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = oxydome_state::LedgerStore::open(directory.path()).unwrap();
+        store
+            .init_genesis_with_block(&block_zero, &node.state.utxo, &node.state.contracts)
+            .unwrap();
+        node = node.with_store(store);
+        let master_key = config.masters[0].keypair().unwrap();
+        let mut master = MasterNode::new(
+            master_key,
+            node.gov.clone(),
+            node.params.clone(),
+            &block_zero,
+        );
+        for height in 1..=2 {
+            if height == 1 {
+                let (outpoint, amount) = node
+                    .state
+                    .utxo
+                    .iter()
+                    .find(|entry| entry.output.recipient == node.public())
+                    .map(|entry| (entry.outpoint, entry.output.amount))
+                    .unwrap();
+                let program = oxydome_ovm::Program {
+                    argument_count: oxydome_ovm::AUTHORITY_WORD_COUNT as u8,
+                    local_count: 0,
+                    instructions: vec![
+                        oxydome_ovm::Instruction::Push(7),
+                        oxydome_ovm::Instruction::Return,
+                    ],
+                }
+                .encode()
+                .unwrap();
+                let artifact = oxydome_ovm::ContractArtifact {
+                    source_hash: None,
+                    asset_manifest_hash: None,
+                    functions: vec![oxydome_ovm::ContractFunction {
+                        name: "read".into(),
+                        inputs: Vec::new(),
+                        output: Some(oxydome_ovm::ContractValueType::U64),
+                        code: program,
+                    }],
+                }
+                .encode()
+                .unwrap();
+                let fee = 1 + u128::from(1_000u64);
+                let mut deployment = Transaction::new_unsigned(
+                    vec![(outpoint, node.public())],
+                    vec![TxOutput::spendable(amount - fee, node.public())],
+                    fee,
+                );
+                deployment.ovm_action = Some(OvmAction::DeployContract {
+                    artifact,
+                    gas_limit: 1_000,
+                });
+                deployment.sign_input(0, &node.key);
+                node.submit_transaction(deployment).unwrap();
+            }
+            let block = node.produce_block(height).unwrap();
+            let package = node.audit_package(&block).unwrap();
+            let attestations = vec![master.audit(&package).unwrap()];
+            let prepare = QuorumCertificate::new(
+                height,
+                0,
+                block.hash(),
+                VoteKind::Prepare,
+                vec![node.vote(&block, VoteKind::Prepare).unwrap()],
+            );
+            let commit = QuorumCertificate::new(
+                height,
+                0,
+                block.hash(),
+                VoteKind::Commit,
+                vec![node.vote(&block, VoteKind::Commit).unwrap()],
+            );
+            let checks = vec![node.master_check()];
+            let finalized = oxydome_net::FinalizedBlockRecord {
+                block: block.clone(),
+                evidence: oxydome_net::FinalityEvidence {
+                    attestations: attestations.clone(),
+                    prepare_qc: prepare.clone(),
+                    commit_qc: commit.clone(),
+                    master_checks: checks.clone(),
+                },
+            };
+            node.finalize_block(block, &attestations, &prepare, &commit, &checks)
+                .unwrap();
+            master.on_finalized(&finalized).unwrap();
+        }
+        (node, genesis, follower_key, directory)
+    }
+
+    #[tokio::test]
+    async fn catches_up_by_verifying_finality_and_replaying_blocks() {
+        let (mut source, genesis, follower_key, _directory) = finalized_source().await;
+        let expected_root = source.state.state_root();
+        let store = source.store.take().unwrap();
+        let (restored, _) = Node::new(oxydome_crypto::KeyPair::generate(), &genesis, None).unwrap();
+        let restored = restored.restore_from_store(store, None).unwrap();
+        let (peer, _) = run_server_with_handle("127.0.0.1:0", restored)
+            .await
+            .unwrap();
+        let (mut follower, _) = Node::new(follower_key, &genesis, None).unwrap();
+
+        assert_eq!(
+            catch_up_node_from_peer(&mut follower, peer).await.unwrap(),
+            2
+        );
+        assert_eq!(follower.state.height, 2);
+        assert_eq!(follower.state.state_root(), expected_root);
+        assert_eq!(follower.blocks.len(), 3);
+        assert_eq!(follower.state.contracts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_peer_block_with_forged_quorum_evidence() {
+        let (mut source, genesis, follower_key, _directory) = finalized_source().await;
+        source
+            .finality_evidence
+            .get_mut(&1)
+            .unwrap()
+            .commit_qc
+            .votes
+            .clear();
+        let (peer, _) = run_server_with_handle("127.0.0.1:0", source).await.unwrap();
+        let (mut follower, _) = Node::new(follower_key, &genesis, None).unwrap();
+
+        assert!(catch_up_node_from_peer(&mut follower, peer).await.is_err());
+        assert_eq!(follower.state.height, 0);
+    }
 }
 
-/// Fetches all blocks from a peer starting at `from_height`.
+/// Fetches unverified block bodies for inspection only.
+///
+/// Consensus catch-up must use [`fetch_finalized_block`] and verify its evidence.
 pub async fn fetch_headers(
     peer: SocketAddr,
     from_height: u64,
@@ -422,6 +598,126 @@ pub async fn fetch_headers(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Fetches one finalized block record with evidence for independent verification.
+pub async fn fetch_finalized_block(
+    peer: SocketAddr,
+    from_height: u64,
+) -> Result<(Option<oxydome_net::FinalizedBlockRecord>, u64), NetError> {
+    match request(
+        peer,
+        &Message::GetFinalizedBlocks {
+            from_height,
+            limit: 1,
+        },
+    )
+    .await?
+    {
+        Message::FinalizedBlocksResponse {
+            mut blocks,
+            tip_height,
+            error: None,
+        } if blocks.len() <= 1 => Ok((blocks.pop(), tip_height)),
+        Message::FinalizedBlocksResponse {
+            error: Some(error), ..
+        } => Err(NetError::Unexpected(error)),
+        Message::FinalizedBlocksResponse { .. } => Err(NetError::Unexpected(
+            "peer returned more finalized blocks than requested".into(),
+        )),
+        other => Err(NetError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Catches a running node up by verifying finality evidence and executing each block locally.
+///
+/// This returns an error on any missing, malformed, noncontiguous, or invalid certificate. A
+/// partially caught-up node retains only blocks that passed full finality and state validation.
+pub async fn catch_up_from_peer(node: &SharedNode, peer: SocketAddr) -> Result<usize, NetError> {
+    let mut next_height = {
+        let guard = node
+            .lock()
+            .map_err(|_| NetError::Unexpected("node state lock is poisoned".into()))?;
+        guard
+            .state
+            .height
+            .checked_add(1)
+            .ok_or_else(|| NetError::Unexpected("node height overflow".into()))?
+    };
+    let mut applied = 0usize;
+    loop {
+        let (record, tip_height) = fetch_finalized_block(peer, next_height).await?;
+        let Some(record) = record else {
+            if tip_height >= next_height {
+                return Err(NetError::Unexpected(format!(
+                    "peer advertises tip {tip_height} but has no finalized block at height {next_height}"
+                )));
+            }
+            break;
+        };
+        if record.block.header.height != next_height {
+            return Err(NetError::Unexpected(format!(
+                "peer returned height {} while {} was requested",
+                record.block.header.height, next_height
+            )));
+        }
+        let mut guard = node
+            .lock()
+            .map_err(|_| NetError::Unexpected("node state lock is poisoned".into()))?;
+        apply_finalized_record(&mut guard, record)?;
+        applied += 1;
+        next_height = next_height
+            .checked_add(1)
+            .ok_or_else(|| NetError::Unexpected("node height overflow".into()))?;
+    }
+    Ok(applied)
+}
+
+/// Catches a node up from one peer before its listener starts.
+pub async fn catch_up_node_from_peer(node: &mut Node, peer: SocketAddr) -> Result<usize, NetError> {
+    let mut next_height = node
+        .state
+        .height
+        .checked_add(1)
+        .ok_or_else(|| NetError::Unexpected("node height overflow".into()))?;
+    let mut applied = 0usize;
+    loop {
+        let (record, tip_height) = fetch_finalized_block(peer, next_height).await?;
+        let Some(record) = record else {
+            if tip_height >= next_height {
+                return Err(NetError::Unexpected(format!(
+                    "peer advertises tip {tip_height} but has no finalized block at height {next_height}"
+                )));
+            }
+            break;
+        };
+        if record.block.header.height != next_height {
+            return Err(NetError::Unexpected(format!(
+                "peer returned height {} while {} was requested",
+                record.block.header.height, next_height
+            )));
+        }
+        apply_finalized_record(node, record)?;
+        applied += 1;
+        next_height = next_height
+            .checked_add(1)
+            .ok_or_else(|| NetError::Unexpected("node height overflow".into()))?;
+    }
+    Ok(applied)
+}
+
+fn apply_finalized_record(
+    node: &mut Node,
+    record: oxydome_net::FinalizedBlockRecord,
+) -> Result<(), NetError> {
+    node.finalize_block(
+        record.block,
+        &record.evidence.attestations,
+        &record.evidence.prepare_qc,
+        &record.evidence.commit_qc,
+        &record.evidence.master_checks,
+    )
+    .map_err(|error| NetError::Unexpected(format!("peer block rejected: {error}")))
 }
 
 /// Sends a single request and waits for the first non-pong reply.

@@ -103,10 +103,25 @@ pub fn run(blocks: u64, supply: u128, db: Option<String>) -> Result<()> {
 
         let checks: Vec<MasterCheck> = nodes.iter().map(|n| n.master_check()).collect();
         for n in &mut nodes {
-            n.finalize_block(block.clone(), &attestations, &commit_qc, &checks)?;
+            n.finalize_block(
+                block.clone(),
+                &attestations,
+                &prepare_qc,
+                &commit_qc,
+                &checks,
+            )?;
         }
+        let finalized = oxydome_net::FinalizedBlockRecord {
+            block: block.clone(),
+            evidence: oxydome_net::FinalityEvidence {
+                attestations: attestations.clone(),
+                prepare_qc,
+                commit_qc,
+                master_checks: checks,
+            },
+        };
         for m in &mut masters {
-            m.on_finalized(&block);
+            m.on_finalized(&finalized).map_err(anyhow::Error::msg)?;
         }
 
         println!(

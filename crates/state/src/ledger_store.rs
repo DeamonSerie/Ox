@@ -70,6 +70,7 @@ const PREFIX_SNAPSHOT: u8 = 1u8;
 const PREFIX_DELTA: u8 = 2u8;
 const PREFIX_OVM: u8 = 4u8;
 const PREFIX_BLOCK: u8 = 5u8;
+const PREFIX_FINALITY: u8 = 6u8;
 const KEY_CURRENT: [u8; 1] = [3u8];
 
 fn node_key(hash: &Hash) -> Vec<u8> {
@@ -440,7 +441,7 @@ impl LedgerStore {
         delta: &LedgerDelta,
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
     ) -> Result<(), LedgerError> {
-        self.save_version_contents(height, block_hash, ledger, delta, contracts, None)
+        self.save_version_contents(height, block_hash, ledger, delta, contracts, None, None)
     }
 
     /// Atomically commits UTXO, OVM and block data for a finalized height.
@@ -458,7 +459,48 @@ impl LedgerStore {
                 "block does not match persisted version".into(),
             ));
         }
-        self.save_version_contents(height, block_hash, ledger, delta, contracts, Some(block))
+        self.save_version_contents(
+            height,
+            block_hash,
+            ledger,
+            delta,
+            contracts,
+            Some(block),
+            None,
+        )
+    }
+
+    /// Atomically commits UTXO, OVM, block data, and opaque finalized-evidence bytes.
+    ///
+    /// The state crate stores evidence opaquely to avoid depending on the higher-level audit
+    /// and consensus crates; callers decode and validate it before use.
+    pub fn save_version_with_finality(
+        &mut self,
+        height: u64,
+        block_hash: Hash,
+        ledger: &UtxoLedger,
+        delta: &LedgerDelta,
+        contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+        block: &oxydome_core::Block,
+        finality_evidence: &[u8],
+    ) -> Result<(), LedgerError> {
+        if block.header.height != height
+            || block.hash() != block_hash
+            || finality_evidence.is_empty()
+        {
+            return Err(LedgerError::Corrupt(
+                "block or finality evidence does not match persisted version".into(),
+            ));
+        }
+        self.save_version_contents(
+            height,
+            block_hash,
+            ledger,
+            delta,
+            contracts,
+            Some(block),
+            Some(finality_evidence),
+        )
     }
 
     fn save_version_contents(
@@ -469,6 +511,7 @@ impl LedgerStore {
         delta: &LedgerDelta,
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
         block: Option<&oxydome_core::Block>,
+        finality_evidence: Option<&[u8]>,
     ) -> Result<(), LedgerError> {
         self.ensure_seeded()?;
 
@@ -554,6 +597,9 @@ impl LedgerStore {
         if let Some(block) = block {
             batch.insert(height_key(PREFIX_BLOCK, height), Self::encode(block)?);
         }
+        if let Some(evidence) = finality_evidence {
+            batch.insert(height_key(PREFIX_FINALITY, height), evidence);
+        }
         batch.insert(&KEY_CURRENT, height.to_le_bytes().to_vec());
         self.tree.apply_batch(batch)?;
 
@@ -561,6 +607,14 @@ impl LedgerStore {
         self.persisted
             .extend(writes.into_iter().map(|(hash, _)| hash));
         Ok(())
+    }
+
+    /// Loads opaque finalized-evidence bytes saved atomically with a block.
+    pub fn finality_evidence(&self, height: u64) -> Result<Option<Vec<u8>>, LedgerError> {
+        Ok(self
+            .tree
+            .get(height_key(PREFIX_FINALITY, height))?
+            .map(|bytes| bytes.to_vec()))
     }
 
     /// Replays the chain from an empty ledger, checking every saved snapshot's root and

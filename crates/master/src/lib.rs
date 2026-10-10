@@ -11,16 +11,19 @@ pub mod server;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use oxydome_audit::{
-    audit_root, header_audit, AuditAttestation, AuditError, AuditPackage, AuditReport,
-    HeaderAuditContext,
+    attestation_quorum, audit_root, header_audit, AuditAttestation, AuditError, AuditPackage,
+    AuditReport, HeaderAuditContext,
 };
-use oxydome_consensus::{masters_root, AdmissionCertificate, EpochTransition, MasterProposal};
+use oxydome_consensus::{
+    masters_root, AdmissionCertificate, EpochTransition, MasterProposal, VoteKind,
+};
 use oxydome_core::{
     Amount, Block, BlockHeader, ChainParams, GenesisConfig, GovernanceSet, Hash, PublicKey,
     ValueIndex,
 };
 use oxydome_crypto::KeyPair;
 use oxydome_currency::WindowStats;
+use oxydome_net::FinalizedBlockRecord;
 
 /// The admission registry: which software is approved, which nodes are admitted or revoked.
 #[derive(Debug, Clone, Default)]
@@ -229,9 +232,46 @@ impl MasterNode {
         Ok(AuditAttestation::sign(&report, &self.key))
     }
 
-    /// Records a finalized block (header only).
-    pub fn on_finalized(&mut self, block: &Block) {
+    /// Records a finalized block header after verifying its finality evidence.
+    ///
+    /// Masters validate the signatures and header chain but do not independently execute OVM.
+    pub fn on_finalized(&mut self, finalized: &FinalizedBlockRecord) -> Result<(), String> {
+        let block = &finalized.block;
+        let evidence = &finalized.evidence;
+        if block.header.height != self.chain.head().height.saturating_add(1)
+            || block.header.prev_hash != oxydome_crypto::hash_value(self.chain.head())
+            || !block.roots_match()
+        {
+            return Err("finalized header does not extend the current master tip".into());
+        }
+        let prepare = &evidence.prepare_qc;
+        let commit = &evidence.commit_qc;
+        if prepare.height != block.header.height
+            || prepare.block_hash != block.hash()
+            || prepare.kind != VoteKind::Prepare
+            || !prepare.has_quorum(&self.gov, &self.params)
+            || commit.height != block.header.height
+            || commit.block_hash != block.hash()
+            || commit.kind != VoteKind::Commit
+            || commit.view != prepare.view
+            || !commit.has_quorum(&self.gov, &self.params)
+        {
+            return Err("finalized block lacks valid prepare/commit quorum certificates".into());
+        }
+        if !attestation_quorum(block, &evidence.attestations, &self.gov, &self.params) {
+            return Err("finalized block lacks a valid master attestation quorum".into());
+        }
+        if !oxydome_consensus::votes::master_check_quorum(
+            &evidence.master_checks,
+            block.header.epoch,
+            self.masters_root(),
+            &self.gov,
+            &self.params,
+        ) {
+            return Err("finalized block lacks a valid master-check quorum".into());
+        }
         self.chain.append(block, &self.params);
+        Ok(())
     }
 
     /// Co-signs an epoch transition to change the master set.

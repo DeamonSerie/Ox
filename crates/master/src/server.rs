@@ -67,6 +67,14 @@ async fn handle_connection(
             }
             // Masters serve header metadata only, never block bodies.
             Message::GetHeaders { .. } => Some(Message::HeadersResponse { blocks: Vec::new() }),
+            Message::GetFinalizedBlocks { .. } => {
+                let tip_height = node.lock().unwrap().chain.head().height;
+                Some(Message::FinalizedBlocksResponse {
+                    blocks: Vec::new(),
+                    tip_height,
+                    error: Some("masters do not serve block history".into()),
+                })
+            }
             // A leader asks the masters to audit a proposed block.
             Message::Proposal { package, .. } => {
                 let result = {
@@ -82,8 +90,10 @@ async fn handle_connection(
                 }
             }
             // A finalized block extends the master's header chain.
-            Message::FinalizedBlock { block } => {
-                node.lock().unwrap().on_finalized(&block);
+            Message::FinalizedBlock { finalized } => {
+                if let Err(error) = node.lock().unwrap().on_finalized(&finalized) {
+                    eprintln!("rejected finalized block header: {error}");
+                }
                 None
             }
             _ => None,

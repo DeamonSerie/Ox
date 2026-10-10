@@ -193,15 +193,6 @@ async fn main() -> Result<()> {
             .with_context(|| format!("cannot open asset store for {db}"))?;
     }
 
-    println!(
-        "oxydome-node {} listening on {} (height {}, state_root {})",
-        name,
-        listen,
-        node.state.height,
-        node.state.state_root().to_hex(),
-    );
-    println!("genesis block hash: {}", genesis.hash().to_hex());
-
     let peers = flags
         .get("--peers")
         .map(|addresses| {
@@ -218,6 +209,38 @@ async fn main() -> Result<()> {
         })
         .transpose()?
         .unwrap_or_default();
+    let mut peer_replied = peers.is_empty();
+    let mut sync_errors = Vec::new();
+    for peer in &peers {
+        match oxydome_node::server::catch_up_node_from_peer(&mut node, *peer).await {
+            Ok(applied) => {
+                peer_replied = true;
+                if applied > 0 {
+                    println!("caught up {applied} finalized blocks from peer {peer}");
+                }
+            }
+            Err(error) => sync_errors.push(format!("{peer}: {error}")),
+        }
+    }
+    if !peer_replied {
+        anyhow::bail!(
+            "could not verify peer history from any configured peer: {}",
+            sync_errors.join("; ")
+        );
+    }
+    for error in sync_errors {
+        eprintln!("peer catch-up failed: {error}");
+    }
+
+    println!(
+        "oxydome-node {} listening on {} (height {}, state_root {})",
+        name,
+        listen,
+        node.state.height,
+        node.state.state_root().to_hex(),
+    );
+    println!("genesis block hash: {}", genesis.hash().to_hex());
+
     oxydome_node::server::run_with_peers(&listen, node, peers).await?;
     Ok(())
 }

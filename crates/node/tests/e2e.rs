@@ -178,11 +178,26 @@ fn advance(w: &mut World, height: u64, txs: Vec<Transaction>, ops: Vec<Operation
     let checks: Vec<MasterCheck> = w.nodes.iter().map(|n| n.master_check()).collect();
 
     for n in &mut w.nodes {
-        n.finalize_block(block.clone(), &attestations, &commit_qc, &checks)
-            .expect("finalization must succeed");
+        n.finalize_block(
+            block.clone(),
+            &attestations,
+            &prepare_qc,
+            &commit_qc,
+            &checks,
+        )
+        .expect("finalization must succeed");
     }
+    let finalized = oxydome_net::FinalizedBlockRecord {
+        block: block.clone(),
+        evidence: oxydome_net::FinalityEvidence {
+            attestations: attestations.clone(),
+            prepare_qc,
+            commit_qc,
+            master_checks: checks,
+        },
+    };
     for m in &mut w.masters {
-        m.on_finalized(&block);
+        m.on_finalized(&finalized).unwrap();
     }
     block
 }
