@@ -37,10 +37,22 @@ pub struct ChainParams {
     pub airdrop_interval_blocks: u64,
     /// Base airdrop size as basis points of the current circulating GAS supply.
     #[serde(default = "default_airdrop_base_bps")]
-    pub airdrop_base_bps: u32,
+pub airdrop_base_bps: u32,
     /// Normalizing reference for the Ox price oracle in the airdrop formula.
     #[serde(default = "default_amount_one")]
     pub ox_price_reference: Amount,
+    /// Height at which GAS price updates become active.
+    #[serde(default = "default_one")]
+    pub price_update_height: u64,
+    /// Master approval threshold for price changes (bps denominator).
+    #[serde(default = "default_price_update_threshold")]
+    pub price_update_threshold: u32,
+    /// Maximum basis points change allowed per price update interval.
+    #[serde(default = "default_price_change_limit_bps")]
+    pub price_change_limit_bps: u32,
+    /// Weighted average smoothing factor for price changes.
+    #[serde(default = "default_price_smoothing_bps")]
+    pub price_smoothing_bps: u32,
 
     // ---- fee split ----
     /// Share of block fees paid to masters, in basis points (`400` = 4%).
@@ -126,6 +138,18 @@ fn default_airdrop_base_bps() -> u32 {
     100
 }
 
+fn default_price_update_threshold() -> u32 {
+    66_67
+}
+
+fn default_price_change_limit_bps() -> u32 {
+    500
+}
+
+fn default_price_smoothing_bps() -> u32 {
+    250
+}
+
 impl ChainParams {
     pub fn execution_version_at(&self, height: u64) -> u32 {
         if height >= self.smart_contract_activation_height {
@@ -151,6 +175,10 @@ impl ChainParams {
             airdrop_interval_blocks: 100,
             airdrop_base_bps: 100,
             ox_price_reference: 1,
+            price_update_height: 1,
+            price_update_threshold: 66_67,
+            price_change_limit_bps: 500,
+            price_smoothing_bps: 250,
             fee_master_bps: 400,
             bft_num: 2,
             bft_den: 3,

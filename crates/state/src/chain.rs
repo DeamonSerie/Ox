@@ -158,6 +158,10 @@ pub struct ChainState {
     pub ox_price: Amount,
     /// Height of the most recent GAS airdrop.
     pub last_airdrop_height: u64,
+    /// Height at which GAS price updates become active.
+    pub price_update_height: u64,
+    /// Last height at which the GAS price was updated.
+    pub price_last_update_height: u64,
 }
 
 impl ChainState {
@@ -226,6 +230,8 @@ impl ChainState {
             gas_supply: 0,
             ox_price: config.params.ox_price_reference,
             last_airdrop_height: 0,
+            price_update_height: config.params.price_update_height,
+            price_last_update_height: 0,
         };
         let gov = GovernanceSet::new(config.masters.clone(), config.nodes.clone());
         Ok((state, block, gov))
@@ -616,6 +622,10 @@ impl ChainState {
                 }
                 Operation::Gas(gas_operation) => {
                     apply_gas_operation(&mut next, gas_operation, op, new_height, params, gov)?;
+                }
+                Operation::PriceChange(_) => {
+                    // Price changes are handled by the consensus process,
+                    // not by direct state application here.
                 }
                 Operation::Mint(m) => {
                     let approvals = count_master_approvals(op, gov);

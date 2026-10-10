@@ -135,6 +135,7 @@ impl HeaderChain {
                 | oxydome_core::Operation::Dao(_) 
                 | oxydome_core::Operation::Ohm(_) => {}
                 | oxydome_core::Operation::Gas(_) => {}
+                | oxydome_core::Operation::PriceChange(_) => {}
             }
         }
         self.supply = block.header.supply;

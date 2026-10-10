@@ -55,6 +55,16 @@ pub struct TreasuryBurn {
     pub approvals: Vec<MasterApproval>,
 }
 
+/// A proposal to change the GAS price oracle value. Requires master super-majority approval,
+/// followed by server consensus with change limits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreasuryPriceChange {
+    /// The new Ox price oracle value (same scale as ox_price_reference).
+    pub new_price: Amount,
+    /// Basis points of master approvals collected.
+    pub approvals: Vec<MasterApproval>,
+}
+
 /// A node's request to unlock `amount` of its on-chain fee earnings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WithdrawRequest {
@@ -132,6 +142,9 @@ enum SignableOperation {
         nonce: u64,
         action: GasAction,
     },
+    PriceChange {
+        new_price: Amount,
+    },
 }
 
 /// A block operation.
@@ -144,6 +157,7 @@ pub enum Operation {
     Dao(DaoOperation),
     Ohm(OhmOperation),
     Gas(GasOperation),
+    PriceChange(TreasuryPriceChange),
 }
 
 impl Operation {
@@ -181,6 +195,9 @@ impl Operation {
                 nonce: op.nonce,
                 action: op.action.clone(),
             },
+            Operation::PriceChange(tp) => SignableOperation::PriceChange {
+                new_price: tp.new_price,
+            },
         };
         hash_value(&signable)
     }
@@ -190,6 +207,7 @@ impl Operation {
             Operation::Mint(m) => &m.approvals,
             Operation::Burn(b) => &b.approvals,
             Operation::Gas(g) => &g.approvals,
+            Operation::PriceChange(p) => &p.approvals,
             _ => &[],
         }
     }

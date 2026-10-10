@@ -366,6 +366,7 @@ pub fn header_audit(
                 }
             }
             Operation::Gas(gas_operation) => {}
+            Operation::PriceChange(_) => {}
         }
     }
 
