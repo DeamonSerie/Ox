@@ -351,6 +351,20 @@ pub fn header_audit(
                 epoch_withdrawn = epoch_withdrawn.saturating_add(w.amount);
             }
             Operation::Rewards(_) => {}
+            Operation::Dao(dao_operation) => {
+                if !dao_operation.is_valid() {
+                    return Err(AuditError::Guardrail(
+                        "DAO operation signature or encoding is invalid".into(),
+                    ));
+                }
+            }
+            Operation::Ohm(ohm_operation) => {
+                if !ohm_operation.is_valid() {
+                    return Err(AuditError::Guardrail(
+                        "OHM operation signature or encoding is invalid".into(),
+                    ));
+                }
+            }
         }
     }
 

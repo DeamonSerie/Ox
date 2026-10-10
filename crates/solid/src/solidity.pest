@@ -8,13 +8,26 @@ solidity_version = { ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 contract_definition = {
     contract_kind ~ identifier ~ inheritance? ~ "{" ~ contract_item* ~ "}"
 }
+dao_definition = { "dao" ~ "{" ~ dao_makers ~ dao_currency ~ dao_peg ~ "}" }
+dao_makers = { "makers" ~ ":" ~ "[" ~ (string_literal ~ ("," ~ string_literal)*)? ~ "]" ~ ";" }
+dao_currency = { "currency" ~ ":" ~ (dao_currency_none | dao_currency_optional) ~ ";" }
+dao_currency_none = { "none" }
+dao_currency_optional = {
+    "optional" ~ "(" ~ string_literal ~ "," ~ "initial_supply" ~ ":" ~ number_literal ~ ")"
+}
+dao_peg = { "peg" ~ ":" ~ (dao_peg_none | dao_peg_some) ~ ";" }
+dao_peg_none = { "none" }
+dao_peg_some = {
+    "some" ~ "(" ~ string_literal ~ "," ~ "numerator" ~ ":" ~ number_literal ~
+    "," ~ "denominator" ~ ":" ~ number_literal ~ ")"
+}
 contract_kind = { "contract" | "interface" | "library" }
 inheritance = { "is" ~ inheritance_item ~ ("," ~ inheritance_item)* }
 inheritance_item = { identifier ~ ("(" ~ argument_list? ~ ")")? }
 contract_item = {
     function_definition | constructor_definition | fallback_definition |
     receive_definition | modifier_definition | event_definition |
-    error_definition | struct_definition | enum_definition |
+    error_definition | struct_definition | enum_definition | dao_definition |
     state_variable | ";"
 }
 

@@ -7,7 +7,7 @@
 
 use crate::Node;
 use oxydome_consensus::AdmissionCertificate;
-use oxydome_core::{Block, Hash, OutPoint, PublicKey, Transaction};
+use oxydome_core::{Amount, Block, Hash, OhmBlock, OhmState, OutPoint, PublicKey, Transaction};
 use oxydome_crypto::SparseProof;
 use oxydome_net::{
     recv_message, send_message, BalanceInfo, HistoryEntry, Message, NetError, NodeEvent,
@@ -209,6 +209,125 @@ async fn handle_connection(
                     accepted,
                     error,
                 })
+            }
+            Message::SubmitOperation { operation } => {
+                let operation_id = operation.id();
+                let result = node.lock().unwrap().submit_operation(*operation);
+                let (accepted, error) = match result {
+                    Ok(()) => (true, None),
+                    Err(error) => (false, Some(error.to_string())),
+                };
+                Some(Message::OperationSubmitResponse {
+                    operation_id,
+                    accepted,
+                    error,
+                })
+            }
+            Message::GetDao { dao_id } => {
+                let state = node.lock().unwrap().state.daos.get(&dao_id).cloned();
+                Some(Message::DaoResponse { dao_id, state })
+            }
+            Message::GetOhm { ohm_id } => {
+                let state = node.lock().unwrap().ohm_state(&ohm_id).cloned();
+                Some(Message::OhmResponse {
+                    ohm_id,
+                    state: state.map(Box::new),
+                })
+            }
+            Message::GetOhmBlock { hash } => {
+                let block = node.lock().unwrap().ohm_block(&hash).cloned();
+                Some(Message::OhmBlockResponse {
+                    block: block.map(Box::new),
+                })
+            }
+            Message::GetOhmBalance { ohm_id, owner } => {
+                let amount = {
+                    let guard = node.lock().unwrap();
+                    guard
+                        .ohm_ledger(&ohm_id)
+                        .map(|ledger| {
+                            ledger
+                                .utxos
+                                .values()
+                                .filter(|entry| entry.output.recipient == owner)
+                                .map(|entry| entry.output.amount)
+                                .sum()
+                        })
+                        .unwrap_or(0)
+                };
+                Some(Message::OhmBalanceResponse { ohm_id, amount })
+            }
+            Message::SubmitOhmBlock { block } => {
+                let hash = block.hash();
+                let result = node.lock().unwrap().submit_ohm_block(*block);
+                let (accepted, error) = match result {
+                    Ok(_) => (true, None),
+                    Err(error) => (false, Some(error.to_string())),
+                };
+                Some(Message::OhmBlockSubmitResponse {
+                    hash,
+                    accepted,
+                    error,
+                })
+            }
+            Message::GetOhmContract {
+                ohm_id,
+                contract_id,
+            } => {
+                let contract = node.lock().unwrap().ohm_contract(&ohm_id, &contract_id).cloned();
+                let (code, storage) = match contract {
+                    Some(contract) => {
+                        let storage = contract.storage.into_iter().collect();
+                        (Some(contract.code), Some(storage))
+                    }
+                    None => (None, None),
+                };
+                Some(Message::OhmContractResponse {
+                    ohm_id,
+                    contract_id,
+                    code,
+                    storage,
+                })
+            }
+            Message::CallOhmContract {
+                ohm_id,
+                contract_id,
+                entry_point,
+                arguments,
+                caller,
+                gas_limit,
+            } => {
+                let result = node.lock().unwrap().ohm_call_contract(
+                    &ohm_id,
+                    &contract_id,
+                    &entry_point,
+                    caller,
+                    &arguments,
+                    gas_limit,
+                );
+                match result {
+                    Ok(outcome) => Some(Message::OhmContractCallResponse {
+                        failure: outcome.failure,
+                        gas_used: outcome.gas_used,
+                        return_value: outcome.return_value,
+                        logs: outcome
+                            .logs
+                            .into_iter()
+                            .map(|log| oxydome_core::OvmLog {
+                                topic: log.topic,
+                                value: log.value,
+                            })
+                            .collect(),
+                        error: None,
+                    }),
+                    Err(error) => Some(Message::OhmContractCallResponse {
+                        failure: None,
+                        gas_used: 0,
+                        return_value: None,
+                        logs: Vec::new(),
+                        error: Some(error.to_string()),
+                    }),
+                }
             }
             Message::GetOvmCode { contract_id } => {
                 let code = node.lock().unwrap().ovm_code(&contract_id);
@@ -815,6 +934,100 @@ pub async fn get_value_index(peer: SocketAddr) -> Result<ValueIndexInfo, NetErro
         Message::ValueIndexResponse { info } => Ok(info),
         other => Err(NetError::Unexpected(format!("{other:?}"))),
     }
+}
+
+/// Fetches the Ox-committed OHM anchor state for `ohm_id`.
+pub async fn get_ohm(peer: SocketAddr, ohm_id: Hash) -> Result<Option<OhmState>, NetError> {
+    match request(peer, &Message::GetOhm { ohm_id }).await? {
+        Message::OhmResponse { state, .. } => Ok(state.map(|s| *s)),
+        other => Err(NetError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Fetches a private OHM block body by hash.
+pub async fn get_ohm_block(peer: SocketAddr, hash: Hash) -> Result<Option<OhmBlock>, NetError> {
+    match request(peer, &Message::GetOhmBlock { hash }).await? {
+        Message::OhmBlockResponse { block } => Ok(block.map(|b| *b)),
+        other => Err(NetError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Fetches the OHM-local balance of `owner` within `ohm_id`.
+pub async fn get_ohm_balance(
+    peer: SocketAddr,
+    ohm_id: Hash,
+    owner: PublicKey,
+) -> Result<Amount, NetError> {
+    match request(peer, &Message::GetOhmBalance { ohm_id, owner }).await? {
+        Message::OhmBalanceResponse { amount, .. } => Ok(amount),
+        other => Err(NetError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Submits a private OHM block, returning its hash, acceptance and rejection reason.
+pub async fn submit_ohm_block(
+    peer: SocketAddr,
+    block: OhmBlock,
+) -> Result<(Hash, bool, Option<String>), NetError> {
+    match request(
+        peer,
+        &Message::SubmitOhmBlock {
+            block: Box::new(block),
+        },
+    )
+    .await?
+    {
+        Message::OhmBlockSubmitResponse {
+            hash,
+            accepted,
+            error,
+        } => Ok((hash, accepted, error)),
+        other => Err(NetError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Fetches an OHM-hosted OVM contract's code and storage.
+pub async fn get_ohm_contract(
+    peer: SocketAddr,
+    ohm_id: Hash,
+    contract_id: Hash,
+) -> Result<(Option<Vec<u8>>, Option<Vec<(u64, u64)>>), NetError> {
+    match request(
+        peer,
+        &Message::GetOhmContract {
+            ohm_id,
+            contract_id,
+        },
+    )
+    .await?
+    {
+        Message::OhmContractResponse { code, storage, .. } => Ok((code, storage)),
+        other => Err(NetError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Simulates an OHM-hosted contract call, returning the outcome (never mutates state).
+pub async fn call_ohm_contract(
+    peer: SocketAddr,
+    ohm_id: Hash,
+    contract_id: Hash,
+    entry_point: String,
+    arguments: Vec<u64>,
+    caller: PublicKey,
+    gas_limit: u64,
+) -> Result<Message, NetError> {
+    request(
+        peer,
+        &Message::CallOhmContract {
+            ohm_id,
+            contract_id,
+            entry_point,
+            arguments,
+            caller,
+            gas_limit,
+        },
+    )
+    .await
 }
 
 /// Submits `tx`, returning its txid, whether it was accepted, and the rejection reason.

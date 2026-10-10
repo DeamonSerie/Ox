@@ -9,6 +9,7 @@ oxydome-core.workspace = true
 oxydome-crypto.workspace = true
 oxydome-currency.workspace = true
 oxydome-state.workspace = true
+oxydome-ohm.workspace = true
 oxydome-ovm.workspace = true
 oxydome-consensus.workspace = true
 oxydome-audit.workspace = true

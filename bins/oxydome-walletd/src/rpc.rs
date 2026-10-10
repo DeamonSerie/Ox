@@ -5,7 +5,8 @@
 
 use crate::{node_client::NodeClient, AppState};
 use oxydome_wallet_rpc::{
-    balance_to_rpc, block_to_rpc, history_to_rpc, methods, status_to_rpc, to_hex, tx_to_rpc,
+    balance_to_rpc, block_to_rpc, history_to_rpc, methods, ohm_block_to_rpc,
+    ohm_contract_call_to_rpc, ohm_contract_to_rpc, ohm_to_rpc, status_to_rpc, to_hex, tx_to_rpc,
     utxo_to_rpc, value_index_to_rpc, RpcError, RpcRequest, RpcResponse,
 };
 use serde_json::{json, Value};
@@ -48,6 +49,15 @@ pub async fn dispatch(state: &Arc<AppState>, req: &RpcRequest) -> RpcResponse {
         methods::GET_HISTORY => handle_get_history(state, &params).await,
         methods::GET_PROOF => handle_get_proof(state, &params).await,
         methods::GET_VALUE_INDEX => handle_get_value_index(state).await,
+        methods::GET_DAO => handle_get_dao(state, &params).await,
+        methods::SUBMIT_DAO_OPERATION => handle_submit_dao_operation(state, &params).await,
+        methods::GET_OHM => handle_get_ohm(state, &params).await,
+        methods::GET_OHM_BLOCK => handle_get_ohm_block(state, &params).await,
+        methods::GET_OHM_BALANCE => handle_get_ohm_balance(state, &params).await,
+        methods::SUBMIT_OHM_OPERATION => handle_submit_ohm_operation(state, &params).await,
+        methods::SUBMIT_OHM_BLOCK => handle_submit_ohm_block(state, &params).await,
+        methods::GET_OHM_CONTRACT => handle_get_ohm_contract(state, &params).await,
+        methods::CALL_OHM_CONTRACT => handle_call_ohm_contract(state, &params).await,
         methods::VAULT_CREATE => handle_vault_create(state, &params).await,
         methods::VAULT_IMPORT => handle_vault_import(state, &params).await,
         methods::VAULT_UNLOCK => handle_vault_unlock(state, &params).await,
@@ -748,6 +758,402 @@ async fn handle_send_transaction(state: &Arc<AppState>, params: &Value) -> Resul
     }
 }
 
+async fn handle_get_dao(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let dao_id = params
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected DAO id"))?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    match client
+        .get_dao(parse_hash(dao_id)?)
+        .await
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?
+    {
+        Some(dao) => serde_json::to_value(dao)
+            .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string())),
+        None => Err(RpcError::new(
+            RpcError::RESOURCE_NOT_FOUND,
+            "DAO was not found",
+        )),
+    }
+}
+
+async fn handle_submit_dao_operation(
+    state: &Arc<AppState>,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let object = params
+        .as_object()
+        .or_else(|| {
+            params
+                .as_array()
+                .and_then(|values| values.first())
+                .and_then(Value::as_object)
+        })
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcError::INVALID_PARAMS,
+                "expected { action, account? } parameters",
+            )
+        })?;
+    let action: oxydome_core::DaoAction = serde_json::from_value(
+        object
+            .get("action")
+            .cloned()
+            .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing DAO action"))?,
+    )
+    .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))?;
+    let account = object
+        .get("account")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .try_into()
+        .map_err(|_| RpcError::new(RpcError::INVALID_PARAMS, "account index is too large"))?;
+
+    let operation = {
+        let vault = state.vault.lock().await;
+        if !vault.is_unlocked() {
+            return Err(RpcError::new(RpcError::VAULT_LOCKED, "vault is locked"));
+        }
+        let actor = vault
+            .derive_key(account, 0)
+            .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))?;
+        let mut operation = oxydome_core::DaoOperation::new_unsigned(actor, action);
+        let signature = vault
+            .sign_hash(account, 0, &operation.signing_hash().0)
+            .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?;
+        operation.signature = oxydome_crypto::Sig(signature);
+        if !operation.is_valid() {
+            return Err(RpcError::new(
+                RpcError::INVALID_PARAMS,
+                "DAO action has an invalid shape",
+            ));
+        }
+        operation
+    };
+    let result_id = operation
+        .created_dao_id()
+        .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error))?
+        .unwrap_or_else(|| operation.id());
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    let (_, accepted, error) = client
+        .submit_operation(oxydome_core::Operation::Dao(operation))
+        .await
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?;
+    if !accepted {
+        return Err(RpcError::new(
+            RpcError::TX_REJECTED,
+            error.unwrap_or_else(|| "DAO operation rejected".into()),
+        ));
+    }
+    Ok(json!(to_hex(result_id.as_bytes())))
+}
+
+async fn handle_get_ohm(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let ohm_id = params
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected OHM id"))?;
+    let ohm_id = parse_hash(ohm_id)?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    match client
+        .get_ohm(ohm_id)
+        .await
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?
+    {
+        Some(ohm) => serde_json::to_value(ohm_to_rpc(&ohm_id, &ohm))
+            .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string())),
+        None => Err(RpcError::new(
+            RpcError::RESOURCE_NOT_FOUND,
+            "OHM was not found",
+        )),
+    }
+}
+
+async fn handle_get_ohm_block(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let hash = params
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected OHM block hash"))?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    match client
+        .get_ohm_block(parse_hash(hash)?)
+        .await
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?
+    {
+        Some(block) => serde_json::to_value(ohm_block_to_rpc(&block))
+            .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string())),
+        None => Err(RpcError::new(
+            RpcError::RESOURCE_NOT_FOUND,
+            "OHM block was not found",
+        )),
+    }
+}
+
+async fn handle_get_ohm_balance(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let values = params
+        .as_array()
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected [ohm_id, address]"))?;
+    let ohm_id = values
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected OHM id"))?;
+    let address = values
+        .get(1)
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected address"))?;
+    let owner = parse_address(address)?;
+    let ohm_id = parse_hash(ohm_id)?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    let amount = client
+        .get_ohm_balance(ohm_id, owner)
+        .await
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?;
+    Ok(json!({
+        "ohmId": to_hex(ohm_id.as_bytes()),
+        "address": address,
+        "amount": amount.to_string(),
+    }))
+}
+
+async fn handle_submit_ohm_operation(
+    state: &Arc<AppState>,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let object = params
+        .as_object()
+        .or_else(|| {
+            params
+                .as_array()
+                .and_then(|values| values.first())
+                .and_then(Value::as_object)
+        })
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcError::INVALID_PARAMS,
+                "expected { action, account? } parameters",
+            )
+        })?;
+    let action: oxydome_core::OhmAction = serde_json::from_value(
+        object
+            .get("action")
+            .cloned()
+            .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing OHM action"))?,
+    )
+    .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))?;
+    let account = object
+        .get("account")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .try_into()
+        .map_err(|_| RpcError::new(RpcError::INVALID_PARAMS, "account index is too large"))?;
+
+    let operation = {
+        let vault = state.vault.lock().await;
+        if !vault.is_unlocked() {
+            return Err(RpcError::new(RpcError::VAULT_LOCKED, "vault is locked"));
+        }
+        let actor = vault
+            .derive_key(account, 0)
+            .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))?;
+        let mut operation = oxydome_core::OhmOperation::new_unsigned(actor, action);
+        let signature = vault
+            .sign_hash(account, 0, &operation.signing_hash().0)
+            .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?;
+        operation.signature = oxydome_crypto::Sig(signature);
+        if !operation.is_valid() {
+            return Err(RpcError::new(
+                RpcError::INVALID_PARAMS,
+                "OHM action has an invalid shape",
+            ));
+        }
+        operation
+    };
+    let result_id = operation
+        .created_ohm_id()
+        .unwrap_or_else(|| operation.id());
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    let (_, accepted, error) = client
+        .submit_operation(oxydome_core::Operation::Ohm(operation))
+        .await
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?;
+    if !accepted {
+        return Err(RpcError::new(
+            RpcError::TX_REJECTED,
+            error.unwrap_or_else(|| "OHM operation rejected".into()),
+        ));
+    }
+    Ok(json!(to_hex(result_id.as_bytes())))
+}
+
+async fn handle_submit_ohm_block(
+    state: &Arc<AppState>,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let block_value = params
+        .as_array()
+        .and_then(|values| values.first())
+        .cloned()
+        .or_else(|| params.as_object().map(|_| params.clone()))
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected OHM block"))?;
+    let block: oxydome_core::OhmBlock = serde_json::from_value(block_value)
+        .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))?;
+    let hash = block.hash();
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    let (_, accepted, error) = client
+        .submit_ohm_block(block)
+        .await
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?;
+    if !accepted {
+        return Err(RpcError::new(
+            RpcError::TX_REJECTED,
+            error.unwrap_or_else(|| "OHM block rejected".into()),
+        ));
+    }
+    Ok(json!({
+        "hash": to_hex(hash.as_bytes()),
+        "accepted": true,
+    }))
+}
+
+async fn handle_get_ohm_contract(
+    state: &Arc<AppState>,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let values = params
+        .as_array()
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected [ohm_id, contract_id]"))?;
+    let ohm_id = values
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected OHM id"))?;
+    let contract_id = values
+        .get(1)
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected contract id"))?;
+    let ohm_id = parse_hash(ohm_id)?;
+    let contract_id = parse_hash(contract_id)?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    match client
+        .get_ohm_contract(ohm_id, contract_id)
+        .await
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?
+    {
+        (Some(code), Some(storage)) => serde_json::to_value(ohm_contract_to_rpc(
+            &ohm_id,
+            &contract_id,
+            &code,
+            &storage,
+        ))
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string())),
+        _ => Err(RpcError::new(
+            RpcError::RESOURCE_NOT_FOUND,
+            "OHM contract was not found",
+        )),
+    }
+}
+
+async fn handle_call_ohm_contract(
+    state: &Arc<AppState>,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let object = params
+        .as_object()
+        .or_else(|| {
+            params
+                .as_array()
+                .and_then(|values| values.first())
+                .and_then(Value::as_object)
+        })
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcError::INVALID_PARAMS,
+                "expected { ohmId, contractId, entryPoint, arguments?, caller, gasLimit? }",
+            )
+        })?;
+    let ohm_id = object
+        .get("ohmId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing OHM id"))?;
+    let contract_id = object
+        .get("contractId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing contract id"))?;
+    let entry_point = object
+        .get("entryPoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing entry point"))?
+        .to_string();
+    let caller = object
+        .get("caller")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing caller address"))?;
+    let arguments: Vec<u64> = object
+        .get("arguments")
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|error| RpcError::new(RpcError::INVALID_PARAMS, error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let gas_limit = object
+        .get("gasLimit")
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "invalid gas limit"))
+        })
+        .transpose()?
+        .unwrap_or(100_000);
+
+    let ohm_id = parse_hash(ohm_id)?;
+    let contract_id = parse_hash(contract_id)?;
+    let caller = parse_address(caller)?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    let (failure, gas_used, return_value, logs, error) = client
+        .call_ohm_contract(
+            ohm_id,
+            contract_id,
+            entry_point,
+            arguments,
+            caller,
+            gas_limit,
+        )
+        .await
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?;
+    if let Some(error) = error {
+        return Err(RpcError::new(RpcError::INTERNAL_ERROR, error));
+    }
+    serde_json::to_value(ohm_contract_call_to_rpc(
+        failure,
+        gas_used,
+        return_value,
+        &logs,
+    ))
+    .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))
+}
+
 async fn handle_sign_message(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
     let message = params
         .as_array()
@@ -1343,6 +1749,7 @@ fn parse_rpc_transaction(value: &Value) -> Result<oxydome_core::Transaction, Rpc
         outputs,
         fee,
         ovm_action,
+        ohm_context: None,
     })
 }
 

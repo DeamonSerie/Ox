@@ -14,6 +14,8 @@ pub enum CompileError {
     Unsupported(String),
     #[error("OVM bytecode generation failed: {0}")]
     Bytecode(String),
+    #[error("invalid DAO declaration: {0}")]
+    InvalidDao(String),
 }
 
 impl From<VmError> for CompileError {
@@ -82,6 +84,79 @@ pub fn compile_contract_to_ovm(
         functions,
     };
     Ok(artifact.encode()?)
+}
+
+/// Compiled output for a Solid contract, keeping the ordinary OVM artifact separate from the
+/// consensus-enforced DAO policy artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledSolid {
+    pub contract_artifact: Vec<u8>,
+    pub dao_policy: Option<Vec<u8>>,
+}
+
+pub fn compile_solid_to_ovm(
+    contract: &Contract,
+    source_hash: Option<oxydome_crypto::Hash>,
+    asset_manifest_hash: Option<oxydome_crypto::Hash>,
+) -> Result<CompiledSolid, CompileError> {
+    Ok(CompiledSolid {
+        contract_artifact: compile_contract_to_ovm(contract, source_hash, asset_manifest_hash)?,
+        dao_policy: compile_dao_policy(contract)?,
+    })
+}
+
+/// Compile and canonically encode the DAO policy declared in Solid, if any.
+pub fn compile_dao_policy(contract: &Contract) -> Result<Option<Vec<u8>>, CompileError> {
+    let Some(declaration) = &contract.dao else {
+        return Ok(None);
+    };
+    let mut makers = declaration
+        .makers
+        .iter()
+        .map(|maker| {
+            parse_fixed_hex::<32>(maker)
+                .map(oxydome_crypto::PublicKey)
+                .map_err(|error| CompileError::InvalidDao(format!("maker address: {error}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    makers.sort();
+    let currency = declaration
+        .currency
+        .as_ref()
+        .map(|currency| oxydome_core::DaoCurrency {
+            symbol: currency.symbol.clone(),
+            initial_supply: currency.initial_supply,
+        });
+    let peg = declaration
+        .peg
+        .as_ref()
+        .map(|peg| -> Result<oxydome_core::DaoPeg, CompileError> {
+            Ok(oxydome_core::DaoPeg {
+                target_dao: oxydome_crypto::Hash(
+                    parse_fixed_hex::<64>(&peg.target_dao).map_err(|error| {
+                        CompileError::InvalidDao(format!("peg target: {error}"))
+                    })?,
+                ),
+                numerator: peg.numerator,
+                denominator: peg.denominator,
+            })
+        })
+        .transpose()?;
+    let policy = oxydome_core::DaoPolicy {
+        version: oxydome_core::DAO_POLICY_VERSION,
+        makers,
+        currency,
+        peg,
+    };
+    policy.encode().map(Some).map_err(CompileError::InvalidDao)
+}
+
+fn parse_fixed_hex<const N: usize>(value: &str) -> Result<[u8; N], String> {
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = hex::decode(value).map_err(|error| error.to_string())?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("expected {} bytes, received {}", N, bytes.len()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

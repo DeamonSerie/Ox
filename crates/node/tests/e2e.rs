@@ -140,7 +140,7 @@ fn advance(w: &mut World, height: u64, txs: Vec<Transaction>, ops: Vec<Operation
         w.nodes[li].submit_transaction(tx).unwrap();
     }
     for op in ops {
-        w.nodes[li].submit_operation(op);
+        w.nodes[li].submit_operation(op).unwrap();
     }
 
     let block = w.nodes[li].produce_block(height).unwrap();

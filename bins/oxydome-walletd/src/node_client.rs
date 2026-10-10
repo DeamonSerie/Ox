@@ -1,6 +1,9 @@
 //! TCP client for communicating with an Oxydome node via the binary wire protocol.
 
-use oxydome_core::{Block, Hash, OutPoint, PublicKey, Transaction};
+use oxydome_core::{
+    Amount, Block, DaoState, Hash, OhmBlock, OhmState, Operation, OutPoint, OvmFailureCode, OvmLog,
+    PublicKey, Transaction,
+};
 use oxydome_crypto::SparseProof;
 use oxydome_net::{
     recv_message, send_message, BalanceInfo, HistoryEntry, Message, NetError, TxLocation, TxStatus,
@@ -129,6 +132,140 @@ impl NodeClient {
                 accepted,
                 error,
             } => Ok((txid, accepted, error)),
+            other => Err(NetError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    pub async fn submit_operation(
+        &mut self,
+        operation: Operation,
+    ) -> Result<(Hash, bool, Option<String>), NetError> {
+        match self
+            .request(&Message::SubmitOperation {
+                operation: Box::new(operation),
+            })
+            .await?
+        {
+            Message::OperationSubmitResponse {
+                operation_id,
+                accepted,
+                error,
+            } => Ok((operation_id, accepted, error)),
+            other => Err(NetError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    pub async fn get_dao(&mut self, dao_id: Hash) -> Result<Option<DaoState>, NetError> {
+        match self.request(&Message::GetDao { dao_id }).await? {
+            Message::DaoResponse { state, .. } => Ok(state),
+            other => Err(NetError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    /// Fetches the Ox-committed anchor state for `ohm_id`.
+    pub async fn get_ohm(&mut self, ohm_id: Hash) -> Result<Option<OhmState>, NetError> {
+        match self.request(&Message::GetOhm { ohm_id }).await? {
+            Message::OhmResponse { state, .. } => Ok(state.map(|s| *s)),
+            other => Err(NetError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    /// Fetches a private OHM block body by hash.
+    pub async fn get_ohm_block(&mut self, hash: Hash) -> Result<Option<OhmBlock>, NetError> {
+        match self.request(&Message::GetOhmBlock { hash }).await? {
+            Message::OhmBlockResponse { block } => Ok(block.map(|b| *b)),
+            other => Err(NetError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    /// Fetches the OHM-local balance of `owner` within `ohm_id`.
+    pub async fn get_ohm_balance(
+        &mut self,
+        ohm_id: Hash,
+        owner: PublicKey,
+    ) -> Result<Amount, NetError> {
+        match self.request(&Message::GetOhmBalance { ohm_id, owner }).await? {
+            Message::OhmBalanceResponse { amount, .. } => Ok(amount),
+            other => Err(NetError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    /// Submits a private OHM block.
+    pub async fn submit_ohm_block(
+        &mut self,
+        block: OhmBlock,
+    ) -> Result<(Hash, bool, Option<String>), NetError> {
+        match self
+            .request(&Message::SubmitOhmBlock {
+                block: Box::new(block),
+            })
+            .await?
+        {
+            Message::OhmBlockSubmitResponse {
+                hash,
+                accepted,
+                error,
+            } => Ok((hash, accepted, error)),
+            other => Err(NetError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    /// Fetches an OHM-hosted contract's code and storage.
+    pub async fn get_ohm_contract(
+        &mut self,
+        ohm_id: Hash,
+        contract_id: Hash,
+    ) -> Result<(Option<Vec<u8>>, Option<Vec<(u64, u64)>>), NetError> {
+        match self
+            .request(&Message::GetOhmContract {
+                ohm_id,
+                contract_id,
+            })
+            .await?
+        {
+            Message::OhmContractResponse { code, storage, .. } => Ok((code, storage)),
+            other => Err(NetError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    /// Simulates an OHM-hosted contract call.
+    #[allow(clippy::type_complexity)]
+    pub async fn call_ohm_contract(
+        &mut self,
+        ohm_id: Hash,
+        contract_id: Hash,
+        entry_point: String,
+        arguments: Vec<u64>,
+        caller: PublicKey,
+        gas_limit: u64,
+    ) -> Result<
+        (
+            Option<OvmFailureCode>,
+            u64,
+            Option<u64>,
+            Vec<OvmLog>,
+            Option<String>,
+        ),
+        NetError,
+    > {
+        match self
+            .request(&Message::CallOhmContract {
+                ohm_id,
+                contract_id,
+                entry_point,
+                arguments,
+                caller,
+                gas_limit,
+            })
+            .await?
+        {
+            Message::OhmContractCallResponse {
+                failure,
+                gas_used,
+                return_value,
+                logs,
+                error,
+            } => Ok((failure, gas_used, return_value, logs, error)),
             other => Err(NetError::Unexpected(format!("{other:?}"))),
         }
     }

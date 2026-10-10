@@ -131,7 +131,9 @@ impl HeaderChain {
                 oxydome_core::Operation::Withdraw(w) => {
                     self.epoch_withdrawn = self.epoch_withdrawn.saturating_add(w.amount)
                 }
-                oxydome_core::Operation::Rewards(_) => {}
+                oxydome_core::Operation::Rewards(_) 
+                | oxydome_core::Operation::Dao(_) 
+                | oxydome_core::Operation::Ohm(_) => {}
             }
         }
         self.supply = block.header.supply;

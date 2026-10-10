@@ -5,8 +5,10 @@
 
 pub mod block;
 pub mod config;
+pub mod dao;
 pub mod genesis;
 pub mod governance;
+pub mod ohm;
 pub mod operation;
 pub mod params;
 pub mod tx;
@@ -16,11 +18,23 @@ pub use block::{
     SMART_CONTRACT_EXECUTION_VERSION, VALUE_SCALE,
 };
 pub use config::{AllocationConfig, AppConfig, ConfigError, EndpointConfig};
+pub use dao::{
+    DaoAction, DaoCurrency, DaoOperation, DaoPeg, DaoPolicy, DaoProposal, DaoProposalAction,
+    DaoProposalStatus, DaoState, DaoWindowStats, DAO_POLICY_VERSION, MAX_DAO_CURRENCY_SYMBOL_BYTES,
+    MAX_DAO_HOLDERS, MAX_DAO_MAKERS, MAX_DAO_PROPOSALS, MAX_DAO_PROPOSAL_HEIGHTS,
+};
 pub use genesis::{GenesisAllocation, GenesisConfig};
 pub use governance::GovernanceSet;
 pub use operation::{
     MasterApproval, NodeApproval, Operation, RewardDistribution, TreasuryBurn, TreasuryMint,
     WithdrawRequest,
+};
+pub use ohm::{
+    build_ohm_server_outputs, compute_ohm_fee_split, ohm_genesis_hash, ohm_state_root,
+    ohm_treasury_outpoint, ohm_utxo_root, OhmAction, OhmBlock, OhmBlockHeader, OhmContext,
+    OhmContract, OhmInput, OhmOperation, OhmOutput, OhmPolicy, OhmState, OhmTransaction,
+    OhmUtxoEntry, MAX_OHM_BLOCK_TXS, MAX_OHM_NAME_BYTES, MAX_OHM_REASON_BYTES, MAX_OHM_TX_ITEMS,
+    OHM_POLICY_MAGIC, OHM_POLICY_VERSION, OHM_SERVER_FEE_BPS,
 };
 pub use oxydome_crypto::{Hash, PublicKey, Sig};
 pub use params::ChainParams;

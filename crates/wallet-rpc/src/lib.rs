@@ -147,6 +147,15 @@ pub mod methods {
     pub const GET_HISTORY: &str = "ox_getHistory";
     pub const GET_PROOF: &str = "ox_getProof";
     pub const GET_VALUE_INDEX: &str = "ox_getValueIndex";
+    pub const GET_DAO: &str = "ox_getDao";
+    pub const SUBMIT_DAO_OPERATION: &str = "ox_submitDaoOperation";
+    pub const GET_OHM: &str = "ox_getOhm";
+    pub const GET_OHM_BLOCK: &str = "ox_getOhmBlock";
+    pub const GET_OHM_BALANCE: &str = "ox_getOhmBalance";
+    pub const SUBMIT_OHM_OPERATION: &str = "ox_submitOhmOperation";
+    pub const SUBMIT_OHM_BLOCK: &str = "ox_submitOhmBlock";
+    pub const GET_OHM_CONTRACT: &str = "ox_getOhmContract";
+    pub const CALL_OHM_CONTRACT: &str = "ox_callOhmContract";
 
     // Vault methods
     pub const VAULT_CREATE: &str = "ox_vaultCreate";
@@ -275,6 +284,104 @@ pub struct RpcValueIndex {
     pub height: u64,
 }
 
+/// An OHM-local UTXO in friendly JSON form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcOhmUtxo {
+    pub txid: String,
+    pub index: u32,
+    pub amount: String,
+    pub recipient: String,
+    pub created_height: u64,
+}
+
+/// An OHM's Ox-committed anchor state in friendly JSON form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcOhm {
+    pub ohm_id: String,
+    pub name: String,
+    pub maintainer: String,
+    pub policy_version: u8,
+    pub block_window: u64,
+    pub current_height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub supply: String,
+    pub genesis_supply: String,
+    pub treasury_ox: String,
+    pub fees_paid: String,
+    pub utxos: Vec<RpcOhmUtxo>,
+}
+
+/// A private OHM transaction input in friendly JSON form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcOhmInput {
+    pub txid: String,
+    pub index: u32,
+    pub owner: String,
+    pub signature: String,
+}
+
+/// A private OHM transaction output in friendly JSON form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcOhmOutput {
+    pub amount: String,
+    pub recipient: String,
+}
+
+/// A private OHM transaction in friendly JSON form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcOhmTransaction {
+    pub txid: String,
+    pub inputs: Vec<RpcOhmInput>,
+    pub outputs: Vec<RpcOhmOutput>,
+    pub fee: String,
+}
+
+/// A private OHM block in friendly JSON form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcOhmBlock {
+    pub hash: String,
+    pub ohm_id: String,
+    pub height: u64,
+    pub prev_hash: String,
+    pub timestamp: u64,
+    pub tx_root: String,
+    pub state_root: String,
+    pub fee_total: String,
+    pub maintainer: String,
+    pub signature: String,
+    pub transactions: Vec<RpcOhmTransaction>,
+}
+
+/// An OVM log entry in friendly JSON form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcOvmLog {
+    pub topic: u32,
+    pub value: String,
+}
+
+/// A private OVM contract hosted by an OHM, in friendly JSON form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcOhmContract {
+    pub ohm_id: String,
+    pub contract_id: String,
+    /// Encoded program/artifact bytes, hex-encoded.
+    pub code: String,
+    /// Persisted storage as `[key, value]` decimal pairs.
+    pub storage: Vec<(String, String)>,
+}
+
+/// The outcome of simulating an OHM-hosted OVM contract call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcOhmContractCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    pub gas_used: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_value: Option<String>,
+    pub logs: Vec<RpcOvmLog>,
+}
+
 /// A vault status response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcVaultStatus {
@@ -371,6 +478,8 @@ pub fn tx_to_rpc(
                     oxydome_core::OutputKind::Spendable => "spendable".into(),
                     oxydome_core::OutputKind::LockedReward => "locked_reward".into(),
                     oxydome_core::OutputKind::ExitReserve { .. } => "exit_reserve".into(),
+                    oxydome_core::OutputKind::DaoTreasury { .. } => "dao_treasury".into(),
+                    oxydome_core::OutputKind::OhmTreasury { .. } => "ohm_treasury".into(),
                 },
                 created_height: 0,
                 mature: true,
@@ -450,6 +559,8 @@ pub fn utxo_to_rpc(info: &oxydome_net::UtxoInfo) -> RpcUtxo {
             oxydome_core::OutputKind::Spendable => "spendable".into(),
             oxydome_core::OutputKind::LockedReward => "locked_reward".into(),
             oxydome_core::OutputKind::ExitReserve { .. } => "exit_reserve".into(),
+            oxydome_core::OutputKind::DaoTreasury { .. } => "dao_treasury".into(),
+            oxydome_core::OutputKind::OhmTreasury { .. } => "ohm_treasury".into(),
         },
         created_height: info.created_height,
         mature: info.mature,
@@ -478,6 +589,119 @@ pub fn value_index_to_rpc(info: &oxydome_net::ValueIndexInfo) -> RpcValueIndex {
     }
 }
 
+/// Converts an OHM's anchor state into its friendly JSON representation.
+///
+/// The private UTXO map is keyed by an opaque hash, so it is rendered as a list of UTXOs
+/// (with hex outpoints) rather than a JSON object.
+pub fn ohm_to_rpc(ohm_id: &oxydome_core::Hash, ohm: &oxydome_core::OhmState) -> RpcOhm {
+    RpcOhm {
+        ohm_id: to_hex(ohm_id.as_bytes()),
+        name: ohm.policy.name.clone(),
+        maintainer: to_hex(ohm.policy.maintainer.as_bytes()),
+        policy_version: ohm.policy.version,
+        block_window: ohm.policy.block_window,
+        current_height: ohm.current_height,
+        block_hash: to_hex(ohm.block_hash.as_bytes()),
+        state_root: to_hex(ohm.state_root.as_bytes()),
+        supply: amount_to_string(ohm.supply),
+        genesis_supply: amount_to_string(ohm.genesis_supply),
+        treasury_ox: amount_to_string(ohm.treasury_ox),
+        fees_paid: amount_to_string(ohm.fees_paid),
+        utxos: ohm
+            .utxos
+            .values()
+            .map(|entry| RpcOhmUtxo {
+                txid: to_hex(entry.outpoint.txid.as_bytes()),
+                index: entry.outpoint.index,
+                amount: amount_to_string(entry.output.amount),
+                recipient: to_hex(entry.output.recipient.as_bytes()),
+                created_height: entry.created_height,
+            })
+            .collect(),
+    }
+}
+
+/// Converts a private OHM block into its friendly JSON representation.
+pub fn ohm_block_to_rpc(block: &oxydome_core::OhmBlock) -> RpcOhmBlock {
+    RpcOhmBlock {
+        hash: to_hex(block.hash().as_bytes()),
+        ohm_id: to_hex(block.header.ohm_id.as_bytes()),
+        height: block.header.height,
+        prev_hash: to_hex(block.header.prev_hash.as_bytes()),
+        timestamp: block.header.timestamp,
+        tx_root: to_hex(block.header.tx_root.as_bytes()),
+        state_root: to_hex(block.header.state_root.as_bytes()),
+        fee_total: amount_to_string(block.header.fee_total),
+        maintainer: to_hex(block.header.maintainer.as_bytes()),
+        signature: to_hex(block.signature.as_bytes()),
+        transactions: block
+            .transactions
+            .iter()
+            .map(|tx| RpcOhmTransaction {
+                txid: to_hex(tx.txid().as_bytes()),
+                inputs: tx
+                    .inputs
+                    .iter()
+                    .map(|input| RpcOhmInput {
+                        txid: to_hex(input.prev_out.txid.as_bytes()),
+                        index: input.prev_out.index,
+                        owner: to_hex(input.owner.as_bytes()),
+                        signature: to_hex(input.signature.as_bytes()),
+                    })
+                    .collect(),
+                outputs: tx
+                    .outputs
+                    .iter()
+                    .map(|output| RpcOhmOutput {
+                        amount: amount_to_string(output.amount),
+                        recipient: to_hex(output.recipient.as_bytes()),
+                    })
+                    .collect(),
+                fee: amount_to_string(tx.fee),
+            })
+            .collect(),
+    }
+}
+
+/// Converts a private OHM-hosted OVM contract into its friendly JSON representation.
+pub fn ohm_contract_to_rpc(
+    ohm_id: &oxydome_core::Hash,
+    contract_id: &oxydome_core::Hash,
+    code: &[u8],
+    storage: &[(u64, u64)],
+) -> RpcOhmContract {
+    RpcOhmContract {
+        ohm_id: to_hex(ohm_id.as_bytes()),
+        contract_id: to_hex(contract_id.as_bytes()),
+        code: to_hex(code),
+        storage: storage
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+    }
+}
+
+/// Converts an OHM-hosted contract call outcome into its friendly JSON representation.
+pub fn ohm_contract_call_to_rpc(
+    failure: Option<oxydome_core::OvmFailureCode>,
+    gas_used: u64,
+    return_value: Option<u64>,
+    logs: &[oxydome_core::OvmLog],
+) -> RpcOhmContractCall {
+    RpcOhmContractCall {
+        failure: failure.map(|code| format!("{code:?}")),
+        gas_used: gas_used.to_string(),
+        return_value: return_value.map(|value| value.to_string()),
+        logs: logs
+            .iter()
+            .map(|log| RpcOvmLog {
+                topic: log.topic,
+                value: log.value.to_string(),
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +723,93 @@ mod tests {
         assert_eq!(amount_to_string(12345), "12345");
         assert_eq!(amount_from_string("12345"), Some(12345));
         assert_eq!(amount_from_string("abc"), None);
+    }
+
+    #[test]
+    fn ohm_state_and_block_serialize_to_friendly_json() {
+        use std::collections::BTreeMap;
+
+        use oxydome_core::ohm::{OhmBlock, OhmOutput, OhmPolicy, OhmState, OhmUtxoEntry};
+        use oxydome_core::{Hash, OutPoint, PublicKey};
+
+        let maintainer = PublicKey::from_bytes([7u8; 32]);
+        let recipient = PublicKey::from_bytes([9u8; 32]);
+        let ohm_id = Hash([1u8; 64]);
+        let entry = OhmUtxoEntry::new(
+            OutPoint::new(Hash([2u8; 64]), 0),
+            OhmOutput {
+                amount: 100,
+                recipient,
+            },
+            0,
+        );
+        let mut utxos = BTreeMap::new();
+        utxos.insert(entry.key(), entry);
+        let state = OhmState {
+            policy: OhmPolicy {
+                version: 1,
+                maintainer,
+                name: "test".into(),
+                genesis_supply: 100,
+                block_window: 10,
+            },
+            current_height: 0,
+            block_hash: Hash::zero(),
+            state_root: Hash::zero(),
+            supply: 100,
+            utxos,
+            treasury_ox: 0,
+            genesis_supply: 100,
+            fees_paid: 0,
+        };
+        let value = serde_json::to_value(ohm_to_rpc(&ohm_id, &state)).unwrap();
+        assert_eq!(value["name"], "test");
+        assert_eq!(value["utxos"].as_array().unwrap().len(), 1);
+        assert!(value["ohm_id"].as_str().unwrap().starts_with("0x"));
+
+        let block = OhmBlock::new_unsigned(
+            ohm_id,
+            1,
+            Hash::zero(),
+            1234,
+            Hash::zero(),
+            maintainer,
+            Vec::new(),
+        );
+        let value = serde_json::to_value(ohm_block_to_rpc(&block)).unwrap();
+        assert_eq!(value["height"], 1);
+        assert!(value["hash"].as_str().unwrap().starts_with("0x"));
+    }
+
+    #[test]
+    fn ohm_contract_and_call_serialize_to_friendly_json() {
+        use oxydome_core::Hash;
+
+        let ohm_id = Hash([1u8; 64]);
+        let contract_id = Hash([2u8; 64]);
+        let contract = ohm_contract_to_rpc(
+            &ohm_id,
+            &contract_id,
+            &[0xde, 0xad],
+            &[(0, 5), (7, 9)],
+        );
+        let value = serde_json::to_value(&contract).unwrap();
+        assert_eq!(value["code"], "0xdead");
+        assert_eq!(value["storage"][0][0], "0");
+        assert_eq!(value["storage"][1][1], "9");
+        assert!(value["ohm_id"].as_str().unwrap().starts_with("0x"));
+
+        let call = ohm_contract_call_to_rpc(
+            None,
+            42,
+            Some(7),
+            &[oxydome_core::OvmLog { topic: 1, value: 2 }],
+        );
+        let value = serde_json::to_value(&call).unwrap();
+        assert_eq!(value["gas_used"], "42");
+        assert_eq!(value["return_value"], "7");
+        assert_eq!(value["logs"][0]["value"], "2");
+        assert!(value.get("failure").is_none());
     }
 
     #[test]

@@ -193,6 +193,115 @@ impl WalletRpcClient {
         self.call(methods::GET_VALUE_INDEX, Value::Null).await
     }
 
+    /// Returns the committed state for a DAO.
+    pub async fn get_dao(&self, dao_id: &str) -> Result<Value> {
+        self.call(methods::GET_DAO, serde_json::json!([dao_id]))
+            .await
+    }
+
+    /// Signs and submits a consensus DAO operation using the unlocked vault.
+    pub async fn submit_dao_operation(
+        &self,
+        action: Value,
+        account: Option<u32>,
+    ) -> Result<String> {
+        self.call(
+            methods::SUBMIT_DAO_OPERATION,
+            serde_json::json!({
+                "action": action,
+                "account": account.unwrap_or(0),
+            }),
+        )
+        .await
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("invalid DAO operation id")
+        })
+    }
+
+    /// Returns the Ox-committed anchor state for an OHM.
+    pub async fn get_ohm(&self, ohm_id: &str) -> Result<Value> {
+        self.call(methods::GET_OHM, serde_json::json!([ohm_id]))
+            .await
+    }
+
+    /// Returns a private OHM block body by hash.
+    pub async fn get_ohm_block(&self, hash: &str) -> Result<Value> {
+        self.call(methods::GET_OHM_BLOCK, serde_json::json!([hash]))
+            .await
+    }
+
+    /// Returns the OHM-local balance of an address within an OHM.
+    pub async fn get_ohm_balance(&self, ohm_id: &str, address: &str) -> Result<Value> {
+        self.call(
+            methods::GET_OHM_BALANCE,
+            serde_json::json!([ohm_id, address]),
+        )
+        .await
+    }
+
+    /// Signs and submits a consensus OHM operation using the unlocked vault.
+    pub async fn submit_ohm_operation(
+        &self,
+        action: Value,
+        account: Option<u32>,
+    ) -> Result<String> {
+        self.call(
+            methods::SUBMIT_OHM_OPERATION,
+            serde_json::json!({
+                "action": action,
+                "account": account.unwrap_or(0),
+            }),
+        )
+        .await
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("invalid OHM operation id")
+        })
+    }
+
+    /// Submits a private OHM block for anchoring.
+    pub async fn submit_ohm_block(&self, block: Value) -> Result<Value> {
+        self.call(methods::SUBMIT_OHM_BLOCK, serde_json::json!([block]))
+            .await
+    }
+
+    /// Returns an OHM-hosted OVM contract's code and storage.
+    pub async fn get_ohm_contract(&self, ohm_id: &str, contract_id: &str) -> Result<Value> {
+        self.call(
+            methods::GET_OHM_CONTRACT,
+            serde_json::json!([ohm_id, contract_id]),
+        )
+        .await
+    }
+
+    /// Simulates an OHM-hosted OVM contract call.
+    pub async fn call_ohm_contract(
+        &self,
+        ohm_id: &str,
+        contract_id: &str,
+        entry_point: &str,
+        arguments: &[u64],
+        caller: &str,
+        gas_limit: Option<u64>,
+    ) -> Result<Value> {
+        let mut payload = serde_json::json!({
+            "ohmId": ohm_id,
+            "contractId": contract_id,
+            "entryPoint": entry_point,
+            "arguments": arguments,
+            "caller": caller,
+        });
+        if let Some(gas_limit) = gas_limit {
+            payload["gasLimit"] = serde_json::json!(gas_limit);
+        }
+        self.call(methods::CALL_OHM_CONTRACT, payload).await
+    }
+
     /// Returns vault status.
     pub async fn vault_status(&self) -> Result<Value> {
         self.call(methods::VAULT_STATUS, Value::Null).await

@@ -11,8 +11,8 @@ use crate::index::{IndexStore, WalletIndex};
 use oxydome_audit::{attestation_quorum, AuditAttestation, AuditPackage, InputProof};
 use oxydome_consensus::{AdmissionCertificate, MasterCheck, QuorumCertificate, Vote, VoteKind};
 use oxydome_core::{
-    Amount, Block, ChainParams, GenesisConfig, GovernanceSet, Hash, Operation, OutPoint, OvmAction,
-    PublicKey, Transaction,
+    Amount, Block, ChainParams, GenesisConfig, GovernanceSet, Hash, OhmAction, OhmBlock, OhmPolicy,
+    OhmState, Operation, OutPoint, OvmAction, PublicKey, Transaction,
 };
 use oxydome_crypto::{CodeManifest, KeyPair, SparseProof};
 use oxydome_currency::rebound_utxo_spendable;
@@ -20,6 +20,7 @@ use oxydome_net::{
     BalanceInfo, FinalityEvidence, FinalizedBlockRecord, HistoryEntry, NodeEvent, TxLocation,
     TxStatus, UtxoInfo, ValueIndexInfo,
 };
+use oxydome_ohm::{OhmCallOutcome, OhmContract, OhmLedger};
 use oxydome_rewards::{participation_weights, split_fees};
 use oxydome_state::{ledger_diff, ChainState, LedgerStore, StateError, UtxoEntry};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -32,6 +33,8 @@ pub enum NodeError {
     State(#[from] StateError),
     #[error("transaction rejected: {0}")]
     Tx(String),
+    #[error("operation rejected: {0}")]
+    Operation(String),
     #[error("block is not the current leader's proposal")]
     NotLeader,
     #[error("commit certificate is invalid")]
@@ -48,6 +51,7 @@ pub enum NodeError {
 
 /// Maximum number of rejected transactions retained for status lookups.
 pub const REJECTED_LIMIT: usize = 10_000;
+pub const MAX_PENDING_OPERATIONS: usize = 10_000;
 
 /// A transaction accepted by the node that has not yet been confirmed.
 pub struct PendingTx {
@@ -78,6 +82,10 @@ pub struct Node {
     pub index_store: Option<IndexStore>,
     /// Optional asset storage, deliberately excluded from consensus state.
     pub content_store: ContentStore,
+    /// Private OHM ledgers this node keeps and re-derives, keyed by OHM id.
+    pub ohm_ledgers: BTreeMap<Hash, OhmLedger>,
+    /// Private OHM block bodies, content-addressed by block hash and served to peers.
+    pub ohm_blocks: BTreeMap<Hash, OhmBlock>,
     /// Accepted-but-unconfirmed transactions, keyed by txid.
     pub pending: HashMap<Hash, PendingTx>,
     /// Rejected transactions and the reason, bounded by [`REJECTED_LIMIT`].
@@ -118,6 +126,8 @@ impl Node {
             wallet_index: WalletIndex::new(),
             index_store: None,
             content_store: ContentStore::default(),
+            ohm_ledgers: BTreeMap::new(),
+            ohm_blocks: BTreeMap::new(),
             pending: HashMap::new(),
             rejected: HashMap::new(),
             rejected_order: VecDeque::new(),
@@ -222,6 +232,14 @@ impl Node {
         }
         self.verify_persisted_height(&store, &blocks[0])?;
 
+        // Load private OHM block bodies before replaying anchors that reference them.
+        self.ohm_blocks = store
+            .load_ohm_blocks()
+            .map_err(|error| NodeError::Ledger(error.to_string()))?
+            .into_iter()
+            .map(|block| (block.hash(), block))
+            .collect();
+
         let mut restored_index = WalletIndex::new();
         let mut restored_evidence = BTreeMap::new();
         for block in blocks.iter().skip(1) {
@@ -241,6 +259,7 @@ impl Node {
                         block.header.height
                     ))
                 })?;
+            self.ohm_ledgers = self.advance_ohm_ledgers(block)?;
             self.verify_persisted_height(&store, block)?;
             if let Some(bytes) = store
                 .finality_evidence(block.header.height)
@@ -281,6 +300,10 @@ impl Node {
                 .load_ovm_state(current_height)
                 .map_err(|error| NodeError::Ledger(error.to_string()))?
                 != self.state.contracts
+            || store
+                .load_dao_state(current_height)
+                .map_err(|error| NodeError::Ledger(error.to_string()))?
+                != self.state.daos
         {
             return Err(NodeError::Ledger(
                 "persisted tip snapshots do not match replayed state".into(),
@@ -362,6 +385,22 @@ impl Node {
         if contracts != self.state.contracts {
             return Err(NodeError::Ledger(format!(
                 "persisted OVM snapshot does not match replay at height {height}"
+            )));
+        }
+        let daos = store
+            .load_dao_state(height)
+            .map_err(|error| NodeError::Ledger(error.to_string()))?;
+        if daos != self.state.daos {
+            return Err(NodeError::Ledger(format!(
+                "persisted DAO snapshot does not match replay at height {height}"
+            )));
+        }
+        let ohm_states = store
+            .load_ohm_state(height)
+            .map_err(|error| NodeError::Ledger(error.to_string()))?;
+        if ohm_states != self.state.ohm_states {
+            return Err(NodeError::Ledger(format!(
+                "persisted OHM snapshot does not match replay at height {height}"
             )));
         }
         Ok(())
@@ -538,8 +577,177 @@ impl Node {
     }
 
     /// Queues a governance operation for the next block this node produces.
-    pub fn submit_operation(&mut self, op: Operation) {
+    pub fn submit_operation(&mut self, op: Operation) -> Result<(), NodeError> {
+        if !op.is_governance() {
+            return Err(NodeError::Operation(
+                "only governance operations can be submitted".into(),
+            ));
+        }
+        if let Operation::Dao(dao_operation) = &op {
+            if !dao_operation.is_valid() {
+                return Err(NodeError::Operation(
+                    "DAO operation signature or action is invalid".into(),
+                ));
+            }
+        }
+        if let Operation::Ohm(ohm_operation) = &op {
+            if !ohm_operation.is_valid() {
+                return Err(NodeError::Operation(
+                    "OHM operation signature or action is invalid".into(),
+                ));
+            }
+        }
+        if self.pending_ops.len() >= MAX_PENDING_OPERATIONS {
+            return Err(NodeError::Operation(
+                "pending governance operation limit reached".into(),
+            ));
+        }
+        let operation_id = op.id();
+        if self
+            .pending_ops
+            .iter()
+            .any(|pending| pending.id() == operation_id)
+        {
+            return Err(NodeError::Operation(
+                "governance operation is already pending".into(),
+            ));
+        }
         self.pending_ops.push(op);
+        Ok(())
+    }
+
+    /// Accepts a private OHM block submitted by an OHM maintainer.
+    ///
+    /// The block is validated against the node's re-derived OHM ledger (which must be exactly one
+    /// height behind), then retained so the matching Ox anchor can be verified. The ledger is not
+    /// advanced until the anchor is finalized on Ox.
+    pub fn submit_ohm_block(&mut self, block: OhmBlock) -> Result<Hash, NodeError> {
+        let ohm_id = block.header.ohm_id;
+        let ledger = self.ohm_ledgers.get(&ohm_id).ok_or_else(|| {
+            NodeError::Operation("OHM ledger is not tracked (create is not anchored yet)".into())
+        })?;
+        ledger
+            .verify_block(&block)
+            .map_err(|error| NodeError::Operation(format!("invalid OHM block: {error}")))?;
+        let hash = block.hash();
+        if let Some(store) = &mut self.store {
+            store
+                .save_ohm_block(&block)
+                .map_err(|error| NodeError::Ledger(error.to_string()))?;
+        }
+        self.ohm_blocks.insert(hash, block);
+        Ok(hash)
+    }
+
+    /// The private OHM ledger for `ohm_id`, if this node tracks it.
+    pub fn ohm_ledger(&self, ohm_id: &Hash) -> Option<&OhmLedger> {
+        self.ohm_ledgers.get(ohm_id)
+    }
+
+    /// The Ox-committed OHM anchor state for `ohm_id`, if present.
+    pub fn ohm_state(&self, ohm_id: &Hash) -> Option<&OhmState> {
+        self.state.ohm_states.get(ohm_id)
+    }
+
+    /// A private OHM block body by hash, if retained.
+    pub fn ohm_block(&self, hash: &Hash) -> Option<&OhmBlock> {
+        self.ohm_blocks.get(hash)
+    }
+
+    /// The private OVM contract `contract_id` hosted by OHM `ohm_id`, if any.
+    pub fn ohm_contract(&self, ohm_id: &Hash, contract_id: &Hash) -> Option<&OhmContract> {
+        self.ohm_ledger(ohm_id)?.contract(contract_id)
+    }
+
+    /// Simulates an OHM-hosted contract call against the current private state.
+    ///
+    /// Read-only: it never advances the ledger or mutates any contract storage.
+    pub fn ohm_call_contract(
+        &self,
+        ohm_id: &Hash,
+        contract_id: &Hash,
+        entry_point: &str,
+        caller: PublicKey,
+        arguments: &[u64],
+        gas_limit: u64,
+    ) -> Result<OhmCallOutcome, NodeError> {
+        let ledger = self.ohm_ledger(ohm_id).ok_or_else(|| {
+            NodeError::Operation("OHM ledger is not tracked".into())
+        })?;
+        ledger
+            .simulate_contract_call(contract_id, entry_point, caller, arguments, gas_limit)
+            .map_err(|error| NodeError::Operation(error.to_string()))
+    }
+
+    /// Re-derives the OHM ledgers after applying `block`, validating that every `Update` anchor
+    /// matches the private block it commits to. Returns the updated ledger set on success and
+    /// leaves `self` untouched on failure.
+    fn advance_ohm_ledgers(
+        &self,
+        block: &Block,
+    ) -> Result<BTreeMap<Hash, OhmLedger>, NodeError> {
+        let mut ledgers = self.ohm_ledgers.clone();
+        for operation in &block.operations {
+            let Operation::Ohm(ohm_operation) = operation else {
+                continue;
+            };
+            match &ohm_operation.action {
+                OhmAction::Create {
+                    policy_bytes,
+                    genesis_outputs,
+                } => {
+                    let ohm_id = ohm_operation.created_ohm_id().ok_or_else(|| {
+                        NodeError::Operation("OHM create has no derived id".into())
+                    })?;
+                    let policy = OhmPolicy::decode(policy_bytes).map_err(|error| {
+                        NodeError::Operation(format!("invalid OHM policy: {error}"))
+                    })?;
+                    if ledgers.contains_key(&ohm_id) {
+                        return Err(NodeError::Operation("OHM ledger already exists".into()));
+                    }
+                    ledgers.insert(
+                        ohm_id,
+                        OhmLedger::from_genesis(
+                            ohm_id,
+                            policy.maintainer,
+                            genesis_outputs,
+                            ohm_operation.id(),
+                        ),
+                    );
+                }
+                OhmAction::Update {
+                    ohm_id,
+                    context,
+                    block_hash,
+                    ..
+                } => {
+                    let ohm_block = self.ohm_blocks.get(block_hash).ok_or_else(|| {
+                        NodeError::Operation(
+                            "anchored OHM block is not retained by this node".into(),
+                        )
+                    })?;
+                    let ledger = ledgers.get_mut(ohm_id).ok_or_else(|| {
+                        NodeError::Operation("OHM ledger is not tracked".into())
+                    })?;
+                    ledger
+                        .apply_block(ohm_block)
+                        .map_err(|error| NodeError::Operation(error.to_string()))?;
+                    if ledger.height != context.ohm_height
+                        || ledger.state_root != context.ohm_state_root
+                        || ledger.block_hash != *block_hash
+                    {
+                        return Err(NodeError::Operation(
+                            "OHM anchor does not match the re-derived ledger".into(),
+                        ));
+                    }
+                }
+                OhmAction::Terminate { ohm_id, .. } => {
+                    ledgers.remove(ohm_id);
+                }
+                OhmAction::Transfer { .. } | OhmAction::TreasuryDeposit { .. } => {}
+            }
+        }
+        Ok(ledgers)
     }
 
     /// Builds the reward distribution for a set of fees from this node's perspective.
@@ -652,18 +860,22 @@ impl Node {
         self.verify_finality_evidence(&block, &evidence)?;
         let encoded_evidence = oxydome_crypto::encode(&evidence);
         let next = self.state.apply_block(&block, &self.gov, &self.params)?;
+        // Re-derive the private OHM ledgers and ensure every anchor matches before committing.
+        let next_ohm_ledgers = self.advance_ohm_ledgers(&block)?;
 
         // Persist the new version before swapping it in: a failed store write leaves the node
         // unchanged and retryable.
         if let Some(store) = &mut self.store {
             let delta = ledger_diff(&self.state.utxo, &next.utxo);
             store
-                .save_version_with_finality(
+                .save_version_with_dao_and_finality(
                     next.height,
                     block.hash(),
                     &next.utxo,
                     &delta,
                     &next.contracts,
+                    &next.daos,
+                    &next.ohm_states,
                     &block,
                     &encoded_evidence,
                 )
@@ -757,6 +969,7 @@ impl Node {
         self.pending_ops.retain(|o| !applied_ops.contains(&o.id()));
 
         self.state = next;
+        self.ohm_ledgers = next_ohm_ledgers;
         self.blocks.push(block.clone());
         self.finality_evidence.insert(block.header.height, evidence);
         self.epoch = block.header.epoch;
@@ -1078,7 +1291,9 @@ pub fn default_config(masters: usize, nodes: usize, supply: Amount) -> oxydome_c
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
-    use oxydome_core::{Operation, OvmAction, Transaction, TxOutput};
+    use oxydome_core::{
+        OhmOperation, OhmOutput, OHM_POLICY_VERSION, Operation, OvmAction, Transaction, TxOutput,
+    };
     use oxydome_rewards::split_fees;
 
     #[test]
@@ -1170,5 +1385,348 @@ mod recovery_tests {
         assert_eq!(restored.state.contracts, next.contracts);
         assert!(restored.state.contracts.contains_key(&contract_id));
         assert_eq!(restored.blocks, vec![genesis, block]);
+    }
+
+    #[test]
+    fn ohm_create_anchor_fee_split_and_restore() {
+        let app_config = default_config(1, 1, 100_000);
+        let genesis_config = app_config.genesis().unwrap();
+        let key = app_config.nodes[0].keypair().unwrap();
+        let (mut node, genesis) = Node::new(key.clone(), &genesis_config, None).unwrap();
+
+        let mut store = LedgerStore::open_temporary().unwrap();
+        store
+            .init_genesis_with_block(&genesis, &node.state.utxo, &node.state.contracts)
+            .unwrap();
+        node.store = Some(store);
+
+        // Create the OHM and anchor the Create operation at Ox height 1.
+        let maintainer = KeyPair::from_seed(&[42u8; 32]);
+        let policy = OhmPolicy {
+            version: OHM_POLICY_VERSION,
+            maintainer: maintainer.public(),
+            name: "tenant".to_string(),
+            genesis_supply: 1000,
+            block_window: 10,
+        };
+        let genesis_outputs = vec![OhmOutput {
+            amount: 1000,
+            recipient: maintainer.public(),
+        }];
+        let mut create = OhmOperation::new_unsigned(
+            maintainer.public(),
+            OhmAction::Create {
+                policy_bytes: policy.encode().unwrap(),
+                genesis_outputs: genesis_outputs.clone(),
+            },
+        );
+        create.sign(&maintainer);
+        let ohm_id = create.created_ohm_id().unwrap();
+        node.pending_ops.push(Operation::Ohm(create));
+
+        let block1 = node.produce_block(1).unwrap();
+        let state1 = node
+            .state
+            .apply_block(&block1, &node.gov, &node.params)
+            .unwrap();
+        let ohm1 = node.advance_ohm_ledgers(&block1).unwrap();
+        assert!(ohm1.contains_key(&ohm_id));
+        assert_eq!(
+            ohm1[&ohm_id].state_root,
+            state1.ohm_states[&ohm_id].state_root
+        );
+        node.store
+            .as_mut()
+            .unwrap()
+            .save_version_with_ohm_and_block(
+                state1.height,
+                block1.hash(),
+                &state1.utxo,
+                &ledger_diff(&node.state.utxo, &state1.utxo),
+                &state1.contracts,
+                &state1.daos,
+                &state1.ohm_states,
+                &block1,
+            )
+            .unwrap();
+        node.state = state1;
+        node.ohm_ledgers = ohm1;
+        node.pending_ops.clear();
+
+        // Build and submit a private OHM block moving 900 with a 100 fee.
+        let ledger = node.ohm_ledgers[&ohm_id].clone();
+        let genesis_out = ledger.utxos.values().next().unwrap().outpoint;
+        let tx = ledger.build_transaction(
+            vec![(genesis_out, maintainer.public())],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: maintainer.public(),
+            }],
+            100,
+            &maintainer,
+        );
+        let ohm_block = ledger.build_block(vec![tx], 5, &maintainer).unwrap();
+        let ohm_block_hash = node.submit_ohm_block(ohm_block.clone()).unwrap();
+        assert_eq!(ohm_block_hash, ohm_block.hash());
+
+        // Anchor it at Ox height 2.
+        let mut update = OhmOperation::new_unsigned(
+            maintainer.public(),
+            OhmAction::Update {
+                ohm_id,
+                context: ohm_block.context(),
+                block_hash: ohm_block_hash,
+                fee_total: 100,
+            },
+        );
+        update.sign(&maintainer);
+        node.pending_ops.push(Operation::Ohm(update));
+
+        let block2 = node.produce_block(2).unwrap();
+        let state2 = node
+            .state
+            .apply_block(&block2, &node.gov, &node.params)
+            .unwrap();
+        let ohm2 = node.advance_ohm_ledgers(&block2).unwrap();
+        node.store
+            .as_mut()
+            .unwrap()
+            .save_version_with_ohm_and_block(
+                state2.height,
+                block2.hash(),
+                &state2.utxo,
+                &ledger_diff(&node.state.utxo, &state2.utxo),
+                &state2.contracts,
+                &state2.daos,
+                &state2.ohm_states,
+                &block2,
+            )
+            .unwrap();
+        node.state = state2;
+        node.ohm_ledgers = ohm2;
+
+        // 40% of the 100 fee goes to the single server node, 60% to the OHM treasury.
+        assert_eq!(node.balance(&node.public()).locked_reward, 40);
+        assert_eq!(node.state.ohm_states[&ohm_id].treasury_ox, 60);
+        assert_eq!(node.state.ohm_states[&ohm_id].fees_paid, 100);
+        assert_eq!(node.ohm_ledgers[&ohm_id].height, 1);
+        assert_eq!(node.ohm_ledgers[&ohm_id].supply, 900);
+        assert_eq!(node.ohm_ledgers[&ohm_id].block_hash, ohm_block_hash);
+
+        // Restore and confirm the private OHM ledger is re-derived from persisted blocks.
+        let store = node.store.take().unwrap();
+        let (fresh_node, _) = Node::new(key, &genesis_config, None).unwrap();
+        let restored = fresh_node.restore_from_store(store, None).unwrap();
+        assert_eq!(restored.state.height, 2);
+        let restored_ledger = restored.ohm_ledgers.get(&ohm_id).unwrap();
+        assert_eq!(restored_ledger.height, 1);
+        assert_eq!(restored_ledger.block_hash, ohm_block_hash);
+        assert_eq!(restored_ledger.supply, 900);
+        assert_eq!(
+            restored_ledger.state_root,
+            restored.state.ohm_states[&ohm_id].state_root
+        );
+    }
+
+    #[test]
+    fn ohm_hosted_ovm_contract_anchors_and_restores() {
+        let app_config = default_config(1, 1, 100_000);
+        let genesis_config = app_config.genesis().unwrap();
+        let key = app_config.nodes[0].keypair().unwrap();
+        let (mut node, genesis) = Node::new(key.clone(), &genesis_config, None).unwrap();
+
+        let mut store = LedgerStore::open_temporary().unwrap();
+        store
+            .init_genesis_with_block(&genesis, &node.state.utxo, &node.state.contracts)
+            .unwrap();
+        node.store = Some(store);
+
+        // Create the OHM and anchor the Create operation at Ox height 1.
+        let maintainer = KeyPair::from_seed(&[42u8; 32]);
+        let policy = OhmPolicy {
+            version: OHM_POLICY_VERSION,
+            maintainer: maintainer.public(),
+            name: "tenant".to_string(),
+            genesis_supply: 1000,
+            block_window: 10,
+        };
+        let genesis_outputs = vec![OhmOutput {
+            amount: 1000,
+            recipient: maintainer.public(),
+        }];
+        let mut create = OhmOperation::new_unsigned(
+            maintainer.public(),
+            OhmAction::Create {
+                policy_bytes: policy.encode().unwrap(),
+                genesis_outputs,
+            },
+        );
+        create.sign(&maintainer);
+        let ohm_id = create.created_ohm_id().unwrap();
+        node.pending_ops.push(Operation::Ohm(create));
+
+        let block1 = node.produce_block(1).unwrap();
+        let state1 = node
+            .state
+            .apply_block(&block1, &node.gov, &node.params)
+            .unwrap();
+        let ohm1 = node.advance_ohm_ledgers(&block1).unwrap();
+        node.store
+            .as_mut()
+            .unwrap()
+            .save_version_with_ohm_and_block(
+                state1.height,
+                block1.hash(),
+                &state1.utxo,
+                &ledger_diff(&node.state.utxo, &state1.utxo),
+                &state1.contracts,
+                &state1.daos,
+                &state1.ohm_states,
+                &block1,
+            )
+            .unwrap();
+        node.state = state1;
+        node.ohm_ledgers = ohm1;
+        node.pending_ops.clear();
+
+        // Deploy a named contract and call it inside a single private OHM block.
+        let ledger = node.ohm_ledgers[&ohm_id].clone();
+        let genesis_out = ledger.utxos.values().next().unwrap().outpoint;
+        let code = oxydome_ovm::Program {
+            argument_count: (oxydome_ovm::AUTHORITY_WORD_COUNT + 1) as u8,
+            local_count: 0,
+            instructions: vec![
+                oxydome_ovm::Instruction::LoadArg(oxydome_ovm::AUTHORITY_WORD_COUNT as u8),
+                oxydome_ovm::Instruction::LoadStorage(0),
+                oxydome_ovm::Instruction::Add,
+                oxydome_ovm::Instruction::StoreStorage(0),
+                oxydome_ovm::Instruction::LoadStorage(0),
+                oxydome_ovm::Instruction::Return,
+            ],
+        }
+        .encode()
+        .unwrap();
+        let artifact = oxydome_ovm::ContractArtifact {
+            source_hash: None,
+            asset_manifest_hash: None,
+            functions: vec![oxydome_ovm::ContractFunction {
+                name: "increment".into(),
+                inputs: vec![oxydome_ovm::ContractValueType::U64],
+                output: Some(oxydome_ovm::ContractValueType::U64),
+                code,
+            }],
+        }
+        .encode()
+        .unwrap();
+        let deploy = ledger.build_ovm_transaction(
+            vec![(genesis_out, maintainer.public())],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: maintainer.public(),
+            }],
+            100,
+            Some(OvmAction::DeployContract {
+                artifact,
+                gas_limit: 2_000,
+            }),
+            &maintainer,
+        );
+        let contract_id = oxydome_ovm::contract_id(deploy.txid());
+        let call = ledger.build_ovm_transaction(
+            vec![(OutPoint::new(deploy.txid(), 0), maintainer.public())],
+            vec![OhmOutput {
+                amount: 800,
+                recipient: maintainer.public(),
+            }],
+            100,
+            Some(OvmAction::CallContract {
+                contract_id,
+                entry_point: "increment".into(),
+                arguments: vec![5],
+                authority_input: 0,
+                gas_limit: 100,
+            }),
+            &maintainer,
+        );
+        let ohm_block = ledger.build_block(vec![deploy, call], 6, &maintainer).unwrap();
+        let ohm_block_hash = node.submit_ohm_block(ohm_block.clone()).unwrap();
+
+        // Anchor it at Ox height 2.
+        let mut update = OhmOperation::new_unsigned(
+            maintainer.public(),
+            OhmAction::Update {
+                ohm_id,
+                context: ohm_block.context(),
+                block_hash: ohm_block_hash,
+                fee_total: ohm_block.header.fee_total,
+            },
+        );
+        update.sign(&maintainer);
+        node.pending_ops.push(Operation::Ohm(update));
+
+        let block2 = node.produce_block(2).unwrap();
+        let state2 = node
+            .state
+            .apply_block(&block2, &node.gov, &node.params)
+            .unwrap();
+        let ohm2 = node.advance_ohm_ledgers(&block2).unwrap();
+        node.store
+            .as_mut()
+            .unwrap()
+            .save_version_with_ohm_and_block(
+                state2.height,
+                block2.hash(),
+                &state2.utxo,
+                &ledger_diff(&node.state.utxo, &state2.utxo),
+                &state2.contracts,
+                &state2.daos,
+                &state2.ohm_states,
+                &block2,
+            )
+            .unwrap();
+        node.state = state2;
+        node.ohm_ledgers = ohm2;
+
+        // The private contract state is committed by the anchored OHM state root.
+        assert_eq!(
+            node.ohm_ledgers[&ohm_id].contracts[&contract_id]
+                .storage
+                .get(&0),
+            Some(&5)
+        );
+        assert_eq!(
+            node.ohm_ledgers[&ohm_id].state_root,
+            node.state.ohm_states[&ohm_id].state_root
+        );
+        assert!(node.ohm_contract(&ohm_id, &contract_id).is_some());
+
+        // Restore and confirm the hosted contract is re-derived from persisted OHM blocks.
+        let store = node.store.take().unwrap();
+        let (fresh_node, _) = Node::new(key, &genesis_config, None).unwrap();
+        let restored = fresh_node.restore_from_store(store, None).unwrap();
+        assert_eq!(
+            restored.ohm_ledgers[&ohm_id].contracts[&contract_id]
+                .storage
+                .get(&0),
+            Some(&5)
+        );
+        assert_eq!(
+            restored.ohm_ledgers[&ohm_id].state_root,
+            restored.state.ohm_states[&ohm_id].state_root
+        );
+
+        // Read-only simulation runs against the restored private state.
+        let outcome = restored
+            .ohm_call_contract(
+                &ohm_id,
+                &contract_id,
+                "increment",
+                maintainer.public(),
+                &[1],
+                100,
+            )
+            .unwrap();
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.return_value, Some(6));
     }
 }

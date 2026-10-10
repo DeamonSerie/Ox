@@ -3,9 +3,15 @@
 
 use crate::utxo::{UtxoEntry, UtxoLedger};
 use oxydome_core::{
-    Amount, Block, ChainParams, GovernanceSet, Operation, OutPoint, OvmAction, OvmFailureCode,
-    OvmLog, OvmReceipt, PublicKey, RewardDistribution, Transaction, TxOutput, ValueIndex,
-    MAX_OVM_BLOCK_GAS_LIMIT,
+    Amount, Block, ChainParams, DaoAction, DaoOperation, DaoPeg, DaoPolicy, DaoProposal,
+    DaoProposalAction, DaoProposalStatus, DaoState, DaoWindowStats, GovernanceSet, OhmAction,
+    OhmOperation, OhmPolicy, OhmState, OhmUtxoEntry, Operation, OutPoint, OvmAction,
+    OvmFailureCode, OvmLog, OvmReceipt, PublicKey, RewardDistribution, Transaction, TxOutput,
+    ValueIndex, MAX_DAO_PROPOSALS, MAX_DAO_PROPOSAL_HEIGHTS, MAX_OVM_BLOCK_GAS_LIMIT,
+};
+use oxydome_core::{
+    build_ohm_server_outputs, compute_ohm_fee_split, ohm_genesis_hash, ohm_state_root,
+    ohm_treasury_outpoint,
 };
 use oxydome_crypto::{hash_value, verify, Hash};
 use oxydome_currency::{
@@ -105,6 +111,10 @@ pub enum StateError {
     OvmBlockGasLimit,
     #[error("block execution version or OVM activation height does not match chain parameters")]
     ExecutionVersionMismatch,
+    #[error("DAO operation invalid: {0}")]
+    Dao(String),
+    #[error("OHM operation invalid: {0}")]
+    Ohm(String),
 }
 
 /// The complete accounting state of the chain.
@@ -112,6 +122,8 @@ pub enum StateError {
 pub struct ChainState {
     pub utxo: UtxoLedger,
     pub contracts: BTreeMap<Hash, OvmContract>,
+    pub daos: BTreeMap<Hash, DaoState>,
+    pub ohm_states: BTreeMap<Hash, OhmState>,
     pub ovm_receipts: Vec<OvmReceipt>,
     pub supply: Amount,
     pub height: u64,
@@ -176,6 +188,8 @@ impl ChainState {
         let state = ChainState {
             utxo,
             contracts: BTreeMap::new(),
+            daos: BTreeMap::new(),
+            ohm_states: BTreeMap::new(),
             ovm_receipts: Vec::new(),
             supply: config.params.genesis_supply,
             height: 0,
@@ -197,14 +211,40 @@ impl ChainState {
         self.utxo.root()
     }
 
-    /// Combined commitment to UTXOs and OVM code/storage. Empty OVM state preserves the
-    /// original genesis and transfer-only state root for compatibility.
+    /// Combined commitment to UTXOs, OVM code/storage, DAO state, and OHM state.
+    /// Empty feature state preserves the original transfer-only state root.
     pub fn state_root(&self) -> Hash {
-        if self.contracts.is_empty() {
+        if self.contracts.is_empty() && self.daos.is_empty() && self.ohm_states.is_empty() {
             return self.utxo.root();
         }
-        let ovm_root = hash_value(&("oxydome-ovm-state-v1", &self.contracts));
-        hash_value(&("oxydome-combined-state-v1", self.utxo.root(), ovm_root))
+        let ovm_root = if self.contracts.is_empty() {
+            Hash::zero()
+        } else {
+            hash_value(&("oxydome-ovm-state-v1", &self.contracts))
+        };
+        let dao_root = if self.daos.is_empty() {
+            Hash::zero()
+        } else {
+            hash_value(&("oxydome-dao-state-v1", &self.daos))
+        };
+        let ohm_root = if self.ohm_states.is_empty() {
+            Hash::zero()
+        } else {
+            hash_value(&("oxydome-ohm-state-v1", &self.ohm_states))
+        };
+        
+        // Combine all roots - use v2 if only OVM+DAO, v3 if OHM included
+        if ohm_root.is_zero() {
+            hash_value(&("oxydome-combined-state-v2", self.utxo.root(), ovm_root, dao_root))
+        } else {
+            hash_value(&(
+                "oxydome-combined-state-v3",
+                self.utxo.root(),
+                ovm_root,
+                dao_root,
+                ohm_root
+            ))
+        }
     }
 
     /// The summed statistics over the measurement window.
@@ -493,9 +533,30 @@ impl ChainState {
         }
 
         // ---- 3. Governance operations ----
+        let mut dao_block_stats: BTreeMap<Hash, DaoWindowStats> = BTreeMap::new();
         for op in &block.operations {
             match op {
                 Operation::Rewards(_) => {}
+                Operation::Dao(dao_operation) => {
+                    apply_dao_operation(
+                        &mut next,
+                        dao_operation,
+                        new_height,
+                        params,
+                        &mut dao_block_stats,
+                    )?;
+                }
+                Operation::Ohm(ohm_operation) => {
+                    apply_ohm_operation(
+                        &mut next,
+                        ohm_operation,
+                        op.id(),
+                        new_height,
+                        params,
+                        gov,
+                        block.header.producer,
+                    )?;
+                }
                 Operation::Mint(m) => {
                     let approvals = count_master_approvals(op, gov);
                     let threshold = gov.master_threshold(params);
@@ -635,6 +696,8 @@ impl ChainState {
                 }
             }
         }
+
+        update_dao_value_indices(&mut next.daos, &dao_block_stats, params);
 
         // ---- 4. Value index ----
         let transition = compute_value(
@@ -972,8 +1035,8 @@ fn apply_rewards(
 mod tests {
     use super::*;
     use oxydome_core::{
-        GenesisAllocation, GenesisConfig, Operation, OvmAction, RewardDistribution, Transaction,
-        TxOutput,
+        compute_ohm_fee_split, GenesisAllocation, GenesisConfig, OhmContext, OhmOutput, Operation,
+        OvmAction, RewardDistribution, Transaction, TxOutput, OHM_POLICY_VERSION,
     };
     use oxydome_crypto::KeyPair;
     use oxydome_rewards::split_fees;
@@ -1054,6 +1117,85 @@ mod tests {
         assert_eq!(after.utxo.total(), after.supply);
         assert!(after.value_index.raw() >= params.initial_value_index);
         assert_eq!(after.height, 1);
+    }
+
+    #[test]
+    fn ohm_update_settles_fees_with_server_fee_bps() {
+        let (mut state, _genesis, gov, params, _master, node, _user) = setup();
+        let supply_before = state.supply;
+        let utxo_before = state.utxo.total();
+
+        let maintainer = KeyPair::from_seed(&[42u8; 32]);
+        let policy = OhmPolicy {
+            version: OHM_POLICY_VERSION,
+            maintainer: maintainer.public(),
+            name: "tenant".to_string(),
+            genesis_supply: 1_000,
+            block_window: 10,
+        };
+        let mut create = OhmOperation::new_unsigned(
+            maintainer.public(),
+            OhmAction::Create {
+                policy_bytes: policy.encode().unwrap(),
+                genesis_outputs: vec![OhmOutput {
+                    amount: 1_000,
+                    recipient: maintainer.public(),
+                }],
+            },
+        );
+        create.sign(&maintainer);
+        let ohm_id = create.created_ohm_id().unwrap();
+        let create_id = create.id();
+        apply_ohm_operation(&mut state, &create, create_id, 1, &params, &gov, node.public())
+            .unwrap();
+        assert_eq!(state.ohm_states[&ohm_id].treasury_ox, 0);
+
+        // Anchor a private OHM block whose transactions paid a 1_000 fee.
+        let fee_total: Amount = 1_000;
+        let prev_hash = state.ohm_states[&ohm_id].block_hash;
+        let mut update = OhmOperation::new_unsigned(
+            maintainer.public(),
+            OhmAction::Update {
+                ohm_id,
+                context: OhmContext {
+                    ohm_height: 1,
+                    ohm_prev_hash: prev_hash,
+                    ohm_timestamp: 7,
+                    ohm_state_root: Hash::from([9u8; 64]),
+                },
+                block_hash: Hash::from([8u8; 64]),
+                fee_total,
+            },
+        );
+        update.sign(&maintainer);
+        let update_id = update.id();
+        apply_ohm_operation(&mut state, &update, update_id, 2, &params, &gov, node.public())
+            .unwrap();
+
+        // The 40/60 split is governed solely by `OHM_SERVER_FEE_BPS`.
+        let (expected_server, expected_treasury) = compute_ohm_fee_split(fee_total);
+        assert_eq!(expected_server, 400);
+        assert_eq!(expected_treasury, 600);
+
+        // The server share is minted as participation-weighted `LockedReward` outputs. With a
+        // single Ox server node it is exactly the OHM server share.
+        let server_reward: Amount = state
+            .utxo
+            .iter()
+            .filter(|e| e.output.kind.is_locked_reward() && e.output.recipient == node.public())
+            .map(|e| e.output.amount)
+            .sum();
+        assert_eq!(server_reward, expected_server);
+
+        // The remainder is credited to the OHM treasury and tracked in the OHM state.
+        assert_eq!(state.ohm_states[&ohm_id].treasury_ox, expected_treasury);
+        assert_eq!(state.ohm_states[&ohm_id].fees_paid, fee_total);
+        assert_eq!(state.ohm_states[&ohm_id].current_height, 1);
+
+        // Value is conserved: exactly the fee total is minted and the UTXO set backs the supply.
+        assert_eq!(state.supply, supply_before + fee_total);
+        assert_eq!(state.utxo.total(), utxo_before + fee_total);
+        assert_eq!(state.utxo.total(), state.supply);
     }
 
     #[test]
@@ -1431,4 +1573,291 @@ fn count_node_approvals(op: &Operation, gov: &GovernanceSet) -> usize {
         .iter()
         .filter(|a| gov.contains_node(&a.node) && a.is_valid(&id) && seen.insert(a.node))
         .count()
+}
+
+fn dao_error(message: impl Into<String>) -> StateError {
+    StateError::Dao(message.into())
+}
+
+fn ohm_error(message: impl Into<String>) -> StateError {
+    StateError::Ohm(message.into())
+}
+
+fn apply_dao_operation(
+    _chain: &mut ChainState,
+    _operation: &DaoOperation,
+    _height: u64,
+    _params: &ChainParams,
+    _activity: &mut BTreeMap<Hash, DaoWindowStats>,
+) -> Result<(), StateError> {
+    Err(dao_error("DAO operations not yet fully implemented"))
+}
+
+fn apply_ohm_operation(
+    chain: &mut ChainState,
+    operation: &OhmOperation,
+    operation_id: Hash,
+    height: u64,
+    _params: &ChainParams,
+    gov: &GovernanceSet,
+    proposer: PublicKey,
+) -> Result<(), StateError> {
+    if !operation.is_valid() {
+        return Err(ohm_error("signature or action encoding is invalid"));
+    }
+
+    match &operation.action {
+        OhmAction::Create {
+            policy_bytes,
+            genesis_outputs,
+        } => {
+            let policy = OhmPolicy::decode(policy_bytes).map_err(ohm_error)?;
+            if policy.maintainer != operation.actor {
+                return Err(ohm_error("OHM creator must be the declared maintainer"));
+            }
+            let ohm_id = operation
+                .created_ohm_id()
+                .ok_or_else(|| ohm_error("create action has no derived OHM id"))?;
+            if chain.ohm_states.contains_key(&ohm_id) {
+                return Err(ohm_error("OHM already exists"));
+            }
+
+            // Verify genesis outputs sum to policy genesis supply.
+            let total: Amount = genesis_outputs.iter().map(|o| o.amount).sum();
+            if total != policy.genesis_supply {
+                return Err(ohm_error("genesis outputs do not sum to genesis supply"));
+            }
+
+            // Create initial UTXOs for genesis outputs. These belong to OHM height 0, so the
+            // recorded created-height is 0 to match the node-side ledger derivation.
+            let mut utxos = BTreeMap::new();
+            for (i, output) in genesis_outputs.iter().enumerate() {
+                let outpoint = OutPoint::new(operation.id(), i as u32);
+                let entry = OhmUtxoEntry::new(outpoint, output.clone(), 0);
+                utxos.insert(entry.key(), entry);
+            }
+            let state_root = ohm_state_root(&utxos, &BTreeMap::new());
+
+            chain.ohm_states.insert(
+                ohm_id,
+                OhmState {
+                    policy,
+                    current_height: 0,
+                    block_hash: ohm_genesis_hash(&ohm_id),
+                    state_root,
+                    supply: total,
+                    utxos,
+                    treasury_ox: 0,
+                    genesis_supply: total,
+                    fees_paid: 0,
+                },
+            );
+        }
+        OhmAction::Update {
+            ohm_id,
+            context,
+            block_hash,
+            fee_total,
+        } => {
+            let (maintainer, new_treasury) = {
+                let ohm = chain
+                    .ohm_states
+                    .get(ohm_id)
+                    .ok_or_else(|| ohm_error("OHM does not exist"))?;
+                if operation.actor != ohm.policy.maintainer {
+                    return Err(ohm_error("only OHM maintainer may update"));
+                }
+                if !context.is_valid() {
+                    return Err(ohm_error("invalid OHM context"));
+                }
+                if context.ohm_height != ohm.current_height + 1 {
+                    return Err(ohm_error("OHM height does not follow previous"));
+                }
+                if context.ohm_prev_hash != ohm.block_hash {
+                    return Err(ohm_error("OHM prev_hash does not match current block"));
+                }
+                (ohm.policy.maintainer, ohm.treasury_ox)
+            };
+
+            // Settle fees. This is the single enforcement point for the automatic OHM fee split:
+            // `compute_ohm_fee_split` governs the division via `OHM_SERVER_FEE_BPS`, the server
+            // share is minted as `LockedReward` outputs for the Ox server nodes and the remainder
+            // is credited to the OHM treasury. The weighted distribution can leave rounding dust,
+            // which the treasury retains so that the value minted equals the fee total exactly.
+            // Both legs enter the Ox ledger, so supply grows by exactly the fee total.
+            let fee_total = *fee_total;
+            let (server_share, _) = compute_ohm_fee_split(fee_total);
+            let server_outputs = build_ohm_server_outputs(fee_total, &gov.nodes, &proposer);
+            let server_total: Amount = server_outputs.iter().map(|o| o.amount).sum();
+            debug_assert!(server_total <= server_share);
+            let ohm_share = fee_total.saturating_sub(server_total);
+            for (i, output) in server_outputs.into_iter().enumerate() {
+                let outpoint = OutPoint::new(operation_id, i as u32);
+                chain.utxo = chain.utxo.insert(UtxoEntry::new(outpoint, output, height));
+            }
+
+            let treasury_balance = new_treasury
+                .checked_add(ohm_share)
+                .ok_or_else(|| ohm_error("OHM treasury overflow"))?;
+
+            if let Some(ohm) = chain.ohm_states.get_mut(ohm_id) {
+                ohm.current_height = context.ohm_height;
+                ohm.block_hash = *block_hash;
+                ohm.state_root = context.ohm_state_root;
+                ohm.treasury_ox = treasury_balance;
+                ohm.fees_paid = ohm
+                    .fees_paid
+                    .checked_add(fee_total)
+                    .ok_or_else(|| ohm_error("OHM fees_paid overflow"))?;
+            }
+            set_ohm_treasury_utxo(chain, ohm_id, &maintainer, treasury_balance, height);
+            chain.supply = chain
+                .supply
+                .checked_add(fee_total)
+                .ok_or_else(|| ohm_error("Ox supply overflow"))?;
+        }
+        OhmAction::Terminate { ohm_id, reason } => {
+            let ohm = chain
+                .ohm_states
+                .get(ohm_id)
+                .ok_or_else(|| ohm_error("OHM does not exist"))?;
+            if operation.actor != ohm.policy.maintainer {
+                return Err(ohm_error("only OHM maintainer may terminate"));
+            }
+            if reason.len() > oxydome_core::ohm::MAX_OHM_REASON_BYTES {
+                return Err(ohm_error("termination reason too long"));
+            }
+            let maintainer = ohm.policy.maintainer;
+
+            // Return any treasury balance to the maintainer and drop the locked treasury UTXO.
+            let outpoint = ohm_treasury_outpoint(ohm_id);
+            if let Some(entry) = chain.utxo.get(&outpoint).cloned() {
+                chain.utxo = chain.utxo.remove(&outpoint).0;
+                let payout = OutPoint::new(operation_id, 0);
+                chain.utxo = chain.utxo.insert(UtxoEntry::new(
+                    payout,
+                    TxOutput::spendable(entry.output.amount, maintainer),
+                    height,
+                ));
+            }
+
+            // Remove OHM state (termination is final).
+            chain.ohm_states.remove(ohm_id);
+        }
+        OhmAction::Transfer {
+            ohm_id,
+            recipient,
+            amount,
+        } => {
+            let (maintainer, new_balance) = {
+                let ohm = chain
+                    .ohm_states
+                    .get(ohm_id)
+                    .ok_or_else(|| ohm_error("OHM does not exist"))?;
+                if operation.actor != ohm.policy.maintainer {
+                    return Err(ohm_error("only OHM maintainer may transfer from treasury"));
+                }
+                if *amount == 0 {
+                    return Err(ohm_error("transfer amount must be positive"));
+                }
+                if ohm.treasury_ox < *amount {
+                    return Err(ohm_error("insufficient OHM treasury balance"));
+                }
+                (ohm.policy.maintainer, ohm.treasury_ox - *amount)
+            };
+
+            if let Some(ohm) = chain.ohm_states.get_mut(ohm_id) {
+                ohm.treasury_ox = new_balance;
+            }
+
+            // Create UTXO on Ox chain for recipient and update the locked treasury UTXO.
+            let outpoint = OutPoint::new(operation_id, 0);
+            chain.utxo = chain.utxo.insert(UtxoEntry::new(
+                outpoint,
+                TxOutput::spendable(*amount, *recipient),
+                height,
+            ));
+            set_ohm_treasury_utxo(chain, ohm_id, &maintainer, new_balance, height);
+        }
+        OhmAction::TreasuryDeposit {
+            ohm_id,
+            source,
+            amount,
+        } => {
+            let maintainer = chain
+                .ohm_states
+                .get(ohm_id)
+                .ok_or_else(|| ohm_error("OHM does not exist"))?
+                .policy
+                .maintainer;
+
+            // Find and consume the source UTXO from the main Ox ledger.
+            let entry = chain
+                .utxo
+                .get(source)
+                .cloned()
+                .ok_or_else(|| ohm_error("source UTXO does not exist"))?;
+            if !entry.output.kind.is_spendable()
+                || entry.output.recipient != operation.actor
+                || *amount > entry.output.amount
+                || *amount == 0
+            {
+                return Err(ohm_error("invalid source UTXO"));
+            }
+            chain.utxo = chain.utxo.remove(source).0;
+
+            // Create change UTXO if needed.
+            let change = entry.output.amount - *amount;
+            if change > 0 {
+                let outpoint = OutPoint::new(operation_id, 0);
+                chain.utxo = chain.utxo.insert(UtxoEntry::new(
+                    outpoint,
+                    TxOutput::spendable(change, operation.actor),
+                    height,
+                ));
+            }
+
+            let new_balance = chain
+                .ohm_states
+                .get(ohm_id)
+                .map(|ohm| ohm.treasury_ox)
+                .unwrap_or(0)
+                .checked_add(*amount)
+                .ok_or_else(|| ohm_error("OHM treasury overflow"))?;
+            if let Some(ohm) = chain.ohm_states.get_mut(ohm_id) {
+                ohm.treasury_ox = new_balance;
+            }
+            set_ohm_treasury_utxo(chain, ohm_id, &maintainer, new_balance, height);
+        }
+    }
+
+    Ok(())
+}
+
+/// Inserts (or removes, when zero) the locked `OhmTreasury` UTXO that backs `ohm_id`'s
+/// `treasury_ox` balance, keeping the Ox supply invariant intact.
+fn set_ohm_treasury_utxo(
+    chain: &mut ChainState,
+    ohm_id: &Hash,
+    maintainer: &PublicKey,
+    amount: Amount,
+    height: u64,
+) {
+    let outpoint = ohm_treasury_outpoint(ohm_id);
+    chain.utxo = chain.utxo.remove(&outpoint).0;
+    if amount > 0 {
+        chain.utxo = chain.utxo.insert(UtxoEntry::new(
+            outpoint,
+            TxOutput::ohm_treasury(amount, *maintainer, *ohm_id),
+            height,
+        ));
+    }
+}
+
+fn update_dao_value_indices(
+    _daos: &mut BTreeMap<Hash, DaoState>,
+    _block_activity: &BTreeMap<Hash, DaoWindowStats>,
+    _params: &ChainParams,
+) {
+    // Placeholder - DAO value index updates not yet implemented
 }

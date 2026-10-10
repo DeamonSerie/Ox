@@ -128,6 +128,26 @@ pub struct CustomError {
     pub inputs: Vec<Param>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaoCurrencyDeclaration {
+    pub symbol: String,
+    pub initial_supply: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaoPegDeclaration {
+    pub target_dao: String,
+    pub numerator: u128,
+    pub denominator: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaoDeclaration {
+    pub makers: Vec<String>,
+    pub currency: Option<DaoCurrencyDeclaration>,
+    pub peg: Option<DaoPegDeclaration>,
+}
+
 /// Parsed contract definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contract {
@@ -148,6 +168,7 @@ pub struct Contract {
     pub enums: Vec<Enum>,
     pub modifiers: Vec<Modifier>,
     pub errors: Vec<CustomError>,
+    pub dao: Option<DaoDeclaration>,
 }
 
 /// Block statements

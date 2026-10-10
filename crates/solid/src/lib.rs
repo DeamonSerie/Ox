@@ -26,7 +26,10 @@ use ast::{
 };
 
 pub use ast::Contract;
-pub use ovm_compiler::{compile_contract_to_ovm, compile_function_to_ovm, CompileError};
+pub use ovm_compiler::{
+    compile_contract_to_ovm, compile_dao_policy, compile_function_to_ovm, compile_solid_to_ovm,
+    CompileError, CompiledSolid,
+};
 pub use parser::{PestError, Rule};
 
 /// Parse one Solidity contract, interface, or library definition into an AST.
@@ -193,6 +196,7 @@ pub fn token_contract() -> Contract {
         enums: vec![],
         modifiers: vec![],
         errors: vec![],
+        dao: None,
     }
 }
 
@@ -341,5 +345,68 @@ mod tests {
             panic!("expected returned expression");
         };
         assert!(matches!(expression, Expr::Ternary { .. }));
+    }
+
+    #[test]
+    fn parses_and_compiles_a_dao_policy() {
+        let contract = parse_contract(
+            r#"
+                contract Community {
+                    dao {
+                        makers: [
+                            "0x0202020202020202020202020202020202020202020202020202020202020202",
+                            "0x0101010101010101010101010101010101010101010101010101010101010101"
+                        ];
+                        currency: optional("COMM", initial_supply: 1000000);
+                        peg: none;
+                    }
+                }
+            "#,
+        )
+        .expect("valid DAO policy syntax");
+
+        let encoded = compile_dao_policy(&contract)
+            .expect("valid DAO policy")
+            .expect("DAO declaration exists");
+        let policy = oxydome_core::DaoPolicy::decode(&encoded).unwrap();
+        assert_eq!(policy.makers.len(), 2);
+        assert!(policy.makers[0] < policy.makers[1]);
+        assert_eq!(
+            policy.currency,
+            Some(oxydome_core::DaoCurrency {
+                symbol: "COMM".into(),
+                initial_supply: 1_000_000
+            })
+        );
+        assert!(policy.peg.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_dao_policy_addresses_and_currency_symbols() {
+        let bad_address = parse_contract(
+            r#"contract C { dao { makers: ["0x01"]; currency: none; peg: none; } }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            compile_dao_policy(&bad_address),
+            Err(CompileError::InvalidDao(_))
+        ));
+
+        let bad_symbol = parse_contract(
+            r#"
+                contract C {
+                    dao {
+                        makers: ["0x0101010101010101010101010101010101010101010101010101010101010101"];
+                        currency: optional("lowercase", initial_supply: 0);
+                        peg: none;
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            compile_dao_policy(&bad_symbol),
+            Err(CompileError::InvalidDao(_))
+        ));
     }
 }

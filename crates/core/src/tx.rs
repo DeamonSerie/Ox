@@ -1,6 +1,6 @@
 //! Transactions and the UTXO primitive types.
 
-use crate::{Amount, CoreError};
+use crate::{Amount, CoreError, OhmContext};
 use oxydome_crypto::{hash_value, verify, Hash, KeyPair, PublicKey, Sig};
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +33,10 @@ pub enum OutputKind {
     /// Ox deposited into the Exit/Reserve sink. This applies downward pressure on the value
     /// index and is refunded (tagged) when a rebound occurs.
     ExitReserve { generation: u64 },
+    /// Ox held by a DAO until a DAO-approved transfer releases it.
+    DaoTreasury { dao_id: Hash },
+    /// Ox held in an OHM's treasury. Spendable only via OHM operations (deposit/transfer).
+    OhmTreasury { ohm_id: Hash },
 }
 
 impl OutputKind {
@@ -46,6 +50,14 @@ impl OutputKind {
 
     pub fn is_exit(&self) -> bool {
         matches!(self, OutputKind::ExitReserve { .. })
+    }
+
+    pub fn is_dao_treasury(&self) -> bool {
+        matches!(self, OutputKind::DaoTreasury { .. })
+    }
+
+    pub fn is_ohm_treasury(&self) -> bool {
+        matches!(self, OutputKind::OhmTreasury { .. })
     }
 }
 
@@ -87,6 +99,24 @@ impl TxOutput {
         }
     }
 
+    pub fn dao_treasury(amount: Amount, recipient: PublicKey, dao_id: Hash) -> Self {
+        Self {
+            amount,
+            recipient,
+            kind: OutputKind::DaoTreasury { dao_id },
+            rebound_gen: None,
+        }
+    }
+
+    pub fn ohm_treasury(amount: Amount, recipient: PublicKey, ohm_id: Hash) -> Self {
+        Self {
+            amount,
+            recipient,
+            kind: OutputKind::OhmTreasury { ohm_id },
+            rebound_gen: None,
+        }
+    }
+
     pub fn is_rebound_credit(&self) -> bool {
         self.rebound_gen.is_some()
     }
@@ -111,6 +141,10 @@ pub struct Transaction {
     pub fee: Amount,
     #[serde(default)]
     pub ovm_action: Option<OvmAction>,
+    /// OHM context for transactions that are part of an OHM (tenant blockchain).
+    /// OHM transactions pay fees to Ox network: 40% to server nodes, 60% to OHM.
+    #[serde(default)]
+    pub ohm_context: Option<OhmContext>,
 }
 
 /// A versioned OVM action carried by an ordinary, value-conserving transaction.
@@ -294,6 +328,7 @@ impl Transaction {
             outputs,
             fee,
             ovm_action: None,
+            ohm_context: None,
         }
     }
 
@@ -431,6 +466,7 @@ mod tests {
             outputs: vec![TxOutput::spendable(100, owner)],
             fee,
             ovm_action: None,
+            ohm_context: None,
         };
         let msg = tx.signing_hash(0);
         tx.inputs[0].signature = kp.sign(&msg.0);

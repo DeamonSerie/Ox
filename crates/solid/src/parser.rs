@@ -1,6 +1,7 @@
 use crate::ast::{
-    Block, Contract, ContractKind, CustomError, Enum, Event, Expr, Function, FunctionKind, LValue,
-    Modifier, ModifierInvocation, Mutability, Param, Statement, Struct, Type, Variable, Visibility,
+    Block, Contract, ContractKind, CustomError, DaoCurrencyDeclaration, DaoDeclaration,
+    DaoPegDeclaration, Enum, Event, Expr, Function, FunctionKind, LValue, Modifier,
+    ModifierInvocation, Mutability, Param, Statement, Struct, Type, Variable, Visibility,
 };
 use pest::error::ErrorVariant;
 use pest::iterators::Pair;
@@ -71,6 +72,7 @@ fn build_contract(pair: Pair<Rule>) -> Result<Contract, PestError<Rule>> {
         enums: Vec::new(),
         modifiers: Vec::new(),
         errors: Vec::new(),
+        dao: None,
     };
 
     for item in inner {
@@ -104,6 +106,7 @@ fn build_contract(pair: Pair<Rule>) -> Result<Contract, PestError<Rule>> {
                     Rule::modifier_definition => {
                         contract.modifiers.push(parse_modifier(definition)?)
                     }
+                    Rule::dao_definition => contract.dao = Some(parse_dao(definition)?),
                     _ => {}
                 }
             }
@@ -111,6 +114,62 @@ fn build_contract(pair: Pair<Rule>) -> Result<Contract, PestError<Rule>> {
         }
     }
     Ok(contract)
+}
+
+fn parse_dao(pair: Pair<Rule>) -> Result<DaoDeclaration, PestError<Rule>> {
+    let mut makers = Vec::new();
+    let mut currency = None;
+    let mut peg = None;
+    for field in pair.into_inner() {
+        match field.as_rule() {
+            Rule::dao_makers => {
+                makers = field
+                    .into_inner()
+                    .filter(|part| part.as_rule() == Rule::string_literal)
+                    .map(parse_string)
+                    .collect();
+            }
+            Rule::dao_currency => {
+                let declaration = field.into_inner().next().expect("DAO currency variant");
+                if declaration.as_rule() == Rule::dao_currency_optional {
+                    let mut inner = declaration.into_inner();
+                    let symbol = parse_string(inner.next().expect("DAO currency symbol"));
+                    let amount = inner.next().expect("DAO initial supply");
+                    currency = Some(DaoCurrencyDeclaration {
+                        symbol,
+                        initial_supply: parse_dao_amount(amount)?,
+                    });
+                }
+            }
+            Rule::dao_peg => {
+                let declaration = field.into_inner().next().expect("DAO peg variant");
+                if declaration.as_rule() == Rule::dao_peg_some {
+                    let mut inner = declaration.into_inner();
+                    let target_dao = parse_string(inner.next().expect("DAO peg target"));
+                    let numerator = parse_dao_amount(inner.next().expect("DAO peg numerator"))?;
+                    let denominator = parse_dao_amount(inner.next().expect("DAO peg denominator"))?;
+                    peg = Some(DaoPegDeclaration {
+                        target_dao,
+                        numerator,
+                        denominator,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(DaoDeclaration {
+        makers,
+        currency,
+        peg,
+    })
+}
+
+fn parse_dao_amount(pair: Pair<Rule>) -> Result<u128, PestError<Rule>> {
+    pair.as_str()
+        .replace('_', "")
+        .parse::<u128>()
+        .map_err(|error| conversion_error(&pair, format!("invalid DAO amount: {error}")))
 }
 
 fn parse_type(pair: Pair<Rule>) -> Result<Type, PestError<Rule>> {

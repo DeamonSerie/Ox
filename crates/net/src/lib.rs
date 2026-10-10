@@ -3,7 +3,10 @@
 
 use oxydome_audit::{AuditAttestation, AuditPackage};
 use oxydome_consensus::{AdmissionCertificate, MasterCheck, QuorumCertificate, Vote};
-use oxydome_core::{Amount, Block, Hash, OutPoint, OutputKind, PublicKey, Transaction};
+use oxydome_core::{
+    Amount, Block, DaoState, Hash, OhmBlock, OhmState, Operation, OutPoint, OutputKind,
+    OvmFailureCode, OvmLog, PublicKey, Transaction,
+};
 use oxydome_crypto::{CodeManifest, SparseProof};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -137,6 +140,76 @@ pub enum Message {
     SubmitResponse {
         txid: Hash,
         accepted: bool,
+        error: Option<String>,
+    },
+    SubmitOperation {
+        operation: Box<Operation>,
+    },
+    OperationSubmitResponse {
+        operation_id: Hash,
+        accepted: bool,
+        error: Option<String>,
+    },
+    GetDao {
+        dao_id: Hash,
+    },
+    DaoResponse {
+        dao_id: Hash,
+        state: Option<DaoState>,
+    },
+    // -- OHM (walletd/clients <-> node) --
+    GetOhm {
+        ohm_id: Hash,
+    },
+    OhmResponse {
+        ohm_id: Hash,
+        state: Option<Box<OhmState>>,
+    },
+    GetOhmBlock {
+        hash: Hash,
+    },
+    OhmBlockResponse {
+        block: Option<Box<OhmBlock>>,
+    },
+    GetOhmBalance {
+        ohm_id: Hash,
+        owner: PublicKey,
+    },
+    OhmBalanceResponse {
+        ohm_id: Hash,
+        amount: Amount,
+    },
+    SubmitOhmBlock {
+        block: Box<OhmBlock>,
+    },
+    OhmBlockSubmitResponse {
+        hash: Hash,
+        accepted: bool,
+        error: Option<String>,
+    },
+    GetOhmContract {
+        ohm_id: Hash,
+        contract_id: Hash,
+    },
+    OhmContractResponse {
+        ohm_id: Hash,
+        contract_id: Hash,
+        code: Option<Vec<u8>>,
+        storage: Option<Vec<(u64, u64)>>,
+    },
+    CallOhmContract {
+        ohm_id: Hash,
+        contract_id: Hash,
+        entry_point: String,
+        arguments: Vec<u64>,
+        caller: PublicKey,
+        gas_limit: u64,
+    },
+    OhmContractCallResponse {
+        failure: Option<OvmFailureCode>,
+        gas_used: u64,
+        return_value: Option<u64>,
+        logs: Vec<OvmLog>,
         error: Option<String>,
     },
     GetOvmCode {

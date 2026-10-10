@@ -1080,6 +1080,7 @@ dependencies = [
  "oxydome-currency",
  "oxydome-master",
  "oxydome-net",
+ "oxydome-ohm",
  "oxydome-ovm",
  "oxydome-rewards",
  "oxydome-state",
@@ -1110,6 +1111,18 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "oxydome-ohm"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "oxydome-core",
+ "oxydome-crypto",
+ "oxydome-ovm",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -1245,6 +1258,7 @@ dependencies = [
  "oxydome-currency",
  "oxydome-net",
  "oxydome-node",
+ "oxydome-ohm",
  "oxydome-ovm",
  "oxydome-wallet",
  "oxydome-wallet-rpc",

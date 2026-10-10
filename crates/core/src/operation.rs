@@ -5,7 +5,7 @@
 //! nodes for withdrawals). Fee rewards are validated against the block's collected fees.
 
 use crate::tx::TxOutput;
-use crate::{Amount, OutPoint};
+use crate::{Amount, DaoAction, DaoOperation, OhmAction, OhmOperation, OutPoint};
 use oxydome_crypto::{hash_value, verify, Hash, PublicKey, Sig};
 use serde::{Deserialize, Serialize};
 
@@ -119,6 +119,14 @@ enum SignableOperation {
         master_outputs: Vec<TxOutput>,
         node_outputs: Vec<TxOutput>,
     },
+    Dao {
+        actor: PublicKey,
+        action: DaoAction,
+    },
+    Ohm {
+        actor: PublicKey,
+        action: OhmAction,
+    },
 }
 
 /// A block operation.
@@ -128,6 +136,8 @@ pub enum Operation {
     Burn(TreasuryBurn),
     Withdraw(WithdrawRequest),
     Rewards(RewardDistribution),
+    Dao(DaoOperation),
+    Ohm(OhmOperation),
 }
 
 impl Operation {
@@ -151,6 +161,14 @@ impl Operation {
             Operation::Rewards(r) => SignableOperation::Rewards {
                 master_outputs: r.master_outputs.clone(),
                 node_outputs: r.node_outputs.clone(),
+            },
+            Operation::Dao(op) => SignableOperation::Dao {
+                actor: op.actor,
+                action: op.action.clone(),
+            },
+            Operation::Ohm(op) => SignableOperation::Ohm {
+                actor: op.actor,
+                action: op.action.clone(),
             },
         };
         hash_value(&signable)
@@ -194,7 +212,11 @@ impl Operation {
     pub fn is_governance(&self) -> bool {
         matches!(
             self,
-            Operation::Mint(_) | Operation::Burn(_) | Operation::Withdraw(_)
+            Operation::Mint(_)
+                | Operation::Burn(_)
+                | Operation::Withdraw(_)
+                | Operation::Dao(_)
+                | Operation::Ohm(_)
         )
     }
 

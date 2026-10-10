@@ -15,7 +15,7 @@
 
 use crate::chain::OvmContract;
 use crate::utxo::{Summary, UtxoEntry, UtxoLedger, VNode};
-use oxydome_core::{Amount, OutPoint};
+use oxydome_core::{Amount, DaoState, OhmBlock, OhmState, OutPoint};
 use oxydome_crypto::{merkle_leaf_hash, merkle_node_hash, Hash};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -39,6 +39,20 @@ pub struct OvmSnapshot {
     pub height: u64,
     pub root: Hash,
     pub contracts: std::collections::BTreeMap<Hash, OvmContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaoSnapshot {
+    pub height: u64,
+    pub root: Hash,
+    pub daos: std::collections::BTreeMap<Hash, DaoState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OhmSnapshot {
+    pub height: u64,
+    pub root: Hash,
+    pub states: std::collections::BTreeMap<Hash, OhmState>,
 }
 
 /// The committed summary of a specific ledger version.
@@ -71,6 +85,10 @@ const PREFIX_DELTA: u8 = 2u8;
 const PREFIX_OVM: u8 = 4u8;
 const PREFIX_BLOCK: u8 = 5u8;
 const PREFIX_FINALITY: u8 = 6u8;
+const PREFIX_DAO: u8 = 7u8;
+const PREFIX_OHM_STATE: u8 = 8u8;
+/// Content-addressed private OHM blocks, keyed by OHM block hash.
+const PREFIX_OHM_BLOCK: u8 = 9u8;
 const KEY_CURRENT: [u8; 1] = [3u8];
 
 fn node_key(hash: &Hash) -> Vec<u8> {
@@ -192,6 +210,7 @@ impl LedgerStore {
                         snapshot.height
                     )));
                 }
+
                 let root =
                     oxydome_crypto::hash_value(&("oxydome-ovm-state-v1", &snapshot.contracts));
                 if root != snapshot.root {
@@ -203,6 +222,113 @@ impl LedgerStore {
             }
             None => Ok(Default::default()),
         }
+    }
+
+    pub fn load_dao_state(
+        &self,
+        height: u64,
+    ) -> Result<std::collections::BTreeMap<Hash, DaoState>, LedgerError> {
+        match self.tree.get(height_key(PREFIX_DAO, height))? {
+            Some(raw) => {
+                let snapshot: DaoSnapshot = Self::decode(&raw)?;
+                if snapshot.height != height {
+                    return Err(LedgerError::Corrupt(format!(
+                        "DAO snapshot height {} stored at {height}",
+                        snapshot.height
+                    )));
+                }
+                let root = oxydome_crypto::hash_value(&("oxydome-dao-state-v1", &snapshot.daos));
+                if root != snapshot.root {
+                    return Err(LedgerError::Corrupt(format!(
+                        "DAO snapshot root mismatch at height {height}"
+                    )));
+                }
+                Ok(snapshot.daos)
+            }
+            None => Ok(Default::default()),
+        }
+    }
+
+    pub fn load_ohm_state(
+        &self,
+        height: u64,
+    ) -> Result<std::collections::BTreeMap<Hash, OhmState>, LedgerError> {
+        match self.tree.get(height_key(PREFIX_OHM_STATE, height))? {
+            Some(raw) => {
+                let snapshot: OhmSnapshot = Self::decode(&raw)?;
+                if snapshot.height != height {
+                    return Err(LedgerError::Corrupt(format!(
+                        "OHM snapshot height {} stored at {height}",
+                        snapshot.height
+                    )));
+                }
+                let root = oxydome_crypto::hash_value(&("oxydome-ohm-state-v1", &snapshot.states));
+                if root != snapshot.root {
+                    return Err(LedgerError::Corrupt(format!(
+                        "OHM snapshot root mismatch at height {height}"
+                    )));
+                }
+                Ok(snapshot.states)
+            }
+            None => Ok(Default::default()),
+        }
+    }
+
+    /// Durably stores a private OHM block, content-addressed by its block hash.
+    ///
+    /// Re-saving an existing block is a no-op, so repeated submissions are idempotent.
+    pub fn save_ohm_block(&mut self, block: &OhmBlock) -> Result<(), LedgerError> {
+        let hash = block.hash();
+        let mut key = Vec::with_capacity(1 + 64);
+        key.push(PREFIX_OHM_BLOCK);
+        key.extend_from_slice(hash.as_bytes());
+        if self.tree.get(&key)?.is_some() {
+            return Ok(());
+        }
+        self.tree
+            .insert(key, Self::encode(block)?)
+            .map_err(LedgerError::from)?;
+        Ok(())
+    }
+
+    /// Loads a single private OHM block by hash, verifying it hashes to the requested key.
+    pub fn load_ohm_block(&self, hash: &Hash) -> Result<Option<OhmBlock>, LedgerError> {
+        let mut key = Vec::with_capacity(1 + 64);
+        key.push(PREFIX_OHM_BLOCK);
+        key.extend_from_slice(hash.as_bytes());
+        match self.tree.get(&key)? {
+            Some(raw) => {
+                let block: OhmBlock = Self::decode(&raw)?;
+                if &block.hash() != hash {
+                    return Err(LedgerError::Corrupt(format!(
+                        "stored OHM block does not hash to its key {hash}"
+                    )));
+                }
+                Ok(Some(block))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Loads every durably stored private OHM block.
+    pub fn load_ohm_blocks(&self) -> Result<Vec<OhmBlock>, LedgerError> {
+        let mut blocks = Vec::new();
+        for entry in self.tree.scan_prefix(&[PREFIX_OHM_BLOCK]) {
+            let (key, value) = entry?;
+            if key.len() != 1 + 64 {
+                return Err(LedgerError::Corrupt("OHM block key length".into()));
+            }
+            let block: OhmBlock = Self::decode(&value)?;
+            let mut hash_bytes = [0u8; 64];
+            hash_bytes.copy_from_slice(&key[1..]);
+            if *block.hash().as_bytes() != hash_bytes {
+                return Err(LedgerError::Corrupt(
+                    "stored OHM block does not hash to its key".into(),
+                ));
+            }
+            blocks.push(block);
+        }
+        Ok(blocks)
     }
 
     /// Loads every durably stored block in height order.
@@ -441,7 +567,17 @@ impl LedgerStore {
         delta: &LedgerDelta,
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
     ) -> Result<(), LedgerError> {
-        self.save_version_contents(height, block_hash, ledger, delta, contracts, None, None)
+        self.save_version_contents(
+            height,
+            block_hash,
+            ledger,
+            delta,
+            contracts,
+            &Default::default(),
+            &Default::default(),
+            None,
+            None,
+        )
     }
 
     /// Atomically commits UTXO, OVM and block data for a finalized height.
@@ -465,6 +601,40 @@ impl LedgerStore {
             ledger,
             delta,
             contracts,
+            &Default::default(),
+            &Default::default(),
+            Some(block),
+            None,
+        )
+    }
+
+    /// Atomically commits UTXO, OVM, DAO, OHM and block data for a finalized height, without
+    /// finalized-evidence bytes. Used by nodes that persist OHM state but not audit evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_version_with_ohm_and_block(
+        &mut self,
+        height: u64,
+        block_hash: Hash,
+        ledger: &UtxoLedger,
+        delta: &LedgerDelta,
+        contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+        daos: &std::collections::BTreeMap<Hash, DaoState>,
+        ohm_states: &std::collections::BTreeMap<Hash, OhmState>,
+        block: &oxydome_core::Block,
+    ) -> Result<(), LedgerError> {
+        if block.header.height != height || block.hash() != block_hash {
+            return Err(LedgerError::Corrupt(
+                "block does not match persisted version".into(),
+            ));
+        }
+        self.save_version_contents(
+            height,
+            block_hash,
+            ledger,
+            delta,
+            contracts,
+            daos,
+            ohm_states,
             Some(block),
             None,
         )
@@ -492,17 +662,55 @@ impl LedgerStore {
                 "block or finality evidence does not match persisted version".into(),
             ));
         }
+        self.save_version_with_dao_and_finality(
+            height,
+            block_hash,
+            ledger,
+            delta,
+            contracts,
+            &Default::default(),
+            &Default::default(),
+            block,
+            finality_evidence,
+        )
+    }
+
+    /// Atomically commits UTXO, OVM, DAO, OHM, block, and finalized-evidence state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_version_with_dao_and_finality(
+        &mut self,
+        height: u64,
+        block_hash: Hash,
+        ledger: &UtxoLedger,
+        delta: &LedgerDelta,
+        contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+        daos: &std::collections::BTreeMap<Hash, DaoState>,
+        ohm_states: &std::collections::BTreeMap<Hash, OhmState>,
+        block: &oxydome_core::Block,
+        finality_evidence: &[u8],
+    ) -> Result<(), LedgerError> {
+        if block.header.height != height
+            || block.hash() != block_hash
+            || finality_evidence.is_empty()
+        {
+            return Err(LedgerError::Corrupt(
+                "block or finality evidence does not match persisted version".into(),
+            ));
+        }
         self.save_version_contents(
             height,
             block_hash,
             ledger,
             delta,
             contracts,
+            daos,
+            ohm_states,
             Some(block),
             Some(finality_evidence),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn save_version_contents(
         &mut self,
         height: u64,
@@ -510,6 +718,8 @@ impl LedgerStore {
         ledger: &UtxoLedger,
         delta: &LedgerDelta,
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+        daos: &std::collections::BTreeMap<Hash, DaoState>,
+        ohm_states: &std::collections::BTreeMap<Hash, OhmState>,
         block: Option<&oxydome_core::Block>,
         finality_evidence: Option<&[u8]>,
     ) -> Result<(), LedgerError> {
@@ -592,6 +802,22 @@ impl LedgerStore {
                 height,
                 root: oxydome_crypto::hash_value(&("oxydome-ovm-state-v1", contracts)),
                 contracts: contracts.clone(),
+            })?,
+        );
+        batch.insert(
+            height_key(PREFIX_DAO, height),
+            Self::encode(&DaoSnapshot {
+                height,
+                root: oxydome_crypto::hash_value(&("oxydome-dao-state-v1", daos)),
+                daos: daos.clone(),
+            })?,
+        );
+        batch.insert(
+            height_key(PREFIX_OHM_STATE, height),
+            Self::encode(&OhmSnapshot {
+                height,
+                root: oxydome_crypto::hash_value(&("oxydome-ohm-state-v1", ohm_states)),
+                states: ohm_states.clone(),
             })?,
         );
         if let Some(block) = block {
