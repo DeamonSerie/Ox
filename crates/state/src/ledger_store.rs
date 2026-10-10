@@ -13,6 +13,7 @@
 //! ([`LedgerStore::verify_history`], [`LedgerStore::rebuild_from_deltas`]) to independently
 //! re-derive and cross-check every committed state root.
 
+use crate::chain::OvmContract;
 use crate::utxo::{Summary, UtxoEntry, UtxoLedger, VNode};
 use oxydome_core::{Amount, OutPoint};
 use oxydome_crypto::{merkle_leaf_hash, merkle_node_hash, Hash};
@@ -31,6 +32,13 @@ enum NodeMeta {
         count: u64,
         total: Amount,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OvmSnapshot {
+    pub height: u64,
+    pub root: Hash,
+    pub contracts: std::collections::BTreeMap<Hash, OvmContract>,
 }
 
 /// The committed summary of a specific ledger version.
@@ -60,6 +68,7 @@ pub struct LedgerDelta {
 const PREFIX_NODE: u8 = 0u8;
 const PREFIX_SNAPSHOT: u8 = 1u8;
 const PREFIX_DELTA: u8 = 2u8;
+const PREFIX_OVM: u8 = 4u8;
 const KEY_CURRENT: [u8; 1] = [3u8];
 
 fn node_key(hash: &Hash) -> Vec<u8> {
@@ -166,6 +175,32 @@ impl LedgerStore {
         }
         self.seeded = true;
         Ok(())
+    }
+
+    pub fn load_ovm_state(
+        &self,
+        height: u64,
+    ) -> Result<std::collections::BTreeMap<Hash, OvmContract>, LedgerError> {
+        match self.tree.get(height_key(PREFIX_OVM, height))? {
+            Some(raw) => {
+                let snapshot: OvmSnapshot = Self::decode(&raw)?;
+                if snapshot.height != height {
+                    return Err(LedgerError::Corrupt(format!(
+                        "OVM snapshot height {} stored at {height}",
+                        snapshot.height
+                    )));
+                }
+                let root =
+                    oxydome_crypto::hash_value(&("oxydome-ovm-state-v1", &snapshot.contracts));
+                if root != snapshot.root {
+                    return Err(LedgerError::Corrupt(format!(
+                        "OVM snapshot root mismatch at height {height}"
+                    )));
+                }
+                Ok(snapshot.contracts)
+            }
+            None => Ok(Default::default()),
+        }
     }
 
     fn read_meta(&self, hash: &Hash) -> Result<Option<NodeMeta>, LedgerError> {
@@ -346,6 +381,18 @@ impl LedgerStore {
         ledger: &UtxoLedger,
         delta: &LedgerDelta,
     ) -> Result<(), LedgerError> {
+        self.save_version_with_ovm(height, block_hash, ledger, delta, &Default::default())
+    }
+
+    /// Atomically commits UTXO and OVM state for a finalized height.
+    pub fn save_version_with_ovm(
+        &mut self,
+        height: u64,
+        block_hash: Hash,
+        ledger: &UtxoLedger,
+        delta: &LedgerDelta,
+        contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+    ) -> Result<(), LedgerError> {
         self.ensure_seeded()?;
 
         // Post-order walk collecting nodes; skip complete subtrees that already exist.
@@ -419,6 +466,14 @@ impl LedgerStore {
             Self::encode(&snapshot)?,
         );
         batch.insert(height_key(PREFIX_DELTA, height), Self::encode(delta)?);
+        batch.insert(
+            height_key(PREFIX_OVM, height),
+            Self::encode(&OvmSnapshot {
+                height,
+                root: oxydome_crypto::hash_value(&("oxydome-ovm-state-v1", contracts)),
+                contracts: contracts.clone(),
+            })?,
+        );
         batch.insert(&KEY_CURRENT, height.to_le_bytes().to_vec());
         self.tree.apply_batch(batch)?;
 
@@ -610,6 +665,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.load_current().unwrap().unwrap().total(), 5);
+    }
+
+    #[test]
+    fn ovm_state_is_saved_atomically_with_ledger_version() {
+        let mut store = LedgerStore::open_temporary().unwrap();
+        store
+            .init_genesis(Hash::zero(), &UtxoLedger::new())
+            .unwrap();
+        let ledger = UtxoLedger::new().insert(entry(4, 7));
+        let code = oxydome_ovm::Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![
+                oxydome_ovm::Instruction::Push(9),
+                oxydome_ovm::Instruction::Return,
+            ],
+        }
+        .encode()
+        .unwrap();
+        let contract_id = Hash([5; 64]);
+        let contracts = [(
+            contract_id,
+            OvmContract {
+                code,
+                storage: [(1, 42)].into_iter().collect(),
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        store
+            .save_version_with_ovm(
+                1,
+                Hash::zero(),
+                &ledger,
+                &ledger_diff(&UtxoLedger::new(), &ledger),
+                &contracts,
+            )
+            .unwrap();
+
+        assert_eq!(store.load_ovm_state(1).unwrap(), contracts);
+        assert!(store.load_ovm_state(0).unwrap().is_empty());
     }
 
     #[test]

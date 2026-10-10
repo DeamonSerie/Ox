@@ -132,4 +132,67 @@ impl NodeClient {
             other => Err(NetError::Unexpected(format!("{other:?}"))),
         }
     }
+
+    pub async fn get_ovm_code(&mut self, contract_id: Hash) -> Result<Option<Vec<u8>>, NetError> {
+        match self.request(&Message::GetOvmCode { contract_id }).await? {
+            Message::OvmCodeResponse { code } => Ok(code),
+            other => Err(NetError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    pub async fn call_ovm(
+        &mut self,
+        contract_id: Hash,
+        arguments: Vec<u64>,
+        gas_limit: u64,
+    ) -> Result<oxydome_ovm::Execution, String> {
+        match self
+            .request(&Message::CallOvm {
+                contract_id,
+                arguments,
+                gas_limit,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Message::OvmCallResponse {
+                execution: Some(execution),
+                error: None,
+            } => Ok(execution),
+            Message::OvmCallResponse {
+                error: Some(error), ..
+            } => Err(error),
+            other => Err(format!("unexpected node response: {other:?}")),
+        }
+    }
+
+    pub async fn call_ovm_contract(
+        &mut self,
+        contract_id: Hash,
+        entry_point: String,
+        arguments: Vec<u64>,
+        caller: PublicKey,
+        gas_limit: u64,
+    ) -> Result<oxydome_ovm::Execution, String> {
+        match self
+            .request(&Message::CallOvmContract {
+                contract_id,
+                entry_point,
+                arguments,
+                caller,
+                gas_limit,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Message::OvmContractCallResponse {
+                execution: Some(execution),
+                error: None,
+            } => Ok(execution),
+            Message::OvmContractCallResponse {
+                error: Some(error), ..
+            } => Err(error),
+            other => Err(format!("unexpected node response: {other:?}")),
+        }
+    }
 }

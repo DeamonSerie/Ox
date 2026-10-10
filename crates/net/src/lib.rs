@@ -139,6 +139,32 @@ pub enum Message {
         accepted: bool,
         error: Option<String>,
     },
+    GetOvmCode {
+        contract_id: Hash,
+    },
+    OvmCodeResponse {
+        code: Option<Vec<u8>>,
+    },
+    CallOvm {
+        contract_id: Hash,
+        arguments: Vec<u64>,
+        gas_limit: u64,
+    },
+    OvmCallResponse {
+        execution: Option<oxydome_ovm::Execution>,
+        error: Option<String>,
+    },
+    CallOvmContract {
+        contract_id: Hash,
+        entry_point: String,
+        arguments: Vec<u64>,
+        caller: PublicKey,
+        gas_limit: u64,
+    },
+    OvmContractCallResponse {
+        execution: Option<oxydome_ovm::Execution>,
+        error: Option<String>,
+    },
 
     // -- wallet subscriptions (walletd <-> node) --
     Subscribe {

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 oxydome-crypto.workspace = true
+oxydome-ovm.workspace = true
 serde.workspace = true
 bincode.workspace = true
 thiserror.workspace = true

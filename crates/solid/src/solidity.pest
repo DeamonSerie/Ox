@@ -1,94 +1,175 @@
-source_unit = { SOI ~ pragma? ~ contract_definition ~ EOI }
-
-pragma = { "pragma" ~ "solidity" ~ solidity_version ~ ";" }
-solidity_version = { "0." ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+source_unit = { SOI ~ pragma? ~ import_declaration* ~ contract_definition ~ EOI }
+pragma = { "pragma" ~ "solidity" ~ version_constraint ~ ";" }
+import_declaration = { "import" ~ string_literal ~ ("as" ~ identifier)? ~ ";" }
+version_constraint = { version_operator? ~ solidity_version }
+version_operator = { "^" | "~" | ">=" | ">" | "<=" | "<" | "=" }
+solidity_version = { ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 
 contract_definition = {
-    "contract" ~ identifier ~ inheritance? ~ "{" ~ contract_item* ~ "}"
+    contract_kind ~ identifier ~ inheritance? ~ "{" ~ contract_item* ~ "}"
 }
-inheritance = { "is" ~ identifier ~ ("," ~ identifier)* }
-contract_item = { function_definition | event_definition | variable_declaration }
+contract_kind = { "contract" | "interface" | "library" }
+inheritance = { "is" ~ inheritance_item ~ ("," ~ inheritance_item)* }
+inheritance_item = { identifier ~ ("(" ~ argument_list? ~ ")")? }
+contract_item = {
+    function_definition | constructor_definition | fallback_definition |
+    receive_definition | modifier_definition | event_definition |
+    error_definition | struct_definition | enum_definition |
+    state_variable | ";"
+}
 
 function_definition = {
-    "function" ~ identifier ~ "(" ~ parameter_list? ~ ")" ~ visibility? ~
-    returns_clause? ~ block
+    "function" ~ identifier ~ "(" ~ parameter_list? ~ ")" ~ function_attribute* ~
+    returns_clause? ~ (block | ";")
 }
-visibility = { "public" | "internal" | "private" }
+constructor_definition = {
+    "constructor" ~ "(" ~ parameter_list? ~ ")" ~ function_attribute* ~ (block | ";")
+}
+fallback_definition = {
+    "fallback" ~ "(" ~ parameter_list? ~ ")" ~ function_attribute* ~
+    returns_clause? ~ (block | ";")
+}
+receive_definition = {
+    "receive" ~ "(" ~ ")" ~ function_attribute* ~ (block | ";")
+}
+function_attribute = {
+    visibility | mutability | "virtual" | override_specifier |
+    modifier_invocation
+}
+visibility = { "public" | "internal" | "private" | "external" }
+mutability = { "pure" | "view" | "payable" }
+override_specifier = { "override" ~ ("(" ~ identifier_list ~ ")")? }
+modifier_invocation = {
+    !("returns" | "virtual" | "override" | "public" | "internal" | "private" |
+      "external" | "pure" | "view" | "payable") ~ identifier ~
+    ("(" ~ argument_list? ~ ")")?
+}
+returns_clause = { "returns" ~ "(" ~ parameter_list? ~ ")" }
 parameter_list = { parameter ~ ("," ~ parameter)* }
-parameter = { type_name ~ identifier }
-returns_clause = { "returns" ~ "(" ~ type_list? ~ ")" }
-type_list = { type_name ~ ("," ~ type_name)* }
+parameter = { type_name ~ ("memory" | "storage" | "calldata")? ~ "indexed"? ~ identifier? }
+identifier_list = { identifier ~ ("," ~ identifier)* }
 
-variable_declaration = {
-    type_name ~ identifier ~ ("=" ~ expression)? ~ ";"
+state_variable = {
+    type_name ~ visibility? ~ state_attribute? ~ identifier ~ ("=" ~ expression)? ~ ";"
 }
+state_attribute = { "constant" | "immutable" }
 event_definition = {
-    "event" ~ identifier ~ "(" ~ event_parameter_list? ~ ")" ~ ";"
+    "event" ~ identifier ~ "(" ~ event_parameter_list? ~ ")" ~ "anonymous"? ~ ";"
 }
 event_parameter_list = { event_parameter ~ ("," ~ event_parameter)* }
 event_parameter = { type_name ~ "indexed"? ~ identifier }
+error_definition = { "error" ~ identifier ~ "(" ~ parameter_list? ~ ")" ~ ";" }
+struct_definition = { "struct" ~ identifier ~ "{" ~ struct_field* ~ "}" }
+struct_field = { type_name ~ identifier ~ ";" }
+enum_definition = { "enum" ~ identifier ~ "{" ~ identifier_list? ~ "}" }
 
-type_name = {
-    mapping_type | primitive_type ~ array_suffix*
-}
+type_name = { mapping_type | elementary_type ~ array_suffix* | identifier ~ array_suffix* }
 mapping_type = {
-    "mapping" ~ "(" ~ primitive_type ~ "=>" ~ type_name ~ ")"
+    "mapping" ~ "(" ~ elementary_type ~ "=>" ~ type_name ~ ")"
 }
-primitive_type = {
-    "address" | "uint256" | "uint64" | "uint" | "bool" | "string"
+elementary_type = {
+    "address" ~ "payable"? | "uint" ~ integer_width? | "int" ~ integer_width? |
+    "bool" | "string" | "bytes" ~ integer_width? | "byte"
 }
-array_suffix = { "[" ~ ASCII_DIGIT* ~ "]" }
+integer_width = { ASCII_DIGIT+ }
+array_suffix = { "[" ~ expression? ~ "]" }
+
+modifier_definition = {
+    "modifier" ~ identifier ~ "(" ~ parameter_list? ~ ")" ~ block
+}
 
 block = { "{" ~ statement* ~ "}" }
 statement = {
-    if_statement
-    | for_statement
-    | while_statement
-    | return_statement
-    | emit_statement
-    | assert_statement
-    | variable_declaration
-    | assignment_statement
-    | expression_statement
+    block | if_statement | for_statement | while_statement |
+    do_while_statement | modifier_placeholder | return_statement | emit_statement |
+    assert_statement | require_statement | revert_statement |
+    break_statement | continue_statement | variable_declaration |
+    assignment_statement | expression_statement
 }
-if_statement = {
-    "if" ~ "(" ~ expression ~ ")" ~ block ~ ("else" ~ block)?
-}
+if_statement = { "if" ~ "(" ~ expression ~ ")" ~ statement ~ ("else" ~ statement)? }
 for_statement = {
-    "for" ~ "(" ~ expression? ~ ";" ~ expression? ~ ";" ~ expression? ~ ")" ~ block
+    "for" ~ "(" ~ for_init? ~ ";" ~ for_condition ~ ";" ~ for_update ~ ")" ~ statement
 }
-while_statement = { "while" ~ "(" ~ expression ~ ")" ~ block }
+for_init = { variable_declaration_no_semicolon | expression }
+for_condition = { expression? }
+for_update = { expression? }
+while_statement = { "while" ~ "(" ~ expression ~ ")" ~ statement }
+do_while_statement = { "do" ~ statement ~ "while" ~ "(" ~ expression ~ ")" ~ ";" }
+modifier_placeholder = { "_" ~ ";" }
 return_statement = { "return" ~ expression? ~ ";" }
-emit_statement = { "emit" ~ identifier ~ "(" ~ argument_list? ~ ")" ~ ";" }
-assert_statement = { "assert" ~ "(" ~ expression ~ ("," ~ string_literal)? ~ ")" ~ ";" }
+emit_statement = { "emit" ~ function_call ~ ";" }
+assert_statement = { "assert" ~ "(" ~ expression ~ ")" ~ ";" }
+require_statement = { "require" ~ "(" ~ expression ~ ("," ~ string_literal)? ~ ")" ~ ";" }
+revert_statement = { "revert" ~ (function_call | "(" ~ string_literal? ~ ")")? ~ ";" }
+break_statement = { "break" ~ ";" }
+continue_statement = { "continue" ~ ";" }
+variable_declaration = { variable_declaration_no_semicolon ~ ";" }
+variable_declaration_no_semicolon = {
+    type_name ~ ("memory" | "storage" | "calldata")? ~ identifier ~ ("=" ~ expression)?
+}
 assignment_statement = { lvalue ~ assignment_operator ~ expression ~ ";" }
-assignment_operator = { "=" | "+=" | "-=" | "*=" | "/=" }
-lvalue = { identifier ~ ("[" ~ expression ~ "]")* }
+assignment_operator = {
+    assign | add_assign | sub_assign | mul_assign | div_assign | mod_assign |
+    and_assign | or_assign | xor_assign | shl_assign | shr_assign
+}
+assign = { "=" }
+add_assign = { "+=" }
+sub_assign = { "-=" }
+mul_assign = { "*=" }
+div_assign = { "/=" }
+mod_assign = { "%=" }
+and_assign = { "&=" }
+or_assign = { "|=" }
+xor_assign = { "^=" }
+shl_assign = { "<<=" }
+shr_assign = { ">>=" }
+lvalue = { identifier ~ (("." ~ identifier) | ("[" ~ expression ~ "]"))* }
 expression_statement = { expression ~ ";" }
 
-expression = { logical_or }
-logical_or = { logical_and ~ ("||" ~ logical_and)* }
-logical_and = { equality ~ ("&&" ~ equality)* }
-equality = { comparison ~ (("==" | "!=") ~ comparison)* }
-comparison = { term ~ (("<=" | ">=" | "<" | ">") ~ term)* }
-term = { factor ~ (("+" | "-") ~ factor)* }
-factor = { unary ~ (("*" | "/" | "%") ~ unary)* }
-unary = { ("!" | "-")* ~ primary }
+expression = { assignment_expression }
+assignment_expression = { ternary ~ (assignment_operator ~ assignment_expression)? }
+ternary = { logical_or ~ ("?" ~ expression ~ ":" ~ ternary)? }
+logical_or = { logical_and ~ (logical_or_op ~ logical_and)* }
+logical_or_op = { "||" }
+logical_and = { bitwise_or ~ (logical_and_op ~ bitwise_or)* }
+logical_and_op = { "&&" }
+bitwise_or = { bitwise_xor ~ (bitwise_or_op ~ bitwise_xor)* }
+bitwise_or_op = { "|" }
+bitwise_xor = { bitwise_and ~ (bitwise_xor_op ~ bitwise_and)* }
+bitwise_xor_op = { "^" }
+bitwise_and = { equality ~ (bitwise_and_op ~ equality)* }
+bitwise_and_op = { "&" }
+equality = { comparison ~ (equality_op ~ comparison)* }
+equality_op = { "==" | "!=" }
+comparison = { shift ~ (comparison_op ~ shift)* }
+comparison_op = { "<=" | ">=" | "<" | ">" }
+shift = { term ~ (shift_op ~ term)* }
+shift_op = { "<<" | ">>" }
+term = { factor ~ (term_op ~ factor)* }
+term_op = { "+" | "-" }
+factor = { power ~ (factor_op ~ power)* }
+factor_op = { "*" | "/" | "%" }
+power = { unary ~ (power_op ~ power)? }
+power_op = { "**" }
+unary = { prefix_op* ~ postfix }
+prefix_op = { "++" | "--" | "!" | "~" | "-" | "+" }
+postfix = { primary ~ postfix_op? }
+postfix_op = { "++" | "--" }
 primary = {
-    literal
-    | function_call
-    | member_access
-    | identifier
-    | "(" ~ expression ~ ")"
+    literal | function_call | member_access | index_access | identifier | "(" ~ expression ~ ")"
 }
-function_call = { identifier ~ "(" ~ argument_list? ~ ")" }
-member_access = { identifier ~ "." ~ identifier }
+function_call = { (identifier | member_access) ~ "(" ~ argument_list? ~ ")" }
+member_access = { identifier ~ ("." ~ identifier)+ }
+index_access = { (identifier | member_access) ~ ("[" ~ expression ~ "]")+ }
 argument_list = { expression ~ ("," ~ expression)* }
-literal = { address_literal | string_literal | boolean_literal | number_literal }
+literal = { address_literal | string_literal | boolean_literal | hex_number | number_literal }
 address_literal = { "0x" ~ ASCII_HEX_DIGIT{40} }
+hex_number = { "0x" ~ ASCII_HEX_DIGIT+ }
 string_literal = { "\"" ~ ("\\" ~ ANY | !("\"" | NEWLINE) ~ ANY)* ~ "\"" }
 boolean_literal = { "true" | "false" }
-number_literal = { ASCII_DIGIT+ }
+number_literal = {
+    (ASCII_DIGIT | "_")+ ~ ("." ~ (ASCII_DIGIT | "_")+)? ~ (("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+)?
+}
 
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 

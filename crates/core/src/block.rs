@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 /// Fixed-point scale for the Ox value index: `1.000 == 1_000_000_000_000`.
 pub const VALUE_SCALE: u128 = 1_000_000_000_000;
+pub const LEGACY_EXECUTION_VERSION: u32 = 1;
+pub const OVM_EXECUTION_VERSION: u32 = 2;
+pub const SMART_CONTRACT_EXECUTION_VERSION: u32 = 3;
 
 /// The Ox value index, encoded as a fixed-point `u128` with [`VALUE_SCALE`] precision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -46,9 +49,16 @@ impl std::fmt::Display for ValueIndex {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub height: u64,
+    /// Commits the execution rules used to validate this block.
+    pub execution_version: u32,
+    /// Commits the network's OVM activation configuration.
+    pub ovm_activation_height: u64,
+    /// Commits activation of multi-entry-point Solid contract artifacts.
+    pub smart_contract_activation_height: u64,
     pub prev_hash: Hash,
     pub tx_root: Hash,
     pub operation_root: Hash,
+    pub ovm_receipt_root: Hash,
     pub state_root: Hash,
     pub supply: Amount,
     pub epoch: u64,
@@ -71,6 +81,7 @@ pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,
     pub operations: Vec<Operation>,
+    pub ovm_receipts: Vec<crate::OvmReceipt>,
 }
 
 impl Block {
@@ -88,22 +99,47 @@ impl Block {
         merkle_root(&leaves)
     }
 
-    /// Total of all transaction fees contained in this block.
+    pub fn ovm_receipt_root(&self) -> Hash {
+        let leaves: Vec<Hash> = self
+            .ovm_receipts
+            .iter()
+            .map(oxydome_crypto::hash_value)
+            .collect();
+        merkle_root(&leaves)
+    }
+
+    /// Total settled fees, using committed OVM receipts rather than gas-limit escrow.
     pub fn fee_total(&self) -> Amount {
         self.transactions
             .iter()
-            .map(|t| t.fee)
+            .map(|tx| {
+                tx.ovm_action.as_ref().map_or(tx.fee, |action| {
+                    let gas_used = self
+                        .ovm_receipts
+                        .iter()
+                        .find(|receipt| receipt.txid == tx.txid())
+                        .map_or(action.gas_limit(), |receipt| receipt.gas_used);
+                    tx.fee
+                        .saturating_sub(u128::from(action.gas_limit()))
+                        .saturating_add(u128::from(gas_used))
+                })
+            })
             .fold(0u128, |a, b| a.saturating_add(b))
     }
 
     /// Checks that the header's commitments match the block body.
     pub fn roots_match(&self) -> bool {
-        self.header.tx_root == self.tx_root() && self.header.operation_root == self.operation_root()
+        self.header.tx_root == self.tx_root()
+            && self.header.operation_root == self.operation_root()
+            && self.header.ovm_receipt_root == self.ovm_receipt_root()
     }
 
     /// Constructs a block header with the roots filled in from the body.
     pub fn build_header(
         height: u64,
+        execution_version: u32,
+        ovm_activation_height: u64,
+        smart_contract_activation_height: u64,
         prev_hash: Hash,
         state_root: Hash,
         supply: Amount,
@@ -137,9 +173,13 @@ impl Block {
         Block {
             header: BlockHeader {
                 height,
+                execution_version,
+                ovm_activation_height,
+                smart_contract_activation_height,
                 prev_hash,
                 tx_root,
                 operation_root,
+                ovm_receipt_root: merkle_root(&[]),
                 state_root,
                 supply,
                 epoch,
@@ -153,6 +193,7 @@ impl Block {
             },
             transactions,
             operations,
+            ovm_receipts: Vec::new(),
         }
     }
 }

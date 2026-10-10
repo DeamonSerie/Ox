@@ -11,7 +11,10 @@ pub mod operation;
 pub mod params;
 pub mod tx;
 
-pub use block::{Block, BlockHeader, ValueIndex, VALUE_SCALE};
+pub use block::{
+    Block, BlockHeader, ValueIndex, LEGACY_EXECUTION_VERSION, OVM_EXECUTION_VERSION,
+    SMART_CONTRACT_EXECUTION_VERSION, VALUE_SCALE,
+};
 pub use config::{AllocationConfig, AppConfig, ConfigError, EndpointConfig};
 pub use genesis::{GenesisAllocation, GenesisConfig};
 pub use governance::GovernanceSet;
@@ -21,7 +24,11 @@ pub use operation::{
 };
 pub use oxydome_crypto::{Hash, PublicKey, Sig};
 pub use params::ChainParams;
-pub use tx::{OutPoint, OutputKind, Transaction, TxError, TxInput, TxOutput};
+pub use tx::{
+    transfer_fee, transfer_fee_for_amount, OutPoint, OutputKind, OvmAction, OvmFailureCode, OvmLog,
+    OvmReceipt, Transaction, TxError, TxInput, TxOutput, MAX_OVM_ARGUMENTS,
+    MAX_OVM_BLOCK_GAS_LIMIT, MAX_OVM_GAS_LIMIT,
+};
 
 /// The Ox amount type. `u128` is used everywhere internally to make overflow practically
 /// impossible while still allowing very large supplies.

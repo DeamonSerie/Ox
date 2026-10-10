@@ -53,6 +53,21 @@ impl WalletIndex {
                 let flow = flows.entry(output.recipient).or_default();
                 flow.1 = flow.1.saturating_add(output.amount);
             }
+            if let Some(action) = &tx.ovm_action {
+                if let (Some(input), Some(receipt)) = (
+                    tx.inputs.first(),
+                    block
+                        .ovm_receipts
+                        .iter()
+                        .find(|receipt| receipt.txid == tx.txid()),
+                ) {
+                    let refund = action.gas_limit().saturating_sub(receipt.gas_used);
+                    if refund > 0 {
+                        let flow = flows.entry(input.owner).or_default();
+                        flow.1 = flow.1.saturating_add(u128::from(refund));
+                    }
+                }
+            }
             for (owner, (out_amount, in_amount)) in flows {
                 let entry = HistoryEntry {
                     txid: tx.txid(),
@@ -115,7 +130,7 @@ impl IndexStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxydome_core::{OutPoint, Transaction, TxOutput, ValueIndex};
+    use oxydome_core::{OutPoint, OvmAction, OvmReceipt, Transaction, TxOutput, ValueIndex};
     use oxydome_crypto::{Hash, KeyPair};
     use oxydome_state::{UtxoEntry, UtxoLedger};
 
@@ -141,6 +156,9 @@ mod tests {
 
         let block = Block::build_header(
             1,
+            oxydome_core::OVM_EXECUTION_VERSION,
+            1,
+            u64::MAX,
             Hash::zero(),
             pre_utxo.root(),
             0,
@@ -174,5 +192,54 @@ mod tests {
         let bob_entry = &index.by_addr[&bob][&(1, 0)];
         assert_eq!(bob_entry.in_amount, 95);
         assert_eq!(bob_entry.out_amount, 0);
+    }
+
+    #[test]
+    fn records_ovm_gas_refund_as_a_received_output() {
+        let alice_key = KeyPair::from_seed(&[1u8; 32]);
+        let alice = alice_key.public();
+        let bob = KeyPair::from_seed(&[2u8; 32]).public();
+        let outpoint = OutPoint::new(Hash::zero(), 0);
+        let pre_utxo =
+            UtxoLedger::new().insert(UtxoEntry::new(outpoint, TxOutput::spendable(100, alice), 0));
+        let mut tx = Transaction::new_unsigned(
+            vec![(outpoint, alice)],
+            vec![TxOutput::spendable(94, bob)],
+            6,
+        );
+        tx.ovm_action = Some(OvmAction::Call {
+            contract_id: Hash::zero(),
+            arguments: Vec::new(),
+            gas_limit: 5,
+        });
+        tx.sign_input(0, &alice_key);
+        let mut block = Block::build_header(
+            1,
+            oxydome_core::OVM_EXECUTION_VERSION,
+            1,
+            u64::MAX,
+            Hash::zero(),
+            pre_utxo.root(),
+            0,
+            0,
+            0,
+            ValueIndex::from_raw(1_000_000_000_000),
+            alice,
+            1,
+            vec![tx.clone()],
+            vec![],
+        );
+        block.ovm_receipts = vec![OvmReceipt {
+            txid: tx.txid(),
+            gas_used: 3,
+            failure: None,
+            return_data: Vec::new(),
+            logs: Vec::new(),
+        }];
+
+        let mut index = WalletIndex::new();
+        index.record_block(&block, &pre_utxo);
+        assert_eq!(index.by_addr[&alice][&(1, 0)].in_amount, 2);
+        assert_eq!(index.by_addr[&bob][&(1, 0)].in_amount, 94);
     }
 }

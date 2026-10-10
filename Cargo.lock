@@ -986,6 +986,7 @@ dependencies = [
  "bincode",
  "hex",
  "oxydome-crypto",
+ "oxydome-ovm",
  "serde",
  "thiserror",
 ]
@@ -1059,6 +1060,7 @@ dependencies = [
  "oxydome-consensus",
  "oxydome-core",
  "oxydome-crypto",
+ "oxydome-ovm",
  "oxydome-state",
  "serde",
  "thiserror",
@@ -1078,6 +1080,7 @@ dependencies = [
  "oxydome-currency",
  "oxydome-master",
  "oxydome-net",
+ "oxydome-ovm",
  "oxydome-rewards",
  "oxydome-state",
  "oxydome-treasury",
@@ -1109,6 +1112,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxydome-ovm"
+version = "0.1.0"
+dependencies = [
+ "oxydome-crypto",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "oxydome-rewards"
 version = "0.1.0"
 dependencies = [
@@ -1123,11 +1135,14 @@ dependencies = [
 name = "oxydome-solid"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "oxydome-core",
  "oxydome-crypto",
+ "oxydome-ovm",
  "pest",
  "pest_derive",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1139,6 +1154,7 @@ dependencies = [
  "oxydome-core",
  "oxydome-crypto",
  "oxydome-currency",
+ "oxydome-ovm",
  "oxydome-rewards",
  "serde",
  "sled",
@@ -1228,6 +1244,7 @@ dependencies = [
  "oxydome-currency",
  "oxydome-net",
  "oxydome-node",
+ "oxydome-ovm",
  "oxydome-wallet",
  "oxydome-wallet-rpc",
  "pbkdf2",

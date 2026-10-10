@@ -1,10 +1,10 @@
 //! Fee rule for the wallet API.
 //!
-//! The fee is **always 0.0012% of the transaction amount**, where the transaction amount is the
-//! sum of all outputs. Expressed as a ratio: `0.0012% = 12 / 1_000_000`.
+//! The transfer-fee component is **0.0012% of the transaction amount**, where the transaction
+//! amount is the sum of all outputs. OVM transactions reserve their gas limit separately.
 //!
 //! ```text
-//! fee(outputs) = max(1, ceil(sum(outputs) * 12 / 1_000_000))
+//! transfer_fee(outputs) = max(1, ceil(sum(outputs) * 12 / 1_000_000))
 //! ```
 //!
 //! The minimum of `1` is required because zero-fee transactions are invalid at the chain level
@@ -13,33 +13,23 @@
 //! apps and the RPC layer agree with the chain.
 
 use crate::WalletError;
-use oxydome_core::{Amount, TxOutput};
+use oxydome_core::{transfer_fee as core_transfer_fee, transfer_fee_for_amount, Amount, TxOutput};
 
 /// Numerators/denominator of `0.0012%` = `12 / 1_000_000`.
-pub const FEE_PERMILLIONTHS: u128 = 12;
-pub const FEE_DENOMINATOR: u128 = 1_000_000;
+pub const FEE_PERMILLIONTHS: u128 = oxydome_core::tx::TRANSFER_FEE_NUMERATOR;
+pub const FEE_DENOMINATOR: u128 = oxydome_core::tx::TRANSFER_FEE_DENOMINATOR;
 
 /// The minimum fee that makes a transaction payable (zero-fee txs are invalid).
-pub const MIN_FEE: Amount = 1;
+pub const MIN_FEE: Amount = oxydome_core::tx::MIN_TRANSFER_FEE;
 
 /// Fee over a single `amount`, i.e. for a transaction whose only output is `amount`.
 pub fn fee_for_amount(amount: Amount) -> Amount {
-    // ceil(amount * 12 / 1e6) computed without floating point; saturating ops keep
-    // pathological amounts (u128::MAX) from panicking.
-    let num = amount.saturating_mul(FEE_PERMILLIONTHS);
-    let bounded = num.saturating_add(FEE_DENOMINATOR - 1);
-    (bounded / FEE_DENOMINATOR).max(MIN_FEE)
+    transfer_fee_for_amount(amount)
 }
 
 /// Fee for an already-built output list. The transaction amount is `sum(outputs)`.
 pub fn fee_for_outputs(outputs: &[TxOutput]) -> Result<Amount, WalletError> {
-    let mut total: Amount = 0;
-    for out in outputs {
-        total = total
-            .checked_add(out.amount)
-            .ok_or(oxydome_core::CoreError::Overflow)?;
-    }
-    Ok(fee_for_amount(total))
+    core_transfer_fee(outputs).map_err(Into::into)
 }
 
 #[cfg(test)]

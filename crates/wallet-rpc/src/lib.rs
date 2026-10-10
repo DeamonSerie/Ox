@@ -167,6 +167,8 @@ pub struct RpcTransaction {
     pub outputs: Vec<RpcOutput>,
     pub fee: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ovm_action: Option<oxydome_core::OvmAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub block_height: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_hash: Option<String>,
@@ -203,6 +205,7 @@ pub struct RpcBlock {
     pub tx_count: u64,
     pub txids: Vec<String>,
     pub state_root: String,
+    pub ovm_receipts: Vec<oxydome_core::OvmReceipt>,
     pub supply: String,
     pub producer: String,
 }
@@ -220,6 +223,12 @@ pub struct RpcReceipt {
     pub position: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ovm_receipt: Option<oxydome_core::OvmReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ovm_gas_refund: Option<RpcOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ovm_actual_fee: Option<String>,
 }
 
 /// A balance snapshot.
@@ -365,6 +374,7 @@ pub fn tx_to_rpc(
             })
             .collect(),
         fee: amount_to_string(tx.fee),
+        ovm_action: tx.ovm_action.clone(),
         block_height,
         block_hash,
         position,
@@ -385,6 +395,7 @@ pub fn block_to_rpc(block: &oxydome_core::Block) -> RpcBlock {
             .map(|t| to_hex(t.txid().as_bytes()))
             .collect(),
         state_root: to_hex(block.header.state_root.as_bytes()),
+        ovm_receipts: block.ovm_receipts.clone(),
         supply: amount_to_string(block.header.supply),
         producer: to_hex(block.header.producer.as_bytes()),
     }
@@ -419,6 +430,9 @@ pub fn status_to_rpc(status: &oxydome_net::TxStatus) -> RpcReceipt {
         block_hash,
         position,
         reason,
+        ovm_receipt: None,
+        ovm_gas_refund: None,
+        ovm_actual_fee: None,
     }
 }
 

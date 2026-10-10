@@ -18,6 +18,12 @@ pub struct ChainParams {
     pub rebound_lock_blocks: u64,
     /// Audit checkpoint interval `K`, in blocks.
     pub audit_checkpoint_blocks: u64,
+    /// Height at which version 2 OVM execution rules become mandatory.
+    #[serde(default = "default_ovm_activation_height")]
+    pub ovm_activation_height: u64,
+    /// Height at which multi-entry-point user smart-contract artifacts become valid.
+    #[serde(default = "default_smart_contract_activation_height")]
+    pub smart_contract_activation_height: u64,
 
     // ---- fee split ----
     /// Share of block fees paid to masters, in basis points (`400` = 4%).
@@ -75,7 +81,25 @@ pub struct ChainParams {
     pub base_fee: Amount,
 }
 
+fn default_ovm_activation_height() -> u64 {
+    1
+}
+
+fn default_smart_contract_activation_height() -> u64 {
+    u64::MAX
+}
+
 impl ChainParams {
+    pub fn execution_version_at(&self, height: u64) -> u32 {
+        if height >= self.smart_contract_activation_height {
+            crate::SMART_CONTRACT_EXECUTION_VERSION
+        } else if height >= self.ovm_activation_height {
+            crate::OVM_EXECUTION_VERSION
+        } else {
+            crate::LEGACY_EXECUTION_VERSION
+        }
+    }
+
     /// Sensible local-network defaults.
     pub fn default_local() -> Self {
         ChainParams {
@@ -83,6 +107,8 @@ impl ChainParams {
             block_window: 100,
             rebound_lock_blocks: 100,
             audit_checkpoint_blocks: 50,
+            ovm_activation_height: 1,
+            smart_contract_activation_height: 1,
             fee_master_bps: 400,
             bft_num: 2,
             bft_den: 3,

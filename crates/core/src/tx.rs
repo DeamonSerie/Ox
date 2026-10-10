@@ -109,6 +109,85 @@ pub struct Transaction {
     pub inputs: Vec<TxInput>,
     pub outputs: Vec<TxOutput>,
     pub fee: Amount,
+    #[serde(default)]
+    pub ovm_action: Option<OvmAction>,
+}
+
+/// A versioned OVM action carried by an ordinary, value-conserving transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OvmAction {
+    Deploy {
+        code: Vec<u8>,
+        gas_limit: u64,
+    },
+    Call {
+        contract_id: Hash,
+        arguments: Vec<u64>,
+        gas_limit: u64,
+    },
+    DeployContract {
+        artifact: Vec<u8>,
+        gas_limit: u64,
+    },
+    CallContract {
+        contract_id: Hash,
+        entry_point: String,
+        arguments: Vec<u64>,
+        authority_input: u32,
+        gas_limit: u64,
+    },
+}
+
+impl OvmAction {
+    pub fn gas_limit(&self) -> u64 {
+        match self {
+            Self::Deploy { gas_limit, .. }
+            | Self::Call { gas_limit, .. }
+            | Self::DeployContract { gas_limit, .. }
+            | Self::CallContract { gas_limit, .. } => *gas_limit,
+        }
+    }
+
+    pub fn is_smart_contract_action(&self) -> bool {
+        matches!(
+            self,
+            Self::DeployContract { .. } | Self::CallContract { .. }
+        )
+    }
+}
+
+/// Stable, consensus-visible reason for a failed OVM execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OvmFailureCode {
+    Reverted,
+    OutOfGas,
+    ArithmeticOverflow,
+    DivisionByZero,
+    ArgumentCount,
+    MissingReturn,
+    StorageLimitExceeded,
+    StackUnderflow,
+    StackOverflow,
+    InvalidLocal,
+    InvalidProgram,
+    InvalidBooleanValue,
+    ContractNotFound,
+    FunctionNotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OvmReceipt {
+    pub txid: Hash,
+    pub gas_used: u64,
+    pub failure: Option<OvmFailureCode>,
+    pub return_data: Vec<u8>,
+    pub logs: Vec<OvmLog>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OvmLog {
+    pub topic: u32,
+    pub value: u64,
 }
 
 /// The canonical value that an input signature commits to. Excludes all signatures so that
@@ -119,6 +198,7 @@ struct TxSigningData<'a> {
     owners: Vec<PublicKey>,
     outputs: &'a [TxOutput],
     fee: Amount,
+    ovm_action: &'a Option<OvmAction>,
     input_index: u32,
 }
 
@@ -144,12 +224,38 @@ pub enum TxError {
     ExitAndReboundMix,
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("invalid OVM action or gas limit")]
+    InvalidOvmAction,
 }
 
 /// Maximum serialized transaction size in bytes.
 pub const MAX_TX_BYTES: usize = 256 * 1024;
 /// Maximum number of inputs or outputs in one transaction.
 pub const MAX_TX_ITEMS: usize = 4096;
+/// Consensus upper bound on OVM execution fuel for one transaction.
+pub const MAX_OVM_GAS_LIMIT: u64 = 1_000_000;
+pub const MAX_OVM_ARGUMENTS: usize = 64;
+/// Maximum sum of declared OVM gas limits accepted in one block.
+pub const MAX_OVM_BLOCK_GAS_LIMIT: u64 = 10_000_000;
+pub const TRANSFER_FEE_NUMERATOR: Amount = 12;
+pub const TRANSFER_FEE_DENOMINATOR: Amount = 1_000_000;
+pub const MIN_TRANSFER_FEE: Amount = 1;
+
+/// Base transfer fee charged before any OVM gas fee, shared by wallets and consensus.
+pub fn transfer_fee(outputs: &[TxOutput]) -> Result<Amount, CoreError> {
+    let total = outputs.iter().try_fold(0u128, |sum, output| {
+        sum.checked_add(output.amount).ok_or(CoreError::Overflow)
+    })?;
+    Ok(transfer_fee_for_amount(total))
+}
+
+pub fn transfer_fee_for_amount(total: Amount) -> Amount {
+    let whole = (total / TRANSFER_FEE_DENOMINATOR) * TRANSFER_FEE_NUMERATOR;
+    let remainder = total % TRANSFER_FEE_DENOMINATOR;
+    let fraction = (remainder * TRANSFER_FEE_NUMERATOR + TRANSFER_FEE_DENOMINATOR - 1)
+        / TRANSFER_FEE_DENOMINATOR;
+    (whole + fraction).max(MIN_TRANSFER_FEE)
+}
 
 impl Transaction {
     /// The canonical signing hash for `input_index`.
@@ -159,6 +265,7 @@ impl Transaction {
             owners: self.inputs.iter().map(|i| i.owner).collect(),
             outputs: &self.outputs,
             fee: self.fee,
+            ovm_action: &self.ovm_action,
             input_index: input_index as u32,
         };
         hash_value(&data)
@@ -186,6 +293,7 @@ impl Transaction {
                 .collect(),
             outputs,
             fee,
+            ovm_action: None,
         }
     }
 
@@ -238,6 +346,41 @@ impl Transaction {
         if self.fee == 0 {
             return Err(TxError::ZeroFee);
         }
+        if let Some(action) = &self.ovm_action {
+            let (gas_limit, valid) = match action {
+                OvmAction::Deploy { code, gas_limit } => (*gas_limit, !code.is_empty()),
+                OvmAction::DeployContract {
+                    artifact,
+                    gas_limit,
+                } => (
+                    *gas_limit,
+                    !artifact.is_empty()
+                        && artifact.len() <= oxydome_ovm::MAX_CONTRACT_ARTIFACT_BYTES,
+                ),
+                OvmAction::Call {
+                    arguments,
+                    gas_limit,
+                    ..
+                } => (*gas_limit, arguments.len() <= MAX_OVM_ARGUMENTS),
+                OvmAction::CallContract {
+                    entry_point,
+                    arguments,
+                    authority_input,
+                    gas_limit,
+                    ..
+                } => (
+                    *gas_limit,
+                    !entry_point.is_empty()
+                        && entry_point.len() <= oxydome_ovm::MAX_FUNCTION_NAME_BYTES
+                        && (*authority_input as usize) < self.inputs.len()
+                        && arguments.len() + oxydome_ovm::AUTHORITY_WORD_COUNT
+                            <= oxydome_ovm::MAX_ARGUMENTS,
+                ),
+            };
+            if !valid || gas_limit == 0 || gas_limit > MAX_OVM_GAS_LIMIT {
+                return Err(TxError::InvalidOvmAction);
+            }
+        }
         for out in &self.outputs {
             if out.amount == 0 {
                 return Err(TxError::ZeroOutput);
@@ -287,6 +430,7 @@ mod tests {
             }],
             outputs: vec![TxOutput::spendable(100, owner)],
             fee,
+            ovm_action: None,
         };
         let msg = tx.signing_hash(0);
         tx.inputs[0].signature = kp.sign(&msg.0);

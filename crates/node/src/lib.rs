@@ -9,8 +9,8 @@ use crate::index::{IndexStore, WalletIndex};
 use oxydome_audit::{attestation_quorum, AuditAttestation, AuditPackage, InputProof};
 use oxydome_consensus::{AdmissionCertificate, MasterCheck, QuorumCertificate, Vote, VoteKind};
 use oxydome_core::{
-    Amount, Block, ChainParams, GenesisConfig, GovernanceSet, Hash, Operation, OutPoint, PublicKey,
-    Transaction,
+    Amount, Block, ChainParams, GenesisConfig, GovernanceSet, Hash, Operation, OutPoint, OvmAction,
+    PublicKey, Transaction,
 };
 use oxydome_crypto::{CodeManifest, KeyPair, SparseProof};
 use oxydome_currency::rebound_utxo_spendable;
@@ -19,7 +19,6 @@ use oxydome_net::{
 };
 use oxydome_rewards::{participation_weights, split_fees};
 use oxydome_state::{ledger_diff, ChainState, LedgerStore, StateError, UtxoEntry};
-use oxydome_wallet::fee::fee_for_outputs;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use tokio::sync::broadcast;
 
@@ -179,6 +178,21 @@ impl Node {
         }
 
         let next_height = self.next_height();
+        if tx.ovm_action.is_some() && next_height < self.params.ovm_activation_height {
+            return Err(NodeError::Tx(
+                "OVM is not active at the next block height".into(),
+            ));
+        }
+        if tx
+            .ovm_action
+            .as_ref()
+            .is_some_and(OvmAction::is_smart_contract_action)
+            && next_height < self.params.smart_contract_activation_height
+        {
+            return Err(NodeError::Tx(
+                "multi-entry-point smart contracts are not active at the next block height".into(),
+            ));
+        }
         let mut input_total: Amount = 0;
         for input in &tx.inputs {
             if self.mempool_inputs.contains(&input.prev_out) {
@@ -225,13 +239,43 @@ impl Node {
         }
 
         // The wallet-makers API fee rule is exact: reject any fee that deviates from it.
-        let expected_fee =
-            fee_for_outputs(&tx.outputs).map_err(|e| NodeError::Tx(e.to_string()))?;
+        let base_fee =
+            oxydome_core::transfer_fee(&tx.outputs).map_err(|e| NodeError::Tx(e.to_string()))?;
+        let expected_fee = base_fee
+            .checked_add(
+                tx.ovm_action
+                    .as_ref()
+                    .map_or(0, |action| u128::from(action.gas_limit())),
+            )
+            .ok_or_else(|| NodeError::Tx("required fee overflows".into()))?;
         if tx.fee != expected_fee {
             return Err(NodeError::Tx(format!(
-                "fee {0} does not equal the required wallet fee {expected_fee}",
+                "fee {0} does not equal the required transfer plus OVM gas fee {expected_fee}",
                 tx.fee
             )));
+        }
+        if let Some(OvmAction::Deploy { code, .. }) = &tx.ovm_action {
+            oxydome_ovm::Program::decode(code)
+                .map_err(|error| NodeError::Tx(format!("invalid OVM deployment: {error}")))?;
+        }
+        if let Some(OvmAction::DeployContract { artifact, .. }) = &tx.ovm_action {
+            oxydome_ovm::ContractArtifact::decode(artifact).map_err(|error| {
+                NodeError::Tx(format!("invalid smart-contract artifact: {error}"))
+            })?;
+        }
+        let pending_gas = self
+            .mempool
+            .iter()
+            .filter_map(|pending| pending.ovm_action.as_ref())
+            .try_fold(0u64, |total, action| total.checked_add(action.gas_limit()))
+            .ok_or_else(|| NodeError::Tx("mempool OVM gas total overflows".into()))?;
+        let total_gas = pending_gas
+            .checked_add(tx.ovm_action.as_ref().map_or(0, OvmAction::gas_limit))
+            .ok_or_else(|| NodeError::Tx("mempool OVM gas total overflows".into()))?;
+        if total_gas > oxydome_core::MAX_OVM_BLOCK_GAS_LIMIT {
+            return Err(NodeError::Tx(
+                "mempool transactions exceed the block OVM gas limit".into(),
+            ));
         }
 
         let addresses = tx_addresses(&tx);
@@ -279,10 +323,7 @@ impl Node {
             return Err(NodeError::NotLeader);
         }
         let transactions: Vec<Transaction> = self.mempool.clone();
-        let total_fees: Amount = transactions
-            .iter()
-            .map(|t| t.fee)
-            .fold(0u128, |a, b| a.saturating_add(b));
+        let total_fees = self.state.settled_fee_total(&transactions)?;
         let mut operations = self.pending_ops.clone();
         if total_fees > 0 {
             operations.push(self.reward_operation(total_fees, &self.public()));
@@ -330,8 +371,18 @@ impl Node {
     }
 
     /// Signs a vote for `block`.
-    pub fn vote(&self, block: &Block, kind: VoteKind) -> Vote {
-        Vote::sign(&self.key, block.header.height, 0, block.hash(), kind)
+    pub fn vote(&self, block: &Block, kind: VoteKind) -> Result<Vote, NodeError> {
+        if block.header.prev_hash != self.state.block_hash {
+            return Err(NodeError::NotOnTip);
+        }
+        self.state.apply_block(block, &self.gov, &self.params)?;
+        Ok(Vote::sign(
+            &self.key,
+            block.header.height,
+            0,
+            block.hash(),
+            kind,
+        ))
     }
 
     /// Signs a `MasterCheck` for the current epoch.
@@ -381,7 +432,13 @@ impl Node {
         if let Some(store) = &mut self.store {
             let delta = ledger_diff(&self.state.utxo, &next.utxo);
             store
-                .save_version(next.height, block.hash(), &next.utxo, &delta)
+                .save_version_with_ovm(
+                    next.height,
+                    block.hash(),
+                    &next.utxo,
+                    &delta,
+                    &next.contracts,
+                )
                 .map_err(|e| NodeError::Ledger(e.to_string()))?;
         }
 
@@ -622,6 +679,93 @@ impl Node {
             supply: self.state.supply,
             height: self.state.height,
         }
+    }
+
+    pub fn ovm_code(&self, contract_id: &Hash) -> Option<Vec<u8>> {
+        self.state
+            .contracts
+            .get(contract_id)
+            .map(|contract| contract.code.clone())
+    }
+
+    pub fn ovm_call(
+        &self,
+        contract_id: &Hash,
+        arguments: &[u64],
+        gas_limit: u64,
+    ) -> Result<oxydome_ovm::Execution, String> {
+        if gas_limit == 0 || gas_limit > oxydome_core::tx::MAX_OVM_GAS_LIMIT {
+            return Err("OVM gas limit is outside the consensus bounds".into());
+        }
+        if arguments.len() > oxydome_core::MAX_OVM_ARGUMENTS {
+            return Err("OVM call exceeds the 64-argument limit".into());
+        }
+        let contract = self
+            .state
+            .contracts
+            .get(contract_id)
+            .ok_or_else(|| format!("contract {contract_id} does not exist"))?;
+        let program =
+            oxydome_ovm::Program::decode(&contract.code).map_err(|error| error.to_string())?;
+        if gas_limit < oxydome_ovm::ACTION_INTRINSIC_GAS {
+            return Err("OVM gas limit is below the action intrinsic cost".into());
+        }
+        let mut execution = oxydome_ovm::execute(
+            &program,
+            arguments,
+            &contract.storage,
+            gas_limit - oxydome_ovm::ACTION_INTRINSIC_GAS,
+        )
+        .map_err(|failure| failure.to_string())?;
+        execution.gas_used += oxydome_ovm::ACTION_INTRINSIC_GAS;
+        Ok(execution)
+    }
+
+    pub fn ovm_contract_call(
+        &self,
+        contract_id: &Hash,
+        entry_point: &str,
+        arguments: &[u64],
+        caller: PublicKey,
+        gas_limit: u64,
+    ) -> Result<oxydome_ovm::Execution, String> {
+        let intrinsic_gas = oxydome_ovm::ACTION_INTRINSIC_GAS + oxydome_ovm::CONTRACT_DISPATCH_GAS;
+        if gas_limit < intrinsic_gas || gas_limit > oxydome_core::tx::MAX_OVM_GAS_LIMIT {
+            return Err("OVM gas limit is outside the consensus bounds".into());
+        }
+        if arguments.len() + oxydome_ovm::AUTHORITY_WORD_COUNT > oxydome_ovm::MAX_ARGUMENTS {
+            return Err("OVM contract call exceeds the argument limit".into());
+        }
+        let contract = self
+            .state
+            .contracts
+            .get(contract_id)
+            .ok_or_else(|| format!("contract {contract_id} does not exist"))?;
+        let artifact =
+            oxydome_ovm::ContractArtifact::decode(&contract.code).map_err(|e| e.to_string())?;
+        let function = artifact
+            .function(entry_point)
+            .ok_or_else(|| format!("contract function `{entry_point}` does not exist"))?;
+        if function.inputs.len() != arguments.len() {
+            return Err("contract call argument count does not match its interface".into());
+        }
+
+        let mut execution_arguments: Vec<u64> = caller
+            .0
+            .chunks_exact(8)
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte public-key chunk")))
+            .collect();
+        execution_arguments.extend_from_slice(arguments);
+        let program = oxydome_ovm::Program::decode(&function.code).map_err(|e| e.to_string())?;
+        let mut execution = oxydome_ovm::execute(
+            &program,
+            &execution_arguments,
+            &contract.storage,
+            gas_limit - intrinsic_gas,
+        )
+        .map_err(|failure| failure.to_string())?;
+        execution.gas_used += intrinsic_gas;
+        Ok(execution)
     }
 
     /// The manifest of this node's software.

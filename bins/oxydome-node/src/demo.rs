@@ -80,12 +80,18 @@ pub fn run(blocks: u64, supply: u128, db: Option<String>) -> Result<()> {
 
         let prepare: Vec<Vote> = nodes
             .iter()
-            .map(|n| n.vote(&block, VoteKind::Prepare))
+            .map(|n| {
+                n.vote(&block, VoteKind::Prepare)
+                    .expect("valid prepare block")
+            })
             .collect();
         let prepare_qc = QuorumCertificate::new(h, 0, block.hash(), VoteKind::Prepare, prepare);
         let commit: Vec<Vote> = nodes
             .iter()
-            .map(|n| n.vote(&block, VoteKind::Commit))
+            .map(|n| {
+                n.vote(&block, VoteKind::Commit)
+                    .expect("valid commit block")
+            })
             .collect();
         let commit_qc = QuorumCertificate::new(h, 0, block.hash(), VoteKind::Commit, commit);
         assert!(prepare_qc.has_quorum(&gov, &params));

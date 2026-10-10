@@ -112,6 +112,25 @@ fn setup() -> World {
     }
 }
 
+#[test]
+fn node_refuses_to_vote_for_an_invalid_state_transition() {
+    let world = setup();
+    let node = &world.nodes[0];
+    let mut block = node
+        .state
+        .build_block(
+            &world.gov,
+            &world.params,
+            Vec::new(),
+            Vec::new(),
+            node.public(),
+            1,
+        )
+        .unwrap();
+    block.header.state_root = Hash::zero();
+    assert!(node.vote(&block, VoteKind::Prepare).is_err());
+}
+
 /// Runs one full consensus round at `height`.
 #[allow(clippy::too_many_arguments)]
 fn advance(w: &mut World, height: u64, txs: Vec<Transaction>, ops: Vec<Operation>) -> Block {
@@ -142,7 +161,7 @@ fn advance(w: &mut World, height: u64, txs: Vec<Transaction>, ops: Vec<Operation
     let prepare_votes: Vec<Vote> = w
         .nodes
         .iter()
-        .map(|n| n.vote(&block, VoteKind::Prepare))
+        .map(|n| n.vote(&block, VoteKind::Prepare).unwrap())
         .collect();
     let prepare_qc =
         QuorumCertificate::new(height, 0, block.hash(), VoteKind::Prepare, prepare_votes);
@@ -151,7 +170,7 @@ fn advance(w: &mut World, height: u64, txs: Vec<Transaction>, ops: Vec<Operation
     let commit_votes: Vec<Vote> = w
         .nodes
         .iter()
-        .map(|n| n.vote(&block, VoteKind::Commit))
+        .map(|n| n.vote(&block, VoteKind::Commit).unwrap())
         .collect();
     let commit_qc = QuorumCertificate::new(height, 0, block.hash(), VoteKind::Commit, commit_votes);
     assert!(commit_qc.has_quorum(&w.gov, &w.params));
@@ -345,6 +364,31 @@ fn message_wire_round_trips() {
     let bytes = oxydome_net::encode_message(&msg).unwrap();
     match oxydome_net::decode_message(&bytes).unwrap() {
         Message::Ping { nonce } => assert_eq!(nonce, 42),
+        _ => panic!("wrong message"),
+    }
+
+    let msg = Message::CallOvmContract {
+        contract_id: Hash([1; 64]),
+        entry_point: "balanceOf".into(),
+        arguments: vec![7],
+        caller: PublicKey::from_bytes([2; 32]),
+        gas_limit: 1_000,
+    };
+    let bytes = oxydome_net::encode_message(&msg).unwrap();
+    match oxydome_net::decode_message(&bytes).unwrap() {
+        Message::CallOvmContract {
+            contract_id,
+            entry_point,
+            arguments,
+            caller,
+            gas_limit,
+        } => {
+            assert_eq!(contract_id, Hash([1; 64]));
+            assert_eq!(entry_point, "balanceOf");
+            assert_eq!(arguments, vec![7]);
+            assert_eq!(caller, PublicKey::from_bytes([2; 32]));
+            assert_eq!(gas_limit, 1_000);
+        }
         _ => panic!("wrong message"),
     }
 }

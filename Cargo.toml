@@ -19,6 +19,7 @@ members = [
     "bins/oxydome-node",
     "bins/oxydome-walletd",
     "crates/solid",
+    "crates/ovm",
 ]
 
 [workspace.package]
@@ -42,6 +43,7 @@ oxydome-node = { path = "crates/node" }
 oxydome-wallet = { path = "crates/wallet" }
 oxydome-wallet-rpc = { path = "crates/wallet-rpc" }
 oxydome-wallet-rpc-client = { path = "crates/wallet-rpc-client" }
+oxydome-ovm = { path = "crates/ovm" }
 
 bech32 = "0.9"
 sha3 = "0.10"

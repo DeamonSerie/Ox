@@ -164,6 +164,45 @@ async fn handle_connection(mut stream: TcpStream, node: SharedNode) -> std::io::
                     error,
                 })
             }
+            Message::GetOvmCode { contract_id } => {
+                let code = node.lock().unwrap().ovm_code(&contract_id);
+                Some(Message::OvmCodeResponse { code })
+            }
+            Message::CallOvm {
+                contract_id,
+                arguments,
+                gas_limit,
+            } => {
+                let result = node
+                    .lock()
+                    .unwrap()
+                    .ovm_call(&contract_id, &arguments, gas_limit);
+                let (execution, error) = match result {
+                    Ok(execution) => (Some(execution), None),
+                    Err(error) => (None, Some(error)),
+                };
+                Some(Message::OvmCallResponse { execution, error })
+            }
+            Message::CallOvmContract {
+                contract_id,
+                entry_point,
+                arguments,
+                caller,
+                gas_limit,
+            } => {
+                let result = node.lock().unwrap().ovm_contract_call(
+                    &contract_id,
+                    &entry_point,
+                    &arguments,
+                    caller,
+                    gas_limit,
+                );
+                let (execution, error) = match result {
+                    Ok(execution) => (Some(execution), None),
+                    Err(error) => (None, Some(error)),
+                };
+                Some(Message::OvmContractCallResponse { execution, error })
+            }
             Message::Subscribe { kinds } => {
                 let rx = { node.lock().unwrap().events.subscribe() };
                 send_message(

@@ -26,9 +26,9 @@ pub async fn dispatch(state: &Arc<AppState>, req: &RpcRequest) -> RpcResponse {
         methods::GET_BLOCK_BY_HASH => handle_get_block_by_hash(state, &params).await,
         methods::GET_TRANSACTION_BY_HASH => handle_get_transaction_by_hash(state, &params).await,
         methods::GET_TRANSACTION_RECEIPT => handle_get_transaction_receipt(state, &params).await,
-        methods::GET_CODE => handle_get_code().await,
-        methods::CALL => handle_call().await,
-        methods::ESTIMATE_GAS => handle_estimate_gas().await,
+        methods::GET_CODE => handle_get_code(state, &params).await,
+        methods::CALL => handle_call(state, &params).await,
+        methods::ESTIMATE_GAS => handle_estimate_gas(state, &params).await,
         methods::GAS_PRICE => handle_gas_price().await,
         methods::FEE_HISTORY => handle_fee_history().await,
         methods::GET_LOGS => handle_get_logs().await,
@@ -218,32 +218,315 @@ async fn handle_get_transaction_receipt(
         .await
         .map_err(|e| RpcError::new(RpcError::INTERNAL_ERROR, format!("node error: {e}")))?;
     let mut receipt = status_to_rpc(&status);
-    if let Some(t) = tx {
+    if let Some(t) = &tx {
         receipt.txid = to_hex(t.txid().as_bytes());
     }
     if let Some(loc) = location {
         receipt.block_hash = Some(to_hex(loc.block_hash.as_bytes()));
         receipt.position = Some(loc.position);
+        if tx
+            .as_ref()
+            .is_some_and(|transaction| transaction.ovm_action.is_some())
+        {
+            if let Some(block) = client
+                .get_block_by_height(loc.height)
+                .await
+                .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?
+            {
+                receipt.ovm_receipt = block
+                    .ovm_receipts
+                    .into_iter()
+                    .find(|ovm_receipt| ovm_receipt.txid == txid);
+                if let (Some(transaction), Some(action), Some(ovm_receipt), Some(input)) = (
+                    tx.as_ref(),
+                    tx.as_ref()
+                        .and_then(|transaction| transaction.ovm_action.as_ref()),
+                    receipt.ovm_receipt.as_ref(),
+                    tx.as_ref()
+                        .and_then(|transaction| transaction.inputs.first()),
+                ) {
+                    let refund = action.gas_limit().saturating_sub(ovm_receipt.gas_used);
+                    receipt.ovm_actual_fee = Some(
+                        transaction
+                            .fee
+                            .saturating_sub(u128::from(refund))
+                            .to_string(),
+                    );
+                    if refund > 0 {
+                        receipt.ovm_gas_refund = Some(oxydome_wallet_rpc::RpcOutput {
+                            amount: refund.to_string(),
+                            recipient: to_hex(input.owner.as_bytes()),
+                            kind: "spendable".into(),
+                            created_height: loc.height,
+                            mature: true,
+                        });
+                    }
+                }
+            }
+        }
     }
     Ok(serde_json::to_value(receipt).unwrap())
 }
 
-async fn handle_get_code() -> Result<Value, RpcError> {
-    Ok(json!("0x"))
+async fn handle_get_code(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let contract_id = params
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected contract id"))?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| {
+            RpcError::new(
+                RpcError::INTERNAL_ERROR,
+                format!("node connection failed: {error}"),
+            )
+        })?;
+    match client
+        .get_ovm_code(parse_hash(contract_id)?)
+        .await
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))?
+    {
+        Some(code) => Ok(json!(to_hex(&code))),
+        None => Err(RpcError::new(
+            RpcError::RESOURCE_NOT_FOUND,
+            "OVM contract was not found",
+        )),
+    }
 }
 
-async fn handle_call() -> Result<Value, RpcError> {
-    Err(RpcError::new(
-        RpcError::METHOD_NOT_SUPPORTED,
-        "eth_call is not supported on Oxydome",
+async fn handle_call(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    if has_named_entry_point(params) {
+        let (contract_id, entry_point, arguments, caller, gas_limit) =
+            parse_ovm_contract_call(params)?;
+        let mut client = NodeClient::connect(state.node_addr)
+            .await
+            .map_err(|error| {
+                RpcError::new(
+                    RpcError::INTERNAL_ERROR,
+                    format!("node connection failed: {error}"),
+                )
+            })?;
+        let execution = client
+            .call_ovm_contract(contract_id, entry_point, arguments, caller, gas_limit)
+            .await
+            .map_err(|error| RpcError::new(RpcError::TX_REJECTED, error))?;
+        return Ok(ovm_execution_to_rpc(&execution));
+    }
+    let (contract_id, arguments, gas_limit) = parse_ovm_call(params)?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| {
+            RpcError::new(
+                RpcError::INTERNAL_ERROR,
+                format!("node connection failed: {error}"),
+            )
+        })?;
+    let execution = client
+        .call_ovm(contract_id, arguments, gas_limit)
+        .await
+        .map_err(|error| RpcError::new(RpcError::TX_REJECTED, error))?;
+    Ok(ovm_execution_to_rpc(&execution))
+}
+
+fn ovm_execution_to_rpc(execution: &oxydome_ovm::Execution) -> Value {
+    json!({
+        "returnData": to_hex(&execution.return_value.map(u64::to_le_bytes).map_or_else(Vec::new, |value| value.to_vec())),
+        "gasUsed": execution.gas_used.to_string(),
+        "logs": execution.logs.iter().map(|log| json!({
+            "topic": log.topic,
+            "value": log.value.to_string(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+async fn handle_estimate_gas(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    if has_named_entry_point(params) {
+        let (contract_id, entry_point, arguments, caller, _) = parse_ovm_contract_call(params)?;
+        let mut client = NodeClient::connect(state.node_addr)
+            .await
+            .map_err(|error| {
+                RpcError::new(
+                    RpcError::INTERNAL_ERROR,
+                    format!("node connection failed: {error}"),
+                )
+            })?;
+        let execution = client
+            .call_ovm_contract(
+                contract_id,
+                entry_point,
+                arguments,
+                caller,
+                oxydome_core::tx::MAX_OVM_GAS_LIMIT,
+            )
+            .await
+            .map_err(|error| RpcError::new(RpcError::TX_REJECTED, error))?;
+        return Ok(json!(execution.gas_used.to_string()));
+    }
+    let (contract_id, arguments, _) = parse_ovm_call(params)?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| {
+            RpcError::new(
+                RpcError::INTERNAL_ERROR,
+                format!("node connection failed: {error}"),
+            )
+        })?;
+    let execution = client
+        .call_ovm(contract_id, arguments, oxydome_core::tx::MAX_OVM_GAS_LIMIT)
+        .await
+        .map_err(|error| RpcError::new(RpcError::TX_REJECTED, error))?;
+    Ok(json!(execution.gas_used.to_string()))
+}
+
+fn has_named_entry_point(params: &Value) -> bool {
+    params
+        .as_object()
+        .or_else(|| {
+            params
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(Value::as_object)
+        })
+        .is_some_and(|object| object.contains_key("entryPoint"))
+}
+
+fn parse_ovm_contract_call(
+    params: &Value,
+) -> Result<
+    (
+        oxydome_core::Hash,
+        String,
+        Vec<u64>,
+        oxydome_core::PublicKey,
+        u64,
+    ),
+    RpcError,
+> {
+    let object = params
+        .as_object()
+        .or_else(|| {
+            params
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(Value::as_object)
+        })
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcError::INVALID_PARAMS,
+                "expected call object with contractId and entryPoint",
+            )
+        })?;
+    let contract_id = object
+        .get("contractId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing contractId"))?;
+    let entry_point = object
+        .get("entryPoint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing entryPoint"))?
+        .to_owned();
+    let arguments = object
+        .get("arguments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing arguments"))?
+        .iter()
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                RpcError::new(
+                    RpcError::INVALID_PARAMS,
+                    "OVM arguments must be unsigned integers",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if arguments.len() + oxydome_ovm::AUTHORITY_WORD_COUNT > oxydome_ovm::MAX_ARGUMENTS {
+        return Err(RpcError::new(
+            RpcError::INVALID_PARAMS,
+            "OVM contract call exceeds the argument limit",
+        ));
+    }
+    let caller = match object.get("from") {
+        Some(Value::String(address)) => parse_address(address)?,
+        Some(_) => {
+            return Err(RpcError::new(
+                RpcError::INVALID_PARAMS,
+                "from must be an Oxydome address",
+            ))
+        }
+        None => oxydome_core::PublicKey::from_bytes([0; 32]),
+    };
+    let gas_limit = object
+        .get("gasLimit")
+        .and_then(Value::as_u64)
+        .unwrap_or(oxydome_core::tx::MAX_OVM_GAS_LIMIT);
+    if gas_limit < oxydome_ovm::ACTION_INTRINSIC_GAS + oxydome_ovm::CONTRACT_DISPATCH_GAS
+        || gas_limit > oxydome_core::tx::MAX_OVM_GAS_LIMIT
+    {
+        return Err(RpcError::new(
+            RpcError::INVALID_PARAMS,
+            "invalid OVM contract gasLimit",
+        ));
+    }
+    Ok((
+        parse_hash(contract_id)?,
+        entry_point,
+        arguments,
+        caller,
+        gas_limit,
     ))
 }
 
-async fn handle_estimate_gas() -> Result<Value, RpcError> {
-    Err(RpcError::new(
-        RpcError::METHOD_NOT_SUPPORTED,
-        "eth_estimateGas is not supported on Oxydome",
-    ))
+fn parse_ovm_call(params: &Value) -> Result<(oxydome_core::Hash, Vec<u64>, u64), RpcError> {
+    let object = params
+        .as_object()
+        .or_else(|| {
+            params
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(Value::as_object)
+        })
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcError::INVALID_PARAMS,
+                "expected call object with contractId and arguments",
+            )
+        })?;
+    let contract_id = object
+        .get("contractId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing contractId"))?;
+    let arguments = object
+        .get("arguments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing arguments"))?
+        .iter()
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                RpcError::new(
+                    RpcError::INVALID_PARAMS,
+                    "OVM arguments must be unsigned integers",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if arguments.len() > oxydome_core::MAX_OVM_ARGUMENTS {
+        return Err(RpcError::new(
+            RpcError::INVALID_PARAMS,
+            "OVM call exceeds the 64-argument limit",
+        ));
+    }
+    let gas_limit = object
+        .get("gasLimit")
+        .and_then(Value::as_u64)
+        .unwrap_or(oxydome_core::tx::MAX_OVM_GAS_LIMIT);
+    if gas_limit == 0 || gas_limit > oxydome_core::tx::MAX_OVM_GAS_LIMIT {
+        return Err(RpcError::new(
+            RpcError::INVALID_PARAMS,
+            "invalid OVM gasLimit",
+        ));
+    }
+    Ok((parse_hash(contract_id)?, arguments, gas_limit))
 }
 
 async fn handle_gas_price() -> Result<Value, RpcError> {
@@ -765,9 +1048,205 @@ fn parse_rpc_transaction(value: &Value) -> Result<oxydome_core::Transaction, Rpc
         outputs.push(oxydome_core::TxOutput::spendable(amount, recipient));
     }
 
+    let ovm_action = obj
+        .get("ovmAction")
+        .map(|value| {
+            let action = value.as_object().ok_or_else(|| {
+                RpcError::new(RpcError::INVALID_PARAMS, "ovmAction must be an object")
+            })?;
+            let kind = action.get("kind").and_then(Value::as_str).ok_or_else(|| {
+                RpcError::new(RpcError::INVALID_PARAMS, "missing OVM action kind")
+            })?;
+            let gas_limit = action
+                .get("gasLimit")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing OVM gasLimit"))?;
+            match kind {
+                "deploy" => {
+                    let code = action
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .and_then(parse_hex)
+                        .ok_or_else(|| {
+                            RpcError::new(RpcError::INVALID_PARAMS, "invalid OVM code")
+                        })?;
+                    Ok(oxydome_core::OvmAction::Deploy { code, gas_limit })
+                }
+                "deployContract" => {
+                    let artifact = action
+                        .get("artifact")
+                        .and_then(Value::as_str)
+                        .and_then(parse_hex)
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                RpcError::INVALID_PARAMS,
+                                "invalid smart-contract artifact",
+                            )
+                        })?;
+                    Ok(oxydome_core::OvmAction::DeployContract {
+                        artifact,
+                        gas_limit,
+                    })
+                }
+                "call" => {
+                    let contract_id = action
+                        .get("contractId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            RpcError::new(RpcError::INVALID_PARAMS, "missing contractId")
+                        })?;
+                    let arguments = action
+                        .get("arguments")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            RpcError::new(RpcError::INVALID_PARAMS, "missing OVM arguments")
+                        })?
+                        .iter()
+                        .map(|argument| {
+                            argument.as_u64().ok_or_else(|| {
+                                RpcError::new(
+                                    RpcError::INVALID_PARAMS,
+                                    "OVM arguments must be unsigned integers",
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(oxydome_core::OvmAction::Call {
+                        contract_id: parse_hash(contract_id)?,
+                        arguments,
+                        gas_limit,
+                    })
+                }
+                "callContract" => {
+                    let contract_id = action
+                        .get("contractId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            RpcError::new(RpcError::INVALID_PARAMS, "missing contractId")
+                        })?;
+                    let entry_point = action
+                        .get("entryPoint")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            RpcError::new(RpcError::INVALID_PARAMS, "missing entryPoint")
+                        })?
+                        .to_owned();
+                    let arguments = action
+                        .get("arguments")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            RpcError::new(RpcError::INVALID_PARAMS, "missing OVM arguments")
+                        })?
+                        .iter()
+                        .map(|argument| {
+                            argument.as_u64().ok_or_else(|| {
+                                RpcError::new(
+                                    RpcError::INVALID_PARAMS,
+                                    "OVM arguments must be unsigned integers",
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let authority_input = action
+                        .get("authorityInput")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                RpcError::INVALID_PARAMS,
+                                "missing or invalid authorityInput",
+                            )
+                        })?;
+                    Ok(oxydome_core::OvmAction::CallContract {
+                        contract_id: parse_hash(contract_id)?,
+                        entry_point,
+                        arguments,
+                        authority_input,
+                        gas_limit,
+                    })
+                }
+                _ => Err(RpcError::new(
+                    RpcError::INVALID_PARAMS,
+                    "OVM action kind must be deploy, call, deployContract, or callContract",
+                )),
+            }
+        })
+        .transpose()?;
+
     Ok(oxydome_core::Transaction {
         inputs,
         outputs,
         fee,
+        ovm_action,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_named_contract_calls_with_optional_simulation_caller() {
+        let params = json!({
+            "contractId": format!("0x{}", "11".repeat(64)),
+            "entryPoint": "balanceOf",
+            "arguments": [9],
+        });
+        let (contract_id, entry_point, arguments, caller, gas_limit) =
+            parse_ovm_contract_call(&params).unwrap();
+        assert_eq!(contract_id, oxydome_core::Hash([0x11; 64]));
+        assert_eq!(entry_point, "balanceOf");
+        assert_eq!(arguments, vec![9]);
+        assert_eq!(caller, oxydome_core::PublicKey::from_bytes([0; 32]));
+        assert_eq!(gas_limit, oxydome_core::tx::MAX_OVM_GAS_LIMIT);
+
+        let params = json!({
+            "contractId": format!("0x{}", "22".repeat(64)),
+            "entryPoint": "set",
+            "arguments": [],
+            "from": format!("0x{}", "33".repeat(32)),
+            "gasLimit": 50,
+        });
+        let (_, _, _, caller, gas_limit) = parse_ovm_contract_call(&params).unwrap();
+        assert_eq!(caller, oxydome_core::PublicKey::from_bytes([0x33; 32]));
+        assert_eq!(gas_limit, 50);
+    }
+
+    #[test]
+    fn rejects_named_contract_calls_that_exceed_authority_argument_bounds() {
+        let params = json!({
+            "contractId": format!("0x{}", "11".repeat(64)),
+            "entryPoint": "tooMany",
+            "arguments": vec![0; oxydome_ovm::MAX_ARGUMENTS - oxydome_ovm::AUTHORITY_WORD_COUNT + 1],
+        });
+        assert!(parse_ovm_contract_call(&params).is_err());
+    }
+
+    #[test]
+    fn parses_signed_smart_contract_transaction_actions() {
+        let transaction = parse_rpc_transaction(&json!({
+            "inputs": [],
+            "outputs": [],
+            "fee": "1",
+            "ovmAction": {
+                "kind": "callContract",
+                "contractId": format!("0x{}", "44".repeat(64)),
+                "entryPoint": "transfer",
+                "arguments": [5, 8],
+                "authorityInput": 0,
+                "gasLimit": 500,
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            transaction.ovm_action,
+            Some(oxydome_core::OvmAction::CallContract {
+                contract_id: oxydome_core::Hash([0x44; 64]),
+                entry_point: "transfer".into(),
+                arguments: vec![5, 8],
+                authority_input: 0,
+                gas_limit: 500,
+            })
+        );
+    }
 }

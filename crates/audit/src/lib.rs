@@ -253,7 +253,9 @@ pub struct HeaderAuditContext<'a> {
 /// full history via the inclusion proof against the previous state root; conservation, BH
 /// maturity, governance guardrails, supply and the value index are all recomputed and checked
 /// against the header. The new UTXO root itself is verified by the periodic deep replay on
-/// server nodes (which hold full state).
+/// server nodes (which hold full state). This header-only audit does not execute OVM bytecode or
+/// independently validate OVM receipts; server nodes must validate the complete state transition
+/// before voting.
 pub fn header_audit(
     ctx: &HeaderAuditContext,
     package: &AuditPackage,
