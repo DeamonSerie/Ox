@@ -15,7 +15,7 @@ fn usage() -> ! {
         "usage:
   oxydome-node init --out <genesis.toml> [--masters N] [--nodes M] [--supply S]
   oxydome-node demo [--blocks N] [--supply S] [--db <path>]
-  oxydome-node --config <genesis.toml> --name <endpoint-name> [--listen <addr>] [--masters <addr,...>] [--db <path>]"
+  oxydome-node --config <genesis.toml> --name <endpoint-name> [--listen <addr>] [--masters <addr,...>] [--peers <addr,...>] [--db <path>]"
     );
     std::process::exit(2);
 }
@@ -165,36 +165,59 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Restore or initialize durable state before reporting the node's current tip.
+    if let Some(db) = flags.get("--db") {
+        let path = std::path::Path::new(db);
+        let store = oxydome_state::LedgerStore::open(path)
+            .with_context(|| format!("cannot open ledger store {db}"))?;
+        let index_store = oxydome_node::index::IndexStore::open(&path.join("wallet-index"))
+            .with_context(|| format!("cannot open index store {db}"))?;
+        if store.current_height()?.is_some() {
+            node = node
+                .restore_from_store(store, Some(index_store))
+                .with_context(|| format!("cannot restore ledger store {db}"))?;
+            println!(
+                "restored ledger history through height {}",
+                node.state.height
+            );
+        } else {
+            let mut store = store;
+            store
+                .init_genesis_with_block(&genesis, &node.state.utxo, &node.state.contracts)
+                .with_context(|| format!("cannot seed ledger store {db}"))?;
+            node = node.with_store(store).with_index_store(index_store);
+            println!("ledger persistence initialized at {db}");
+        }
+        node = node
+            .with_content_store(&path.join("assets"))
+            .with_context(|| format!("cannot open asset store for {db}"))?;
+    }
+
     println!(
         "oxydome-node {} listening on {} (height {}, state_root {})",
         name,
         listen,
         node.state.height,
-        node.state.utxo_root().to_hex(),
+        node.state.state_root().to_hex(),
     );
     println!("genesis block hash: {}", genesis.hash().to_hex());
 
-    // Attach durable ledger persistence when requested.
-    if let Some(db) = flags.get("--db") {
-        let path = std::path::Path::new(db);
-        let mut store = oxydome_state::LedgerStore::open(path)
-            .with_context(|| format!("cannot open ledger store {db}"))?;
-        if store.current_height()?.is_some() {
-            anyhow::bail!(
-                "ledger store {db} already contains versions; restart replay is not implemented, \
-                 use a fresh path"
-            );
-        }
-        store
-            .init_genesis(genesis.hash(), &node.state.utxo)
-            .with_context(|| format!("cannot seed ledger store {db}"))?;
-        node = node.with_store(store);
-        let index_store = oxydome_node::index::IndexStore::open(&path.join("wallet-index"))
-            .with_context(|| format!("cannot open index store {db}"))?;
-        node = node.with_index_store(index_store);
-        println!("ledger persistence enabled at {db}");
-    }
-
-    oxydome_node::server::run(&listen, node).await?;
+    let peers = flags
+        .get("--peers")
+        .map(|addresses| {
+            addresses
+                .split(',')
+                .filter(|address| !address.trim().is_empty())
+                .map(|address| {
+                    address
+                        .trim()
+                        .parse()
+                        .with_context(|| format!("invalid peer address {address}"))
+                })
+                .collect::<Result<Vec<std::net::SocketAddr>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    oxydome_node::server::run_with_peers(&listen, node, peers).await?;
     Ok(())
 }

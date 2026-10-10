@@ -63,6 +63,9 @@ pub async fn serve(
 
     let app = axum::Router::new()
         .route("/", axum::routing::post(handle_rpc))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            (2 * oxydome_ovm::MAX_ASSET_BYTES as usize) + 1024 * 1024,
+        ))
         .route("/health", axum::routing::get(handle_health))
         .route(
             "/ws",

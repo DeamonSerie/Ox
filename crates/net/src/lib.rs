@@ -165,6 +165,21 @@ pub enum Message {
         execution: Option<oxydome_ovm::Execution>,
         error: Option<String>,
     },
+    GetContent {
+        hash: Hash,
+        hops_remaining: u8,
+    },
+    ContentResponse {
+        content: Option<Vec<u8>>,
+    },
+    StoreContent {
+        hash: Hash,
+        content: Vec<u8>,
+    },
+    StoreContentResponse {
+        stored: bool,
+        error: Option<String>,
+    },
 
     // -- wallet subscriptions (walletd <-> node) --
     Subscribe {

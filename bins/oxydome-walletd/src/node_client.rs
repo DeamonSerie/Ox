@@ -195,4 +195,38 @@ impl NodeClient {
             other => Err(format!("unexpected node response: {other:?}")),
         }
     }
+
+    pub async fn get_content(&mut self, hash: Hash) -> Result<Option<Vec<u8>>, NetError> {
+        match self
+            .request(&Message::GetContent {
+                hash,
+                hops_remaining: 4,
+            })
+            .await?
+        {
+            Message::ContentResponse { content } => Ok(content),
+            other => Err(NetError::Unexpected(format!("{other:?}"))),
+        }
+    }
+
+    pub async fn store_content(&mut self, content: Vec<u8>) -> Result<Hash, String> {
+        if content.len() as u64 > oxydome_ovm::MAX_ASSET_BYTES {
+            return Err("content exceeds the per-item asset size limit".into());
+        }
+        let hash = oxydome_ovm::content_hash(&content);
+        match self
+            .request(&Message::StoreContent { hash, content })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            Message::StoreContentResponse {
+                stored: true,
+                error: None,
+            } => Ok(hash),
+            Message::StoreContentResponse {
+                error: Some(error), ..
+            } => Err(error),
+            other => Err(format!("unexpected node response: {other:?}")),
+        }
+    }
 }

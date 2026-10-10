@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 const MAGIC: &[u8; 4] = b"OVM\x01";
 const CONTRACT_MAGIC: &[u8; 4] = b"OSC\x01";
+const ASSET_MANIFEST_MAGIC: &[u8; 4] = b"OAM\x01";
 const MAX_CODE_BYTES: usize = 64 * 1024;
 const MAX_STACK: usize = 1024;
 const MAX_LOCALS: usize = 256;
@@ -18,6 +19,10 @@ pub const AUTHORITY_WORD_COUNT: usize = 4;
 pub const MAX_CONTRACT_FUNCTIONS: usize = 128;
 pub const MAX_FUNCTION_NAME_BYTES: usize = 64;
 pub const MAX_CONTRACT_ARTIFACT_BYTES: usize = 256 * 1024;
+pub const MAX_ASSET_MANIFEST_ENTRIES: usize = 1024;
+pub const MAX_ASSET_PATH_BYTES: usize = 255;
+pub const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
+pub const MAX_ASSET_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_STORAGE_SLOTS: usize = 1_024;
 pub const MAX_CONTRACTS: usize = 10_000;
 pub const ACTION_INTRINSIC_GAS: u64 = 10;
@@ -104,6 +109,132 @@ pub struct ContractArtifact {
     pub source_hash: Option<Hash>,
     pub asset_manifest_hash: Option<Hash>,
     pub functions: Vec<ContractFunction>,
+}
+
+/// One optional, non-consensus asset committed by a contract artifact's manifest hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetManifestEntry {
+    pub path: String,
+    pub content_hash: Hash,
+    pub size: u64,
+}
+
+/// Canonical path-to-content map for optional UI, source maps, and other non-executable files.
+///
+/// The manifest itself is content-addressed with [`content_hash`]. Asset availability is never
+/// consulted by OVM verification or execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetManifest {
+    pub entries: Vec<AssetManifestEntry>,
+}
+
+impl AssetManifest {
+    pub fn encode(&self) -> Result<Vec<u8>, VmError> {
+        self.verify()?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(ASSET_MANIFEST_MAGIC);
+        bytes.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
+        for entry in &self.entries {
+            bytes.extend_from_slice(&(entry.path.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(entry.path.as_bytes());
+            bytes.extend_from_slice(entry.content_hash.as_bytes());
+            bytes.extend_from_slice(&entry.size.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, VmError> {
+        if bytes.len() < 6
+            || bytes.get(..4) != Some(ASSET_MANIFEST_MAGIC)
+            || bytes.len() > 6 + MAX_ASSET_MANIFEST_ENTRIES * (2 + MAX_ASSET_PATH_BYTES + 64 + 8)
+        {
+            return Err(VmError::InvalidBytecode);
+        }
+        let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        if count == 0 || count > MAX_ASSET_MANIFEST_ENTRIES {
+            return Err(VmError::InvalidProgram);
+        }
+        let mut cursor = 6;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let path_len = u16::from_le_bytes(take(bytes, &mut cursor)?) as usize;
+            let path = std::str::from_utf8(take_slice(bytes, &mut cursor, path_len)?)
+                .map_err(|_| VmError::InvalidBytecode)?
+                .to_owned();
+            let content_hash = Hash(take(bytes, &mut cursor)?);
+            let size = u64::from_le_bytes(take(bytes, &mut cursor)?);
+            entries.push(AssetManifestEntry {
+                path,
+                content_hash,
+                size,
+            });
+        }
+        if cursor != bytes.len() {
+            return Err(VmError::InvalidBytecode);
+        }
+        let manifest = Self { entries };
+        manifest.verify()?;
+        Ok(manifest)
+    }
+
+    pub fn verify(&self) -> Result<(), VmError> {
+        if self.entries.is_empty() || self.entries.len() > MAX_ASSET_MANIFEST_ENTRIES {
+            return Err(VmError::InvalidProgram);
+        }
+        let mut previous: Option<&str> = None;
+        let mut total_size = 0u64;
+        for entry in &self.entries {
+            if !valid_asset_path(&entry.path)
+                || previous.is_some_and(|last| last >= entry.path.as_str())
+                || entry.size > MAX_ASSET_BYTES
+            {
+                return Err(VmError::InvalidProgram);
+            }
+            total_size = total_size
+                .checked_add(entry.size)
+                .ok_or(VmError::ProgramTooLarge)?;
+            if total_size > MAX_ASSET_MANIFEST_BYTES {
+                return Err(VmError::ProgramTooLarge);
+            }
+            previous = Some(&entry.path);
+        }
+        Ok(())
+    }
+
+    pub fn commitment(&self) -> Result<Hash, VmError> {
+        Ok(content_hash(&self.encode()?))
+    }
+
+    pub fn asset(&self, path: &str) -> Option<&AssetManifestEntry> {
+        self.entries
+            .binary_search_by(|entry| entry.path.as_str().cmp(path))
+            .ok()
+            .map(|index| &self.entries[index])
+    }
+}
+
+/// Domain-separated identifier for non-executable content.
+pub fn content_hash(bytes: &[u8]) -> Hash {
+    hash_value(&("oxydome-content-v1", bytes))
+}
+
+fn valid_asset_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.len() > MAX_ASSET_PATH_BYTES
+        || !path.is_ascii()
+        || path.starts_with('/')
+        || path.contains('\\')
+    {
+        return false;
+    }
+    path.split('/').all(|component| {
+        !component.is_empty()
+            && component != "."
+            && component != ".."
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    })
 }
 
 impl ContractArtifact {
@@ -802,5 +933,54 @@ mod tests {
             }],
         };
         assert_eq!(artifact.encode(), Err(VmError::InvalidProgram));
+    }
+
+    #[test]
+    fn asset_manifests_are_canonical_and_content_addressed() {
+        let content = b"<html>Oxydome app</html>";
+        let script = b"console.log('Oxydome')";
+        let manifest = AssetManifest {
+            entries: vec![
+                AssetManifestEntry {
+                    path: "index.html".into(),
+                    content_hash: content_hash(content),
+                    size: content.len() as u64,
+                },
+                AssetManifestEntry {
+                    path: "ui/app.js".into(),
+                    content_hash: content_hash(script),
+                    size: script.len() as u64,
+                },
+            ],
+        };
+        let encoded = manifest.encode().unwrap();
+        let commitment = manifest.commitment().unwrap();
+        let decoded = AssetManifest::decode(&encoded).unwrap();
+        assert_eq!(decoded, manifest);
+        assert_eq!(decoded.commitment().unwrap(), commitment);
+        assert_eq!(
+            decoded.asset("index.html").unwrap().content_hash,
+            content_hash(content)
+        );
+        assert!(decoded.asset("../secrets").is_none());
+    }
+
+    #[test]
+    fn asset_manifests_reject_unsafe_paths_and_noncanonical_order() {
+        let entry = |path: &str| AssetManifestEntry {
+            path: path.into(),
+            content_hash: content_hash(b"x"),
+            size: 1,
+        };
+        for entries in [
+            vec![entry("../escape")],
+            vec![entry("absolute//path")],
+            vec![entry("z.js"), entry("a.js")],
+        ] {
+            assert_eq!(
+                AssetManifest { entries }.encode(),
+                Err(VmError::InvalidProgram)
+            );
+        }
     }
 }

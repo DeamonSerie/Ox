@@ -27,6 +27,9 @@ pub async fn dispatch(state: &Arc<AppState>, req: &RpcRequest) -> RpcResponse {
         methods::GET_TRANSACTION_BY_HASH => handle_get_transaction_by_hash(state, &params).await,
         methods::GET_TRANSACTION_RECEIPT => handle_get_transaction_receipt(state, &params).await,
         methods::GET_CODE => handle_get_code(state, &params).await,
+        methods::GET_ASSET_MANIFEST => handle_get_asset_manifest(state, &params).await,
+        methods::GET_ASSET => handle_get_asset(state, &params).await,
+        methods::PUT_CONTENT => handle_put_content(state, &params).await,
         methods::CALL => handle_call(state, &params).await,
         methods::ESTIMATE_GAS => handle_estimate_gas(state, &params).await,
         methods::GAS_PRICE => handle_gas_price().await,
@@ -293,6 +296,168 @@ async fn handle_get_code(state: &Arc<AppState>, params: &Value) -> Result<Value,
             "OVM contract was not found",
         )),
     }
+}
+
+async fn handle_get_asset_manifest(
+    state: &Arc<AppState>,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let contract_id = params
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected contract id"))?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    let artifact = get_contract_artifact(&mut client, parse_hash(contract_id)?).await?;
+    let manifest_hash = artifact.asset_manifest_hash.ok_or_else(|| {
+        RpcError::new(
+            RpcError::RESOURCE_NOT_FOUND,
+            "contract has no optional asset manifest",
+        )
+    })?;
+    let manifest = fetch_asset_manifest(&mut client, manifest_hash).await?;
+    Ok(json!({
+        "manifestHash": to_hex(manifest_hash.as_bytes()),
+        "entries": manifest.entries.iter().map(|entry| json!({
+            "path": entry.path,
+            "contentHash": to_hex(entry.content_hash.as_bytes()),
+            "size": entry.size.to_string(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+async fn handle_get_asset(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let object = params
+        .as_object()
+        .or_else(|| {
+            params
+                .as_array()
+                .and_then(|values| values.first())
+                .and_then(Value::as_object)
+        })
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "expected contractId and path"))?;
+    let contract_id = object
+        .get("contractId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing contractId"))?;
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "missing asset path"))?;
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    let artifact = get_contract_artifact(&mut client, parse_hash(contract_id)?).await?;
+    let manifest_hash = artifact.asset_manifest_hash.ok_or_else(|| {
+        RpcError::new(
+            RpcError::RESOURCE_NOT_FOUND,
+            "contract has no optional asset manifest",
+        )
+    })?;
+    let manifest = fetch_asset_manifest(&mut client, manifest_hash).await?;
+    let entry = manifest.asset(path).ok_or_else(|| {
+        RpcError::new(
+            RpcError::RESOURCE_NOT_FOUND,
+            "asset path is not in the manifest",
+        )
+    })?;
+    let entry = entry.clone();
+    let content = fetch_content(&mut client, entry.content_hash).await?;
+    if content.len() as u64 != entry.size {
+        return Err(RpcError::new(
+            RpcError::INTERNAL_ERROR,
+            "stored asset size does not match its manifest",
+        ));
+    }
+    Ok(json!({
+        "path": entry.path,
+        "contentHash": to_hex(entry.content_hash.as_bytes()),
+        "size": entry.size.to_string(),
+        "content": to_hex(&content),
+    }))
+}
+
+async fn handle_put_content(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {
+    let encoded = params
+        .as_object()
+        .and_then(|object| object.get("content"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcError::INVALID_PARAMS,
+                "expected an object with hex-encoded content",
+            )
+        })?;
+    let content = parse_hex(encoded)
+        .ok_or_else(|| RpcError::new(RpcError::INVALID_PARAMS, "invalid content hex"))?;
+    if content.len() as u64 > oxydome_ovm::MAX_ASSET_BYTES {
+        return Err(RpcError::new(
+            RpcError::INVALID_PARAMS,
+            "content exceeds the per-item asset size limit",
+        ));
+    }
+    let mut client = NodeClient::connect(state.node_addr)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?;
+    let hash = client
+        .store_content(content)
+        .await
+        .map_err(|error| RpcError::new(RpcError::TX_REJECTED, error))?;
+    Ok(json!(to_hex(hash.as_bytes())))
+}
+
+async fn get_contract_artifact(
+    client: &mut NodeClient,
+    contract_id: oxydome_core::Hash,
+) -> Result<oxydome_ovm::ContractArtifact, RpcError> {
+    let code = client
+        .get_ovm_code(contract_id)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?
+        .ok_or_else(|| RpcError::new(RpcError::RESOURCE_NOT_FOUND, "OVM contract was not found"))?;
+    oxydome_ovm::ContractArtifact::decode(&code)
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))
+}
+
+async fn fetch_asset_manifest(
+    client: &mut NodeClient,
+    manifest_hash: oxydome_core::Hash,
+) -> Result<oxydome_ovm::AssetManifest, RpcError> {
+    let bytes = fetch_content(client, manifest_hash).await?;
+    oxydome_ovm::AssetManifest::decode(&bytes)
+        .map_err(|error| RpcError::new(RpcError::INTERNAL_ERROR, error.to_string()))
+}
+
+async fn fetch_content(
+    client: &mut NodeClient,
+    hash: oxydome_core::Hash,
+) -> Result<Vec<u8>, RpcError> {
+    let content = client
+        .get_content(hash)
+        .await
+        .map_err(|error| node_connection_error(error.to_string()))?
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcError::RESOURCE_NOT_FOUND,
+                format!("content {} is not available from this node", hash),
+            )
+        })?;
+    if oxydome_ovm::content_hash(&content) != hash {
+        return Err(RpcError::new(
+            RpcError::INTERNAL_ERROR,
+            "node returned content that does not match its requested hash",
+        ));
+    }
+    Ok(content)
+}
+
+fn node_connection_error(error: String) -> RpcError {
+    RpcError::new(
+        RpcError::INTERNAL_ERROR,
+        format!("node connection failed: {error}"),
+    )
 }
 
 async fn handle_call(state: &Arc<AppState>, params: &Value) -> Result<Value, RpcError> {

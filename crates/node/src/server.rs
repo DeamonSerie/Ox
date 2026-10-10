@@ -16,22 +16,36 @@ use oxydome_net::{
 use oxydome_state::UtxoEntry;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
+
+const MAX_CONTENT_FORWARD_HOPS: u8 = 4;
 
 /// Shared node handle for the async server.
 pub type SharedNode = Arc<Mutex<Node>>;
 
 /// Runs the node accept loop until the process exits.
 pub async fn run(addr: &str, node: Node) -> std::io::Result<SocketAddr> {
+    run_with_peers(addr, node, Vec::new()).await
+}
+
+/// Runs the node accept loop with static peer addresses for optional asset retrieval.
+pub async fn run_with_peers(
+    addr: &str,
+    node: Node,
+    peers: Vec<SocketAddr>,
+) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
     let _local = listener.local_addr()?;
     let shared: SharedNode = Arc::new(Mutex::new(node));
+    let peers = Arc::new(peers);
     loop {
         let (stream, _peer) = listener.accept().await?;
         let shared = Arc::clone(&shared);
+        let peers = Arc::clone(&peers);
         tokio::spawn(async move {
-            let _ = handle_connection(stream, shared).await;
+            let _ = handle_connection(stream, shared, peers).await;
         });
     }
 }
@@ -49,10 +63,20 @@ pub async fn run_server_with_handle(
     addr: &str,
     node: Node,
 ) -> std::io::Result<(SocketAddr, SharedNode)> {
+    run_server_with_peers_and_handle(addr, node, Vec::new()).await
+}
+
+/// Test/embedded-server variant of [`run_server_with_handle`] with static content peers.
+pub async fn run_server_with_peers_and_handle(
+    addr: &str,
+    node: Node,
+    peers: Vec<SocketAddr>,
+) -> std::io::Result<(SocketAddr, SharedNode)> {
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let shared: SharedNode = Arc::new(Mutex::new(node));
     let accept_shared = Arc::clone(&shared);
+    let peers = Arc::new(peers);
     tokio::spawn(async move {
         loop {
             let (stream, _peer) = match listener.accept().await {
@@ -60,15 +84,20 @@ pub async fn run_server_with_handle(
                 Err(_) => return,
             };
             let shared = Arc::clone(&accept_shared);
+            let peers = Arc::clone(&peers);
             tokio::spawn(async move {
-                let _ = handle_connection(stream, shared).await;
+                let _ = handle_connection(stream, shared, peers).await;
             });
         }
     });
     Ok((local, shared))
 }
 
-async fn handle_connection(mut stream: TcpStream, node: SharedNode) -> std::io::Result<()> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    node: SharedNode,
+    peers: Arc<Vec<SocketAddr>>,
+) -> std::io::Result<()> {
     loop {
         let msg = match recv_message(&mut stream).await {
             Ok(m) => m,
@@ -203,6 +232,27 @@ async fn handle_connection(mut stream: TcpStream, node: SharedNode) -> std::io::
                 };
                 Some(Message::OvmContractCallResponse { execution, error })
             }
+            Message::GetContent {
+                hash,
+                hops_remaining,
+            } => {
+                let local = node.lock().unwrap().get_content(&hash);
+                let hops_remaining = hops_remaining.min(MAX_CONTENT_FORWARD_HOPS);
+                let content = if local.is_some() || hops_remaining == 0 {
+                    local
+                } else {
+                    fetch_content_from_peers(&peers, hash, hops_remaining - 1).await
+                };
+                Some(Message::ContentResponse { content })
+            }
+            Message::StoreContent { hash, content } => {
+                let result = node.lock().unwrap().put_content(hash, content);
+                let (stored, error) = match result {
+                    Ok(()) => (true, None),
+                    Err(error) => (false, Some(error)),
+                };
+                Some(Message::StoreContentResponse { stored, error })
+            }
             Message::Subscribe { kinds } => {
                 let rx = { node.lock().unwrap().events.subscribe() };
                 send_message(
@@ -236,6 +286,46 @@ async fn handle_connection(mut stream: TcpStream, node: SharedNode) -> std::io::
             send_message(&mut stream, &reply).await.ok();
         }
     }
+}
+
+async fn fetch_content_from_peers(
+    peers: &[SocketAddr],
+    hash: Hash,
+    hops_remaining: u8,
+) -> Option<Vec<u8>> {
+    for peer in peers {
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = TcpStream::connect(peer).await?;
+            send_message(
+                &mut stream,
+                &Message::GetContent {
+                    hash,
+                    hops_remaining,
+                },
+            )
+            .await?;
+            loop {
+                match recv_message(&mut stream).await? {
+                    Message::ContentResponse { content } => {
+                        return Ok::<Option<Vec<u8>>, NetError>(content)
+                    }
+                    Message::Ping { nonce } => {
+                        send_message(&mut stream, &Message::Pong { nonce }).await?;
+                    }
+                    _ => return Ok::<Option<Vec<u8>>, NetError>(None),
+                }
+            }
+        })
+        .await;
+        if let Ok(Ok(Some(content))) = result {
+            if content.len() as u64 <= oxydome_ovm::MAX_ASSET_BYTES
+                && oxydome_ovm::content_hash(&content) == hash
+            {
+                return Some(content);
+            }
+        }
+    }
+    None
 }
 
 /// Requests admission from a master and returns the certificate if granted.
@@ -272,6 +362,46 @@ pub async fn request_admission(
             }
             Ok(_) => continue,
             Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxydome_net::{recv_message, send_message};
+
+    #[tokio::test]
+    async fn retrieves_content_from_a_configured_peer_without_consensus_state() {
+        let config = crate::default_config(1, 1, 100_000);
+        let genesis = config.genesis().unwrap();
+        let key = config.nodes[0].keypair().unwrap();
+        let (mut source, _) = Node::new(key.clone(), &genesis, None).unwrap();
+        let bytes = b"static app assets".to_vec();
+        let hash = oxydome_ovm::content_hash(&bytes);
+        source.put_content(hash, bytes.clone()).unwrap();
+        let (source_addr, _) = run_server_with_handle("127.0.0.1:0", source).await.unwrap();
+
+        let (proxy, _) = Node::new(key, &genesis, None).unwrap();
+        let (proxy_addr, _) =
+            run_server_with_peers_and_handle("127.0.0.1:0", proxy, vec![source_addr])
+                .await
+                .unwrap();
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        send_message(
+            &mut client,
+            &Message::GetContent {
+                hash,
+                hops_remaining: MAX_CONTENT_FORWARD_HOPS,
+            },
+        )
+        .await
+        .unwrap();
+        match recv_message(&mut client).await.unwrap() {
+            Message::ContentResponse {
+                content: Some(received),
+            } => assert_eq!(received, bytes),
+            other => panic!("unexpected content response: {other:?}"),
         }
     }
 }

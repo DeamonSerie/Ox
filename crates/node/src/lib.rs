@@ -2,9 +2,11 @@
 //! Proof-of-Authority leader, builds audit packages for the masters, and finalizes blocks once
 //! BFT and `MasterCheck` quorums are present.
 
+pub mod content_store;
 pub mod index;
 pub mod server;
 
+use crate::content_store::ContentStore;
 use crate::index::{IndexStore, WalletIndex};
 use oxydome_audit::{attestation_quorum, AuditAttestation, AuditPackage, InputProof};
 use oxydome_consensus::{AdmissionCertificate, MasterCheck, QuorumCertificate, Vote, VoteKind};
@@ -71,6 +73,8 @@ pub struct Node {
     pub wallet_index: WalletIndex,
     /// Durable snapshot store for the wallet index.
     pub index_store: Option<IndexStore>,
+    /// Optional asset storage, deliberately excluded from consensus state.
+    pub content_store: ContentStore,
     /// Accepted-but-unconfirmed transactions, keyed by txid.
     pub pending: HashMap<Hash, PendingTx>,
     /// Rejected transactions and the reason, bounded by [`REJECTED_LIMIT`].
@@ -109,6 +113,7 @@ impl Node {
             store: None,
             wallet_index: WalletIndex::new(),
             index_store: None,
+            content_store: ContentStore::default(),
             pending: HashMap::new(),
             rejected: HashMap::new(),
             rejected_order: VecDeque::new(),
@@ -128,6 +133,136 @@ impl Node {
     pub fn with_index_store(mut self, store: IndexStore) -> Self {
         self.index_store = Some(store);
         self
+    }
+
+    /// Attaches bounded local storage for optional content-addressed assets.
+    pub fn with_content_store(mut self, path: &std::path::Path) -> Result<Self, NodeError> {
+        self.content_store =
+            ContentStore::open(path).map_err(|error| NodeError::Ledger(error.to_string()))?;
+        Ok(self)
+    }
+
+    pub fn get_content(&self, hash: &Hash) -> Option<Vec<u8>> {
+        self.content_store.get(hash).map(ToOwned::to_owned)
+    }
+
+    pub fn put_content(&mut self, hash: Hash, content: Vec<u8>) -> Result<(), String> {
+        self.content_store
+            .put(hash, content)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Restores the node by replaying its atomically persisted block history from genesis.
+    ///
+    /// The persisted UTXO and contract snapshots are checked against every replayed height;
+    /// snapshots are never trusted as a substitute for deterministic block execution.
+    pub fn restore_from_store(
+        mut self,
+        store: LedgerStore,
+        index_store: Option<IndexStore>,
+    ) -> Result<Self, NodeError> {
+        let blocks = store
+            .load_blocks()
+            .map_err(|error| NodeError::Ledger(error.to_string()))?;
+        if blocks.is_empty() {
+            return Err(NodeError::Ledger(
+                "ledger has no persisted block history".into(),
+            ));
+        }
+        if blocks[0].hash() != self.blocks[0].hash() {
+            return Err(NodeError::Ledger(
+                "persisted genesis does not match configured genesis".into(),
+            ));
+        }
+        if blocks[0].header.utxo_root != self.state.utxo_root()
+            || blocks[0].header.state_root != self.state.state_root()
+        {
+            return Err(NodeError::Ledger(
+                "persisted genesis roots do not match configured genesis".into(),
+            ));
+        }
+        self.verify_persisted_height(&store, &blocks[0])?;
+
+        let mut restored_index = WalletIndex::new();
+        for block in blocks.iter().skip(1) {
+            if block.header.height != self.state.height + 1 {
+                return Err(NodeError::Ledger(format!(
+                    "persisted block sequence skips height {}",
+                    self.state.height + 1
+                )));
+            }
+            restored_index.record_block(block, &self.state.utxo);
+            self.state = self
+                .state
+                .apply_block(block, &self.gov, &self.params)
+                .map_err(|error| {
+                    NodeError::Ledger(format!(
+                        "persisted block {} failed deterministic replay: {error}",
+                        block.header.height
+                    ))
+                })?;
+            self.verify_persisted_height(&store, block)?;
+        }
+
+        let current_height = store
+            .current_height()
+            .map_err(|error| NodeError::Ledger(error.to_string()))?
+            .ok_or_else(|| NodeError::Ledger("ledger has no current-height marker".into()))?;
+        if current_height != self.state.height {
+            return Err(NodeError::Ledger(format!(
+                "current ledger height {current_height} does not match replayed height {}",
+                self.state.height
+            )));
+        }
+        let stored_ledger = store
+            .load_ledger(current_height)
+            .map_err(|error| NodeError::Ledger(error.to_string()))?;
+        if stored_ledger.root() != self.state.utxo_root()
+            || store
+                .load_ovm_state(current_height)
+                .map_err(|error| NodeError::Ledger(error.to_string()))?
+                != self.state.contracts
+        {
+            return Err(NodeError::Ledger(
+                "persisted tip snapshots do not match replayed state".into(),
+            ));
+        }
+
+        self.blocks = blocks;
+        self.wallet_index = restored_index;
+        self.store = Some(store);
+        self.index_store = index_store;
+        if let Some(index_store) = &self.index_store {
+            index_store.save(&self.wallet_index)?;
+        }
+        Ok(self)
+    }
+
+    fn verify_persisted_height(&self, store: &LedgerStore, block: &Block) -> Result<(), NodeError> {
+        let height = block.header.height;
+        let snapshot = store
+            .snapshot(height)
+            .map_err(|error| NodeError::Ledger(error.to_string()))?
+            .ok_or_else(|| {
+                NodeError::Ledger(format!("missing ledger snapshot at height {height}"))
+            })?;
+        if snapshot.block_hash != block.hash()
+            || snapshot.root != self.state.utxo_root()
+            || snapshot.total != self.state.utxo.total()
+        {
+            return Err(NodeError::Ledger(format!(
+                "persisted UTXO snapshot does not match replay at height {height}"
+            )));
+        }
+        let contracts = store
+            .load_ovm_state(height)
+            .map_err(|error| NodeError::Ledger(error.to_string()))?;
+        if contracts != self.state.contracts {
+            return Err(NodeError::Ledger(format!(
+                "persisted OVM snapshot does not match replay at height {height}"
+            )));
+        }
+        Ok(())
     }
 
     /// A receiver that observes wallet-facing events as they occur.
@@ -432,12 +567,13 @@ impl Node {
         if let Some(store) = &mut self.store {
             let delta = ledger_diff(&self.state.utxo, &next.utxo);
             store
-                .save_version_with_ovm(
+                .save_version_with_ovm_and_block(
                     next.height,
                     block.hash(),
                     &next.utxo,
                     &delta,
                     &next.contracts,
+                    &block,
                 )
                 .map_err(|e| NodeError::Ledger(e.to_string()))?;
         }
@@ -843,5 +979,103 @@ pub fn default_config(masters: usize, nodes: usize, supply: Amount) -> oxydome_c
         masters: master_eps,
         nodes: node_eps,
         approved_manifests: vec![reference_manifest().root().to_hex()],
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use oxydome_core::{Operation, OvmAction, Transaction, TxOutput};
+    use oxydome_rewards::split_fees;
+
+    #[test]
+    fn restores_and_replays_persisted_block_history() {
+        let app_config = default_config(1, 1, 100_000);
+        let genesis_config = app_config.genesis().unwrap();
+        let key = app_config.nodes[0].keypair().unwrap();
+        let (node, genesis) = Node::new(key.clone(), &genesis_config, None).unwrap();
+
+        let mut store = LedgerStore::open_temporary().unwrap();
+        store
+            .init_genesis_with_block(&genesis, &node.state.utxo, &node.state.contracts)
+            .unwrap();
+        let (input, amount) = node
+            .state
+            .utxo
+            .iter()
+            .find(|entry| entry.output.recipient == node.public())
+            .map(|entry| (entry.outpoint, entry.output.amount))
+            .unwrap();
+        let program = oxydome_ovm::Program {
+            argument_count: oxydome_ovm::AUTHORITY_WORD_COUNT as u8,
+            local_count: 0,
+            instructions: vec![
+                oxydome_ovm::Instruction::Push(7),
+                oxydome_ovm::Instruction::Return,
+            ],
+        }
+        .encode()
+        .unwrap();
+        let artifact = oxydome_ovm::ContractArtifact {
+            source_hash: None,
+            asset_manifest_hash: None,
+            functions: vec![oxydome_ovm::ContractFunction {
+                name: "read".into(),
+                inputs: Vec::new(),
+                output: Some(oxydome_ovm::ContractValueType::U64),
+                code: program,
+            }],
+        }
+        .encode()
+        .unwrap();
+        let gas_limit = 1_000;
+        let fee = 1 + u128::from(gas_limit);
+        let mut deployment = Transaction::new_unsigned(
+            vec![(input, node.public())],
+            vec![TxOutput::spendable(amount - fee, node.public())],
+            fee,
+        );
+        deployment.ovm_action = Some(OvmAction::DeployContract {
+            artifact,
+            gas_limit,
+        });
+        deployment.sign_input(0, &key);
+        let contract_id = oxydome_ovm::contract_id(deployment.txid());
+        let fees = node.state.settled_fee_total(&[deployment.clone()]).unwrap();
+        let rewards = split_fees(fees, &node.params, &node.gov.masters, &[(node.public(), 1)]);
+        let block = node
+            .state
+            .build_block(
+                &node.gov,
+                &node.params,
+                vec![deployment],
+                vec![Operation::Rewards(rewards)],
+                node.public(),
+                1,
+            )
+            .unwrap();
+        let next = node
+            .state
+            .apply_block(&block, &node.gov, &node.params)
+            .unwrap();
+        store
+            .save_version_with_ovm_and_block(
+                next.height,
+                block.hash(),
+                &next.utxo,
+                &ledger_diff(&node.state.utxo, &next.utxo),
+                &next.contracts,
+                &block,
+            )
+            .unwrap();
+
+        let (fresh_node, _) = Node::new(key, &genesis_config, None).unwrap();
+        let restored = fresh_node.restore_from_store(store, None).unwrap();
+        assert_eq!(restored.state.height, 1);
+        assert_eq!(restored.state.block_hash, block.hash());
+        assert_eq!(restored.state.state_root(), next.state_root());
+        assert_eq!(restored.state.contracts, next.contracts);
+        assert!(restored.state.contracts.contains_key(&contract_id));
+        assert_eq!(restored.blocks, vec![genesis, block]);
     }
 }

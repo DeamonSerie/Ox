@@ -48,12 +48,16 @@ pub fn run(blocks: u64, supply: u128, db: Option<String>) -> Result<()> {
         let cert = masters[0]
             .handle_admission(k.public(), root, 0)
             .map_err(anyhow::Error::msg)?;
-        let (node, _genesis) = Node::new(k.clone(), &genesis_cfg, Some(cert))?;
+        let (mut node, _genesis) = Node::new(k.clone(), &genesis_cfg, Some(cert))?;
         let mut store = match &db {
-            Some(base) => LedgerStore::open(std::path::Path::new(&format!("{base}-{i}")))?,
+            Some(base) => {
+                let path = std::path::PathBuf::from(format!("{base}-{i}"));
+                node = node.with_content_store(&path.join("assets"))?;
+                LedgerStore::open(&path)?
+            }
             None => LedgerStore::open_temporary()?,
         };
-        store.init_genesis(genesis.hash(), &node.state.utxo)?;
+        store.init_genesis_with_block(&genesis, &node.state.utxo, &node.state.contracts)?;
         nodes.push(node.with_store(store));
     }
 
@@ -127,7 +131,7 @@ pub fn run(blocks: u64, supply: u128, db: Option<String>) -> Result<()> {
         n.state.block_hash.to_hex(),
         n.state.supply,
         n.state.value_index.to_display(),
-        n.state.utxo_root().to_hex(),
+        n.state.state_root().to_hex(),
     );
     let store = n.store.as_ref().expect("store attached");
     let verified = store.verify_history()?;
@@ -135,13 +139,13 @@ pub fn run(blocks: u64, supply: u128, db: Option<String>) -> Result<()> {
     assert_eq!(
         persisted.root(),
         n.state.utxo_root(),
-        "persisted root must match in-memory state root"
+        "persisted UTXO root must match in-memory UTXO root"
     );
     assert_eq!(persisted.total(), n.state.utxo.total());
     let genesis_root = store.load_ledger(0)?.root();
     assert_eq!(
-        genesis_root, genesis.header.state_root,
-        "height-0 snapshot must match genesis"
+        genesis_root, genesis.header.utxo_root,
+        "height-0 UTXO snapshot must match genesis"
     );
     println!(
         "ledger store: {verified} versions verified through height {}, current root matches in-memory state",

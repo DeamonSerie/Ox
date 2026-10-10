@@ -1087,6 +1087,7 @@ dependencies = [
  "oxydome-wallet",
  "serde",
  "sled",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

@@ -126,6 +126,9 @@ pub mod methods {
     pub const GET_TRANSACTION_BY_HASH: &str = "ox_getTransactionByHash";
     pub const GET_TRANSACTION_RECEIPT: &str = "ox_getTransactionReceipt";
     pub const GET_CODE: &str = "ox_getCode";
+    pub const GET_ASSET_MANIFEST: &str = "ox_getAssetManifest";
+    pub const GET_ASSET: &str = "ox_getAsset";
+    pub const PUT_CONTENT: &str = "ox_putContent";
     pub const CALL: &str = "ox_call";
     pub const ESTIMATE_GAS: &str = "ox_estimateGas";
     pub const GAS_PRICE: &str = "ox_gasPrice";

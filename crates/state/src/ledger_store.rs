@@ -69,6 +69,7 @@ const PREFIX_NODE: u8 = 0u8;
 const PREFIX_SNAPSHOT: u8 = 1u8;
 const PREFIX_DELTA: u8 = 2u8;
 const PREFIX_OVM: u8 = 4u8;
+const PREFIX_BLOCK: u8 = 5u8;
 const KEY_CURRENT: [u8; 1] = [3u8];
 
 fn node_key(hash: &Hash) -> Vec<u8> {
@@ -201,6 +202,32 @@ impl LedgerStore {
             }
             None => Ok(Default::default()),
         }
+    }
+
+    /// Loads every durably stored block in height order.
+    pub fn load_blocks(&self) -> Result<Vec<oxydome_core::Block>, LedgerError> {
+        let mut blocks = Vec::new();
+        for entry in self.tree.scan_prefix(&[PREFIX_BLOCK]) {
+            let (key, value) = entry?;
+            if key.len() != 1 + 8 {
+                return Err(LedgerError::Corrupt("block key length".into()));
+            }
+            let height = u64::from_le_bytes(
+                key[1..]
+                    .try_into()
+                    .map_err(|_| LedgerError::Corrupt("block height key".into()))?,
+            );
+            let block: oxydome_core::Block = Self::decode(&value)?;
+            if block.header.height != height {
+                return Err(LedgerError::Corrupt(format!(
+                    "block height {} stored at {height}",
+                    block.header.height
+                )));
+            }
+            blocks.push(block);
+        }
+        blocks.sort_by_key(|block| block.header.height);
+        Ok(blocks)
     }
 
     fn read_meta(&self, hash: &Hash) -> Result<Option<NodeMeta>, LedgerError> {
@@ -370,6 +397,26 @@ impl LedgerStore {
         self.save_version(0, block_hash, ledger, &delta)
     }
 
+    /// Seeds genesis state and its full block so the chain can be reconstructed after restart.
+    pub fn init_genesis_with_block(
+        &mut self,
+        block: &oxydome_core::Block,
+        ledger: &UtxoLedger,
+        contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+    ) -> Result<(), LedgerError> {
+        if block.header.height != 0 || !block.roots_match() {
+            return Err(LedgerError::Corrupt("invalid genesis block".into()));
+        }
+        if self.current_height()?.is_some() {
+            return Err(LedgerError::Corrupt("genesis already initialized".into()));
+        }
+        let delta = LedgerDelta {
+            spent: Vec::new(),
+            created: ledger.iter().cloned().collect(),
+        };
+        self.save_version_with_ovm_and_block(0, block.hash(), ledger, &delta, contracts, block)
+    }
+
     /// Atomically commits a new ledger version at `height` together with its delta.
     ///
     /// Only nodes not already persisted are written; on-disk nodes are never mutated because
@@ -392,6 +439,36 @@ impl LedgerStore {
         ledger: &UtxoLedger,
         delta: &LedgerDelta,
         contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+    ) -> Result<(), LedgerError> {
+        self.save_version_contents(height, block_hash, ledger, delta, contracts, None)
+    }
+
+    /// Atomically commits UTXO, OVM and block data for a finalized height.
+    pub fn save_version_with_ovm_and_block(
+        &mut self,
+        height: u64,
+        block_hash: Hash,
+        ledger: &UtxoLedger,
+        delta: &LedgerDelta,
+        contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+        block: &oxydome_core::Block,
+    ) -> Result<(), LedgerError> {
+        if block.header.height != height || block.hash() != block_hash {
+            return Err(LedgerError::Corrupt(
+                "block does not match persisted version".into(),
+            ));
+        }
+        self.save_version_contents(height, block_hash, ledger, delta, contracts, Some(block))
+    }
+
+    fn save_version_contents(
+        &mut self,
+        height: u64,
+        block_hash: Hash,
+        ledger: &UtxoLedger,
+        delta: &LedgerDelta,
+        contracts: &std::collections::BTreeMap<Hash, OvmContract>,
+        block: Option<&oxydome_core::Block>,
     ) -> Result<(), LedgerError> {
         self.ensure_seeded()?;
 
@@ -474,6 +551,9 @@ impl LedgerStore {
                 contracts: contracts.clone(),
             })?,
         );
+        if let Some(block) = block {
+            batch.insert(height_key(PREFIX_BLOCK, height), Self::encode(block)?);
+        }
         batch.insert(&KEY_CURRENT, height.to_le_bytes().to_vec());
         self.tree.apply_batch(batch)?;
 

@@ -391,4 +391,37 @@ fn message_wire_round_trips() {
         }
         _ => panic!("wrong message"),
     }
+
+    let content = b"non-consensus app content".to_vec();
+    let msg = Message::StoreContent {
+        hash: oxydome_ovm::content_hash(&content),
+        content: content.clone(),
+    };
+    let bytes = oxydome_net::encode_message(&msg).unwrap();
+    match oxydome_net::decode_message(&bytes).unwrap() {
+        Message::StoreContent {
+            hash,
+            content: data,
+        } => {
+            assert_eq!(hash, oxydome_ovm::content_hash(&content));
+            assert_eq!(data, content);
+        }
+        _ => panic!("wrong message"),
+    }
+
+    let msg = Message::GetContent {
+        hash: oxydome_ovm::content_hash(&content),
+        hops_remaining: 4,
+    };
+    let bytes = oxydome_net::encode_message(&msg).unwrap();
+    match oxydome_net::decode_message(&bytes).unwrap() {
+        Message::GetContent {
+            hash,
+            hops_remaining,
+        } => {
+            assert_eq!(hash, oxydome_ovm::content_hash(&content));
+            assert_eq!(hops_remaining, 4);
+        }
+        _ => panic!("wrong message"),
+    }
 }
