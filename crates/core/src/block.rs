@@ -111,22 +111,12 @@ impl Block {
         merkle_root(&leaves)
     }
 
-    /// Total settled fees, using committed OVM receipts rather than gas-limit escrow.
+    /// Total settled fees. OVM execution is paid in GAS (burned from the caller's balance), so
+    /// the Ox fee is simply the transfer fee and no gas escrow is re-derived here.
     pub fn fee_total(&self) -> Amount {
         self.transactions
             .iter()
-            .map(|tx| {
-                tx.ovm_action.as_ref().map_or(tx.fee, |action| {
-                    let gas_used = self
-                        .ovm_receipts
-                        .iter()
-                        .find(|receipt| receipt.txid == tx.txid())
-                        .map_or(action.gas_limit(), |receipt| receipt.gas_used);
-                    tx.fee
-                        .saturating_sub(u128::from(action.gas_limit()))
-                        .saturating_add(u128::from(gas_used))
-                })
-            })
+            .map(|tx| tx.fee)
             .fold(0u128, |a, b| a.saturating_add(b))
     }
 

@@ -6,7 +6,8 @@
 //! periodic literal deep replay.
 
 use oxydome_core::{
-    Amount, Block, ChainParams, GovernanceSet, Operation, OutPoint, PublicKey, Sig, ValueIndex,
+    conversion_split_with_bps, Amount, Block, ChainParams, GovernanceSet, Operation, OutPoint,
+    PublicKey, Sig, ValueIndex,
 };
 use oxydome_crypto::{hash_value, Hash, SparseProof};
 use oxydome_currency::{
@@ -368,6 +369,29 @@ pub fn header_audit(
             Operation::Gas(gas_operation) => {}
             Operation::PriceChange(_) => {}
         }
+    }
+
+    // When GAS fuel is active, each server reward fractional share is converted: the Ox amount
+    // is burned and an equal amount of GAS is minted (see `apply_rewards` in the state machine).
+    // This shrinks the Ox supply exactly like `next.supply` did before the header was committed,
+    // so the header-only audit mirrors it here.
+    if block.header.height >= ctx.params.gas_activation_height && ctx.params.gas_server_fee_bps > 0 {
+        let gas_minted: Amount = block
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Rewards(r) => Some(
+                    r.node_outputs
+                        .iter()
+                        .map(|output| {
+                            conversion_split_with_bps(output.amount, ctx.params.gas_server_fee_bps).1
+                        })
+                        .fold(0u128, |a, b| a.saturating_add(b)),
+                ),
+                _ => None,
+            })
+            .fold(0u128, |a, b| a.saturating_add(b));
+        supply = supply.saturating_sub(gas_minted);
     }
 
     if supply != block.header.supply {

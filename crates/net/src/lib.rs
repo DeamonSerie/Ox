@@ -43,6 +43,17 @@ pub enum Message {
         nonce: u64,
     },
 
+    // -- chain handshake & validation --
+    Handshake {
+        chain_id: String,
+        version: u32,
+    },
+    HandshakeResponse {
+        accepted: bool,
+        chain_id: String,
+        error: Option<String>,
+    },
+
     // -- admission (node <-> master) --
     AdmitRequest {
         node: PublicKey,
@@ -50,10 +61,14 @@ pub enum Message {
         manifest: CodeManifest,
         nonce: u64,
         timestamp: u64,
+        #[serde(default)]
+        chain_id: Option<String>,
     },
     AdmitResponse {
         certificate: Option<Box<AdmissionCertificate>>,
         reason: Option<String>,
+        #[serde(default)]
+        chain_id: Option<String>,
     },
     ManifestsResponse {
         approved: Vec<Hash>,
@@ -517,5 +532,45 @@ pub async fn serve_ping(stream: &mut TcpStream, msg: &Message) -> Result<bool, N
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+/// Validates that an incoming peer's chain ID matches local chain ID.
+pub fn validate_chain_handshake(local_chain_id: &str, peer_chain_id: &str) -> Result<(), NetError> {
+    if local_chain_id == peer_chain_id {
+        Ok(())
+    } else {
+        Err(NetError::Unexpected(format!(
+            "peer chain mismatch: local is '{}', peer is '{}'",
+            local_chain_id, peer_chain_id
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_chain_handshake() {
+        assert!(validate_chain_handshake("mychain-mygas-1234", "mychain-mygas-1234").is_ok());
+        assert!(validate_chain_handshake("mychain-mygas-1234", "otherchain-ox-5678").is_err());
+    }
+
+    #[test]
+    fn test_handshake_message_serde() {
+        let msg = Message::Handshake {
+            chain_id: "testchain-tox-123".to_string(),
+            version: 1,
+        };
+        let encoded = bincode::serialize(&msg).expect("serialize");
+        let decoded: Message = bincode::deserialize(&encoded).expect("deserialize");
+        match decoded {
+            Message::Handshake { chain_id, version } => {
+                assert_eq!(chain_id, "testchain-tox-123");
+                assert_eq!(version, 1);
+            }
+            _ => panic!("wrong message variant"),
+        }
     }
 }

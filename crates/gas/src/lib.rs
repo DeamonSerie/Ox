@@ -6,6 +6,13 @@
 //! The airdrop amount is a basis-point share of the current GAS supply, scaled by the on-chain
 //! Ox price oracle: `gas_supply * airdrop_base_bps / 10_000 * ox_price / price_reference`.
 
+pub mod renaming;
+
+pub use renaming::{
+    address_prefix_for_symbol, format_currency, format_gas_currency, scale_currency_amount,
+    validate_currency_symbol,
+};
+
 use oxydome_core::{Amount, PublicKey, GAS_BPS_DENOMINATOR};
 use std::collections::BTreeMap;
 

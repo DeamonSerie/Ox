@@ -40,29 +40,51 @@ async fn handle_connection(
                 manifest_root,
                 manifest,
                 timestamp,
+                chain_id: req_chain_id,
                 ..
             } => {
-                let computed = manifest.root();
-                if computed != manifest_root {
+                let (local_chain_id, mismatch) = {
+                    let guard = node.lock().unwrap();
+                    let local_id = crate::mvms::compute_chain_id(&guard.params.chain_name, &guard.params.currency_symbol);
+                    let mismatch = req_chain_id
+                        .as_ref()
+                        .map(|id| id != &local_id)
+                        .unwrap_or(false);
+                    (local_id, mismatch)
+                };
+
+                if mismatch {
                     Some(Message::AdmitResponse {
                         certificate: None,
-                        reason: Some("manifest root does not match submitted manifest".into()),
+                        reason: Some("chain_id does not match master chain".into()),
+                        chain_id: Some(local_chain_id),
                     })
                 } else {
-                    let result = {
-                        let mut guard = node.lock().unwrap();
-                        guard.handle_admission(requester, manifest_root, timestamp)
-                    };
-                    Some(match result {
-                        Ok(cert) => Message::AdmitResponse {
-                            certificate: Some(Box::new(cert)),
-                            reason: None,
-                        },
-                        Err(reason) => Message::AdmitResponse {
+                    let computed = manifest.root();
+                    if computed != manifest_root {
+                        Some(Message::AdmitResponse {
                             certificate: None,
-                            reason: Some(reason),
-                        },
-                    })
+                            reason: Some("manifest root does not match submitted manifest".into()),
+                            chain_id: Some(local_chain_id),
+                        })
+                    } else {
+                        let result = {
+                            let mut guard = node.lock().unwrap();
+                            guard.handle_admission(requester, manifest_root, timestamp)
+                        };
+                        Some(match result {
+                            Ok(cert) => Message::AdmitResponse {
+                                certificate: Some(Box::new(cert)),
+                                reason: None,
+                                chain_id: Some(local_chain_id),
+                            },
+                            Err(reason) => Message::AdmitResponse {
+                                certificate: None,
+                                reason: Some(reason),
+                                chain_id: Some(local_chain_id),
+                            },
+                        })
+                    }
                 }
             }
             // Masters serve header metadata only, never block bodies.

@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 /// Rationals are expressed as numerator/denominator pairs. Basis points are `value / 10_000`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainParams {
+    /// Human-readable chain name (defaults to "Ox").
+    #[serde(default = "default_chain_name")]
+    pub chain_name: String,
+    /// Currency symbol token (defaults to "OX").
+    #[serde(default = "default_currency_symbol")]
+    pub currency_symbol: String,
+
     // ---- supply and windows ----
     /// Total Ox created at genesis and distributed to genesis accounts.
     pub genesis_supply: Amount,
@@ -110,6 +117,14 @@ pub airdrop_base_bps: u32,
     pub base_fee: Amount,
 }
 
+fn default_chain_name() -> String {
+    "Ox".to_string()
+}
+
+fn default_currency_symbol() -> String {
+    "OX".to_string()
+}
+
 fn default_ovm_activation_height() -> u64 {
     1
 }
@@ -164,6 +179,8 @@ impl ChainParams {
     /// Sensible local-network defaults.
     pub fn default_local() -> Self {
         ChainParams {
+            chain_name: default_chain_name(),
+            currency_symbol: default_currency_symbol(),
             genesis_supply: 1_000_000_000,
             block_window: 100,
             rebound_lock_blocks: 100,

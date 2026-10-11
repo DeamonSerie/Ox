@@ -162,6 +162,10 @@ pub struct ChainState {
     pub price_update_height: u64,
     /// Last height at which the GAS price was updated.
     pub price_last_update_height: u64,
+    /// Human-readable chain name.
+    pub chain_name: String,
+    /// Currency symbol token.
+    pub currency_symbol: String,
 }
 
 impl ChainState {
@@ -179,7 +183,11 @@ impl ChainState {
                 config.params.genesis_supply,
             ));
         }
-        let coinbase_id = hash_value(&config.allocations);
+        let coinbase_id = if config.params.chain_name == "Ox" {
+            hash_value(&config.allocations)
+        } else {
+            hash_value(&(config.params.chain_name.as_str(), &config.allocations))
+        };
         let utxo =
             UtxoLedger::from_entries(config.allocations.iter().enumerate().map(|(i, alloc)| {
                 let outpoint = OutPoint::new(coinbase_id, i as u32);
@@ -232,6 +240,8 @@ impl ChainState {
             last_airdrop_height: 0,
             price_update_height: config.params.price_update_height,
             price_last_update_height: 0,
+            chain_name: config.params.chain_name.clone(),
+            currency_symbol: config.params.currency_symbol.clone(),
         };
         let gov = GovernanceSet::new(config.masters.clone(), config.nodes.clone());
         Ok((state, block, gov))
@@ -288,7 +298,7 @@ impl ChainState {
     }
 
     /// Mints `amount` GAS to `owner`, increasing the circulating GAS supply.
-    fn mint_gas(&mut self, owner: PublicKey, amount: Amount) {
+    pub fn mint_gas(&mut self, owner: PublicKey, amount: Amount) {
         if amount == 0 {
             return;
         }
@@ -392,7 +402,8 @@ impl ChainState {
                     .ok_or(StateError::OvmBlockGasLimit)?;
                 let required = oxydome_core::transfer_fee(&tx.outputs)
                     .map_err(|error| StateError::BadTransaction(tx_index, error.to_string()))?;
-                if tx.fee != required {
+                let legacy_required = required.saturating_add(u128::from(action.gas_limit()));
+                if tx.fee != required && tx.fee != legacy_required {
                     return Err(StateError::BadTransaction(
                         tx_index,
                         "fee does not equal the transfer fee".into(),
@@ -480,7 +491,8 @@ impl ChainState {
                 }
                 let expected_fee = oxydome_core::transfer_fee(&tx.outputs)
                     .map_err(|error| StateError::BadTransaction(tx_idx, error.to_string()))?;
-                if tx.fee != expected_fee {
+                let legacy_expected_fee = expected_fee.saturating_add(u128::from(action.gas_limit()));
+                if tx.fee != expected_fee && tx.fee != legacy_expected_fee {
                     return Err(StateError::BadTransaction(
                         tx_idx,
                         "fee does not equal the transfer fee".into(),

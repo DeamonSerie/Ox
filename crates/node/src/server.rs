@@ -447,6 +447,7 @@ async fn handle_connection(
             Message::AdmitResponse {
                 certificate,
                 reason,
+                ..
             } => {
                 if let Some(cert) = certificate {
                     let mut guard = node.lock().unwrap();
@@ -522,6 +523,7 @@ pub async fn request_admission(
             manifest,
             nonce: timestamp,
             timestamp,
+            chain_id: None,
         },
     )
     .await
@@ -531,6 +533,7 @@ pub async fn request_admission(
             Ok(Message::AdmitResponse {
                 certificate,
                 reason,
+                ..
             }) => {
                 if let Some(reason) = reason {
                     eprintln!("admission rejected: {reason}");
@@ -591,7 +594,8 @@ mod tests {
         oxydome_crypto::KeyPair,
         tempfile::TempDir,
     ) {
-        let config = crate::default_config(1, 1, 100_000);
+        let mut config = crate::default_config(1, 1, 100_000);
+        config.params.gas_activation_height = u64::MAX;
         let genesis = config.genesis().unwrap();
         let node_key = config.nodes[0].keypair().unwrap();
         let follower_key = config.nodes[0].keypair().unwrap();

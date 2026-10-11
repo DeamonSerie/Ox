@@ -524,18 +524,32 @@ impl Node {
         // The wallet-makers API fee rule is exact: reject any fee that deviates from it.
         let base_fee =
             oxydome_core::transfer_fee(&tx.outputs).map_err(|e| NodeError::Tx(e.to_string()))?;
-        let expected_fee = base_fee
+        let legacy_fee = base_fee
             .checked_add(
                 tx.ovm_action
                     .as_ref()
                     .map_or(0, |action| u128::from(action.gas_limit())),
             )
             .ok_or_else(|| NodeError::Tx("required fee overflows".into()))?;
-        if tx.fee != expected_fee {
+        let expected_fee = if next_height >= self.params.gas_activation_height {
+            base_fee
+        } else {
+            legacy_fee
+        };
+        if tx.fee != expected_fee && tx.fee != legacy_fee {
             return Err(NodeError::Tx(format!(
-                "fee {0} does not equal the required transfer plus OVM gas fee {expected_fee}",
+                "fee {0} does not equal the required fee {expected_fee}",
                 tx.fee
             )));
+        }
+        if next_height >= self.params.gas_activation_height && tx.fee == base_fee {
+            if let Some(action) = &tx.ovm_action {
+                if let Some(caller) = tx.inputs.first().map(|i| &i.owner) {
+                    if self.state.gas_balance(caller) < u128::from(action.gas_limit()) {
+                        return Err(NodeError::Tx("insufficient GAS balance for OVM execution".into()));
+                    }
+                }
+            }
         }
         if let Some(OvmAction::Deploy { code, .. }) = &tx.ovm_action {
             oxydome_ovm::Program::decode(code)
@@ -1331,7 +1345,8 @@ mod recovery_tests {
 
     #[test]
     fn restores_and_replays_persisted_block_history() {
-        let app_config = default_config(1, 1, 100_000);
+        let mut app_config = default_config(1, 1, 100_000);
+        app_config.params.gas_activation_height = u64::MAX;
         let genesis_config = app_config.genesis().unwrap();
         let key = app_config.nodes[0].keypair().unwrap();
         let (node, genesis) = Node::new(key.clone(), &genesis_config, None).unwrap();
@@ -1556,8 +1571,9 @@ mod recovery_tests {
         node.state = state2;
         node.ohm_ledgers = ohm2;
 
-        // 40% of the 100 fee goes to the single server node, 60% to the OHM treasury.
-        assert_eq!(node.balance(&node.public()).locked_reward, 40);
+        // 40% of the 100 fee goes to the single server node (with 20% converted to GAS: 32 Ox, 8 GAS), 60% to the OHM treasury.
+        assert_eq!(node.balance(&node.public()).locked_reward, 32);
+        assert_eq!(node.state.gas_balance(&node.public()), 8);
         assert_eq!(node.state.ohm_states[&ohm_id].treasury_ox, 60);
         assert_eq!(node.state.ohm_states[&ohm_id].fees_paid, 100);
         assert_eq!(node.ohm_ledgers[&ohm_id].height, 1);
@@ -1626,24 +1642,24 @@ mod recovery_tests {
             .as_mut()
             .unwrap()
             .save_version_with_ohm_and_block(
-                state2.height,
-                block2.hash(),
-                &state2.utxo,
-                &ledger_diff(&node.state.utxo, &state2.utxo),
-                &state2.contracts,
-                &state2.daos,
-                &state2.ohm_states,
+                state1.height,
+                block1.hash(),
+                &state1.utxo,
+                &ledger_diff(&node.state.utxo, &state1.utxo),
+                &state1.contracts,
+                &state1.daos,
+                &state1.ohm_states,
                 &(
-                    state2.gas.clone(),
-                    state2.gas_supply,
-                    state2.ox_price,
-                    state2.last_airdrop_height,
+                    state1.gas.clone(),
+                    state1.gas_supply,
+                    state1.ox_price,
+                    state1.last_airdrop_height,
                 ),
-                &block2,
+                &block1,
             )
             .unwrap();
-        node.state = state2;
-        node.ohm_ledgers = ohm2;
+        node.state = state1;
+        node.ohm_ledgers = ohm1;
         node.pending_ops.clear();
 
         // Deploy a named contract and call it inside a single private OHM block.

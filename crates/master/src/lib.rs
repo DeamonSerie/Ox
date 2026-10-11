@@ -6,7 +6,12 @@
 //! governance set, and audit each proposed block through Merkle proofs supplied by the
 //! proposer.
 
+pub mod mvms;
+pub mod mvms_config;
 pub mod server;
+
+pub use mvms::{compute_chain_id, MvmsMaster};
+pub use mvms_config::{MvmsBuilder, MvmsConfig, MvmsError, MvmsResult};
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

@@ -237,7 +237,19 @@ fn end_to_end_blocks_and_governance() {
     let b1 = advance(&mut w, 1, vec![tx], vec![]);
     assert_eq!(b1.header.tx_count, 1);
     assert_consistent(&w);
-    assert_eq!(w.nodes[0].state.supply, SUPPLY, "fees do not change supply");
+    // The GAS model converts `gas_server_fee_bps` of each server reward: that Ox is burned and
+    // an equal amount of GAS is minted, so a fee-bearing block shrinks the Ox supply by exactly
+    // the GAS minted (the master audit recomputes this same figure).
+    let supply_after_fees = w.nodes[0].state.supply;
+    assert!(
+        supply_after_fees < SUPPLY,
+        "GAS conversion burns a share of server fees"
+    );
+    assert_eq!(
+        w.nodes[0].state.gas_supply,
+        SUPPLY - supply_after_fees,
+        "burned Ox must equal minted GAS"
+    );
 
     // ---- Block 2: governed mint. ----
     let mint_amount = 5_000u128;
@@ -247,7 +259,10 @@ fn end_to_end_blocks_and_governance() {
     }
     advance(&mut w, 2, vec![], vec![Operation::Mint(mint)]);
     assert_consistent(&w);
-    assert_eq!(w.nodes[0].state.supply, SUPPLY + mint_amount);
+    assert_eq!(
+        w.nodes[0].state.supply,
+        supply_after_fees + mint_amount
+    );
     assert_eq!(w.nodes[0].state.epoch_minted, mint_amount);
 
     // ---- Block 3: governed burn from the user's change output. ----
@@ -259,7 +274,10 @@ fn end_to_end_blocks_and_governance() {
     }
     advance(&mut w, 3, vec![], vec![Operation::Burn(burn)]);
     assert_consistent(&w);
-    assert_eq!(w.nodes[0].state.supply, SUPPLY + mint_amount - burn_amount);
+    assert_eq!(
+        w.nodes[0].state.supply,
+        supply_after_fees + mint_amount - burn_amount
+    );
 
     // ---- Block 4: governed node withdrawal of locked fee earnings. ----
     let (node_index, locked_input, locked_amount) = find_locked_reward(&w).unwrap();
