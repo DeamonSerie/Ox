@@ -6,6 +6,7 @@ members = [
     "crates/currency",
     "crates/state",
     "crates/ohm",
+    "crates/gas",
     "crates/treasury",
     "crates/rewards",
     "crates/audit",
@@ -35,6 +36,7 @@ oxydome-core = { path = "crates/core" }
 oxydome-currency = { path = "crates/currency" }
 oxydome-state = { path = "crates/state" }
 oxydome-ohm = { path = "crates/ohm" }
+oxydome-gas = { path = "crates/gas" }
 oxydome-treasury = { path = "crates/treasury" }
 oxydome-rewards = { path = "crates/rewards" }
 oxydome-audit = { path = "crates/audit" }

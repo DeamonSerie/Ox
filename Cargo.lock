@@ -1032,12 +1032,15 @@ dependencies = [
  "oxydome-core",
  "oxydome-crypto",
  "oxydome-currency",
+ "oxydome-gas",
  "oxydome-net",
  "oxydome-state",
  "oxydome-treasury",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
+ "toml",
 ]
 
 [[package]]
