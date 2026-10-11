@@ -1,9 +1,10 @@
 //! The node-side OHM ledger: private UTXO state re-derived from anchored [`OhmBlock`]s.
 
 use crate::{
-    ohm_cross_msg_id, ohm_genesis_hash, ohm_state_root_full, Amount, Hash, InboundReceipt,
-    OhmBlock, OhmContract, OhmInput, OhmOutput, OhmTransaction, OhmUtxoEntry, OutboundMessage,
-    OutPoint, PublicKey, reply_arguments,
+    ohm_cross_msg_id, ohm_genesis_hash, ohm_state_root_full, Amount, CrossBurnCall,
+    CrossTransferCall, Hash, InboundReceipt, OhmBlock, OhmContract, OhmInput, OhmOutput,
+    OhmTransaction, OhmUtxoEntry, OutboundMessage, OutPoint, PublicKey, TransferPayload,
+    reply_arguments,
 };
 use oxydome_core::{CrossRecvCall, CrossSendCall, OvmAction, OvmFailureCode};
 use oxydome_crypto::KeyPair;
@@ -79,6 +80,7 @@ fn enqueue_staged_calls(
                 reply_contract: None,
                 reply_entry_selector: None,
                 reply_to_msg_id: None,
+                transfer: None,
             },
         );
     }
@@ -152,6 +154,20 @@ pub enum OhmError {
     CrossMessageWrongTarget(Hash),
     #[error("cross-chain message is invalid: {0}")]
     CrossChain(String),
+    #[error("cross-chain transfer cannot target its own OHM")]
+    TransferSelfTarget,
+    #[error("cross-chain transfer amount exceeds the available balance")]
+    TransferInsufficientBalance,
+    #[error("cross-chain burn amount exceeds the minted balance")]
+    BurnInsufficientBalance,
+    #[error("cross-chain transfer has an invalid recipient")]
+    TransferInvalidRecipient,
+    #[error("cross-chain burn has an invalid source OHM")]
+    BurnInvalidSource,
+    #[error("cross-chain transfer output is already locked")]
+    TransferAlreadyLocked,
+    #[error("cross-chain unlock has no matching locked output")]
+    UnlockNoMatch,
 }
 
 /// A read-only view over other OHMs' *committed* outboxes, used to verify and execute inbound
@@ -211,6 +227,8 @@ struct LedgerDelta {
     outbox_seq: u64,
     supply: Amount,
     fee_total: Amount,
+    locked_total: Amount,
+    minted: BTreeMap<Hash, Amount>,
 }
 
 /// A node's private view of a single OHM chain, re-derived from its blocks.
@@ -232,6 +250,10 @@ pub struct OhmLedger {
     pub inbox: BTreeMap<Hash, InboundReceipt>,
     /// Next per-source sequence number for outbound messages.
     outbox_seq: u64,
+    /// Total amount currently locked in the cross-chain bridge escrow.
+    pub locked_total: Amount,
+    /// Wrapped assets minted by cross-chain transfers, keyed by source OHM id.
+    pub minted: BTreeMap<Hash, Amount>,
     blocks: Vec<OhmBlock>,
     roots: BTreeMap<u64, Hash>,
 }
@@ -274,6 +296,8 @@ impl OhmLedger {
             outbox,
             inbox,
             outbox_seq: 0,
+            locked_total: 0,
+            minted: BTreeMap::new(),
             blocks: Vec::new(),
             roots,
         }
@@ -358,6 +382,8 @@ impl OhmLedger {
         self.inbox = delta.inbox;
         self.outbox_seq = delta.outbox_seq;
         self.supply = delta.supply;
+        self.locked_total = delta.locked_total;
+        self.minted = delta.minted;
         self.height = block.header.height;
         self.block_hash = block.hash();
         self.state_root = root;
@@ -468,6 +494,34 @@ impl OhmLedger {
         self.build_action_transaction(inputs, outputs, fee, None, None, Some(call), key)
     }
 
+    /// Builds and signs an OHM transaction initiating a cross-chain asset transfer.
+    pub fn build_cross_transfer_transaction(
+        &self,
+        inputs: Vec<(OutPoint, PublicKey)>,
+        outputs: Vec<OhmOutput>,
+        fee: Amount,
+        call: CrossTransferCall,
+        key: &KeyPair,
+    ) -> OhmTransaction {
+        let mut tx = self.build_action_transaction(inputs, outputs, fee, None, None, None, key);
+        tx.cross_transfer = Some(call);
+        tx
+    }
+
+    /// Builds and signs an OHM transaction burning wrapped cross-chain assets.
+    pub fn build_cross_burn_transaction(
+        &self,
+        inputs: Vec<(OutPoint, PublicKey)>,
+        outputs: Vec<OhmOutput>,
+        fee: Amount,
+        call: CrossBurnCall,
+        key: &KeyPair,
+    ) -> OhmTransaction {
+        let mut tx = self.build_action_transaction(inputs, outputs, fee, None, None, None, key);
+        tx.cross_burn = Some(call);
+        tx
+    }
+
     fn build_action_transaction(
         &self,
         inputs: Vec<(OutPoint, PublicKey)>,
@@ -492,6 +546,8 @@ impl OhmLedger {
             ovm_action,
             cross_send,
             cross_recv,
+            cross_transfer: None,
+            cross_burn: None,
         };
         tx.sign_owned_inputs(key);
         tx
@@ -607,6 +663,8 @@ impl OhmLedger {
         let mut inbox = self.inbox.clone();
         let mut outbox_seq = self.outbox_seq;
         let mut fee_total: Amount = 0;
+        let mut locked_total = self.locked_total;
+        let mut minted = self.minted.clone();
         for (index, tx) in transactions.iter().enumerate() {
             tx.validate_structure()
                 .map_err(|e| OhmError::BadTransaction(index, e))?;
@@ -619,6 +677,12 @@ impl OhmLedger {
                     .ok_or(OhmError::MissingInput(input.prev_out))?;
                 if entry.output.recipient != input.owner {
                     return Err(OhmError::InputOwnerMismatch(input.prev_out));
+                }
+                if entry.output.lock {
+                    return Err(OhmError::BadTransaction(
+                        index,
+                        "cannot spend a locked output".into(),
+                    ));
                 }
                 input_total = input_total
                     .checked_add(entry.output.amount)
@@ -659,6 +723,31 @@ impl OhmLedger {
                     &mut outbox,
                     &mut outbox_seq,
                     &mut inbox,
+                    &mut minted,
+                    &mut locked_total,
+                    &mut utxos,
+                )?;
+            }
+            if let Some(call) = &tx.cross_transfer {
+                self.apply_cross_transfer(
+                    call,
+                    tx,
+                    index,
+                    &mut utxos,
+                    &mut outbox,
+                    &mut outbox_seq,
+                    &mut locked_total,
+                )?;
+            }
+            if let Some(call) = &tx.cross_burn {
+                self.apply_cross_burn(
+                    call,
+                    tx,
+                    index,
+                    &mut utxos,
+                    &mut outbox,
+                    &mut outbox_seq,
+                    &mut minted,
                 )?;
             }
             for (out_index, output) in tx.outputs.iter().enumerate() {
@@ -680,6 +769,8 @@ impl OhmLedger {
             outbox_seq,
             supply,
             fee_total,
+            locked_total,
+            minted,
         })
     }
 
@@ -717,14 +808,157 @@ impl OhmLedger {
                 .as_ref()
                 .map(|name| oxydome_ovm::fn_selector(name)),
             reply_to_msg_id: None,
+            transfer: None,
         };
         outbox.insert(msg_id, message);
+        Ok(())
+    }
+
+    /// Locks assets into the cross-chain bridge escrow and enqueues a transfer message.
+    ///
+    /// The transfer amount is moved from the transaction's inputs into a locked escrow output
+    /// owned by the bridge module. An `OutboundMessage` with `transfer` metadata is enqueued
+    /// so the target OHM can mint the wrapped asset.
+    fn apply_cross_transfer(
+        &self,
+        call: &CrossTransferCall,
+        tx: &OhmTransaction,
+        tx_index: usize,
+        utxos: &mut BTreeMap<Hash, OhmUtxoEntry>,
+        outbox: &mut BTreeMap<Hash, OutboundMessage>,
+        outbox_seq: &mut u64,
+        locked_total: &mut Amount,
+    ) -> Result<(), OhmError> {
+        if call.target_ohm == self.ohm_id {
+            return Err(OhmError::TransferSelfTarget);
+        }
+        if call.amount == 0 {
+            return Err(OhmError::BadTransaction(
+                tx_index,
+                "cross-chain transfer has a zero amount".into(),
+            ));
+        }
+        let txid = tx.txid();
+        let seq = *outbox_seq;
+        *outbox_seq = outbox_seq.checked_add(1).ok_or(OhmError::Overflow)?;
+        let msg_id = ohm_cross_msg_id(&self.ohm_id, self.height + 1, seq);
+        let message = OutboundMessage {
+            msg_id,
+            source_ohm: self.ohm_id,
+            source_height: self.height + 1,
+            seq,
+            caller: tx.inputs[0].owner,
+            target_ohm: call.target_ohm,
+            target_contract: Hash::zero(),
+            entry_selector: 0,
+            arguments: Vec::new(),
+            gas_limit: 0,
+            want_reply: false,
+            reply_contract: None,
+            reply_entry_selector: None,
+            reply_to_msg_id: None,
+            transfer: Some(TransferPayload {
+                amount: call.amount,
+                recipient: Some(call.recipient),
+            }),
+        };
+        outbox.insert(msg_id, message);
+        let escrow_outpoint = OutPoint::new(txid, 0);
+        let escrow_key = escrow_outpoint.key();
+        let escrow_output = OhmOutput {
+            amount: call.amount,
+            recipient: call.recipient,
+            lock: true,
+        };
+        utxos.insert(
+            escrow_key,
+            OhmUtxoEntry::new(escrow_outpoint, escrow_output, self.height + 1),
+        );
+        *locked_total = locked_total
+            .checked_add(call.amount)
+            .ok_or(OhmError::Overflow)?;
+        Ok(())
+    }
+
+    /// Burns wrapped assets and enqueues a burn message to unlock the source escrow.
+    ///
+    /// The burn amount is deducted from the minted balance for `source_ohm`. An `OutboundMessage`
+    /// with `transfer` metadata is enqueued so the source OHM can unlock the original escrow.
+    fn apply_cross_burn(
+        &self,
+        call: &CrossBurnCall,
+        tx: &OhmTransaction,
+        tx_index: usize,
+        utxos: &mut BTreeMap<Hash, OhmUtxoEntry>,
+        outbox: &mut BTreeMap<Hash, OutboundMessage>,
+        outbox_seq: &mut u64,
+        minted: &mut BTreeMap<Hash, Amount>,
+    ) -> Result<(), OhmError> {
+        if call.source_ohm == self.ohm_id {
+            return Err(OhmError::BurnInvalidSource);
+        }
+        if call.amount == 0 {
+            return Err(OhmError::BadTransaction(
+                tx_index,
+                "cross-chain burn has a zero amount".into(),
+            ));
+        }
+        let minted_amount = minted.get(&call.source_ohm).copied().unwrap_or(0);
+        if call.amount > minted_amount {
+            return Err(OhmError::BurnInsufficientBalance);
+        }
+        let txid = tx.txid();
+        let seq = *outbox_seq;
+        *outbox_seq = outbox_seq.checked_add(1).ok_or(OhmError::Overflow)?;
+        let msg_id = ohm_cross_msg_id(&self.ohm_id, self.height + 1, seq);
+        let message = OutboundMessage {
+            msg_id,
+            source_ohm: self.ohm_id,
+            source_height: self.height + 1,
+            seq,
+            caller: tx.inputs[0].owner,
+            target_ohm: call.source_ohm,
+            target_contract: Hash::zero(),
+            entry_selector: 0,
+            arguments: Vec::new(),
+            gas_limit: 0,
+            want_reply: false,
+            reply_contract: None,
+            reply_entry_selector: None,
+            reply_to_msg_id: None,
+            transfer: Some(TransferPayload {
+                amount: call.amount,
+                recipient: None,
+            }),
+        };
+        outbox.insert(msg_id, message);
+        let new_minted = minted_amount - call.amount;
+        if new_minted == 0 {
+            minted.remove(&call.source_ohm);
+        } else {
+            minted.insert(call.source_ohm, new_minted);
+        }
+        let burn_outpoint = OutPoint::new(txid, 0);
+        let burn_key = burn_outpoint.key();
+        let burn_output = OhmOutput {
+            amount: call.amount,
+            recipient: tx.inputs[0].owner,
+            lock: false,
+        };
+        utxos.insert(
+            burn_key,
+            OhmUtxoEntry::new(burn_outpoint, burn_output, self.height + 1),
+        );
         Ok(())
     }
 
     /// Consumes an inbound cross-chain message: verifies it against the committed source outbox,
     /// deterministically executes the target entry point and records a receipt. When the message
     /// requested a reply, auto-enqueues the reply into this ledger's outbox.
+    ///
+    /// For transfer messages (with `transfer` metadata), mints the wrapped asset to the specified
+    /// recipient. For burn messages, unlocks the corresponding escrow output.
+    #[allow(clippy::too_many_arguments)]
     fn apply_cross_recv(
         consumer: &Hash,
         processed_height: u64,
@@ -734,6 +968,9 @@ impl OhmLedger {
         outbox: &mut BTreeMap<Hash, OutboundMessage>,
         outbox_seq: &mut u64,
         inbox: &mut BTreeMap<Hash, InboundReceipt>,
+        minted: &mut BTreeMap<Hash, Amount>,
+        locked_total: &mut Amount,
+        utxos: &mut BTreeMap<Hash, OhmUtxoEntry>,
     ) -> Result<(), OhmError> {
         let view = view.ok_or(OhmError::CrossViewMissing)?;
         let message = view
@@ -745,6 +982,20 @@ impl OhmLedger {
         }
         if inbox.contains_key(&call.msg_id) {
             return Err(OhmError::CrossMessageDuplicate(call.msg_id));
+        }
+
+        if let Some(transfer) = &message.transfer {
+            return Self::apply_transfer_recv(
+                consumer,
+                processed_height,
+                call,
+                &message,
+                transfer,
+                inbox,
+                minted,
+                locked_total,
+                utxos,
+            );
         }
 
         let mut failure: Option<OvmFailureCode> = None;
@@ -826,6 +1077,7 @@ impl OhmLedger {
                 reply_contract: None,
                 reply_entry_selector: None,
                 reply_to_msg_id: Some(call.msg_id),
+                transfer: None,
             };
             outbox.insert(reply_id, reply);
             reply_msg_id = Some(reply_id);
@@ -844,6 +1096,86 @@ impl OhmLedger {
                 reply_to_msg_id: message.reply_to_msg_id,
             },
         );
+        Ok(())
+    }
+
+    /// Handles a cross-chain transfer or burn message: mints wrapped assets on the target OHM or
+    /// unlocks escrow on the source OHM.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_transfer_recv(
+        consumer: &Hash,
+        processed_height: u64,
+        call: &CrossRecvCall,
+        message: &OutboundMessage,
+        transfer: &TransferPayload,
+        inbox: &mut BTreeMap<Hash, InboundReceipt>,
+        minted: &mut BTreeMap<Hash, Amount>,
+        locked_total: &mut Amount,
+        utxos: &mut BTreeMap<Hash, OhmUtxoEntry>,
+    ) -> Result<(), OhmError> {
+        if let Some(recipient) = transfer.recipient {
+            let current_minted = minted.get(&message.source_ohm).copied().unwrap_or(0);
+            let new_minted = current_minted
+                .checked_add(transfer.amount)
+                .ok_or(OhmError::Overflow)?;
+            minted.insert(message.source_ohm, new_minted);
+            let mint_outpoint = OutPoint::new(call.msg_id, 0);
+            let mint_output = OhmOutput {
+                amount: transfer.amount,
+                recipient,
+                lock: false,
+            };
+            utxos.insert(
+                mint_outpoint.key(),
+                OhmUtxoEntry::new(mint_outpoint, mint_output, processed_height),
+            );
+            inbox.insert(
+                call.msg_id,
+                InboundReceipt {
+                    msg_id: call.msg_id,
+                    origin: message.source_ohm,
+                    origin_height: message.source_height,
+                    processed_height,
+                    failure: None,
+                    return_value: None,
+                    reply_msg_id: None,
+                    reply_to_msg_id: None,
+                },
+            );
+        } else {
+            if consumer != &message.source_ohm {
+                return Err(OhmError::CrossChain(
+                    "burn message can only be consumed by the source OHM".into(),
+                ));
+            }
+            let mut unlocked = false;
+            for entry in utxos.values_mut() {
+                if entry.output.lock && entry.output.amount == transfer.amount {
+                    entry.output.lock = false;
+                    unlocked = true;
+                    break;
+                }
+            }
+            if !unlocked {
+                return Err(OhmError::UnlockNoMatch);
+            }
+            *locked_total = locked_total
+                .checked_sub(transfer.amount)
+                .ok_or(OhmError::Underflow)?;
+            inbox.insert(
+                call.msg_id,
+                InboundReceipt {
+                    msg_id: call.msg_id,
+                    origin: message.source_ohm,
+                    origin_height: message.source_height,
+                    processed_height,
+                    failure: None,
+                    return_value: None,
+                    reply_msg_id: None,
+                    reply_to_msg_id: None,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -1164,6 +1496,7 @@ mod tests {
             .map(|_| OhmOutput {
                 amount: per,
                 recipient: owner,
+            lock: false,
             })
             .collect();
         OhmLedger::from_genesis(
@@ -1183,6 +1516,7 @@ mod tests {
             &[OhmOutput {
                 amount: pool,
                 recipient: owner,
+            lock: false,
             }],
             Hash::from([8u8; 64]),
         )
@@ -1208,6 +1542,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 990,
                 recipient: owner,
+            lock: false,
             }],
             10,
             &key(),
@@ -1231,6 +1566,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             100,
             &key(),
@@ -1255,6 +1591,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
+            lock: false,
             }],
             100,
             &key(),
@@ -1264,6 +1601,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
+            lock: false,
             }],
             100,
             &key(),
@@ -1322,6 +1660,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::Deploy {
@@ -1336,6 +1675,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 800,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::Call {
@@ -1373,6 +1713,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::Deploy {
@@ -1423,6 +1764,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -1520,6 +1862,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             100,
             CrossSendCall {
@@ -1570,6 +1913,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -1590,6 +1934,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -1615,6 +1960,7 @@ mod tests {
                     vec![OhmOutput {
                         amount: 800,
                         recipient: owner,
+                        lock: false,
                     }],
                     100,
                     CrossSendCall {
@@ -1648,6 +1994,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 800,
                 recipient: owner,
+            lock: false,
             }],
             100,
             CrossRecvCall { msg_id: msg.msg_id },
@@ -1692,6 +2039,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 700,
                 recipient: owner,
+            lock: false,
             }],
             100,
             CrossRecvCall { msg_id: reply_msg.msg_id },
@@ -1724,6 +2072,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             100,
             CrossRecvCall {
@@ -1744,6 +2093,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -1774,6 +2124,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             reply_contract: None,
             reply_entry_selector: None,
             reply_to_msg_id: None,
+            transfer: None,
         };
         let mut view = CrossChainView::new();
         view.insert(other.ohm_id, BTreeMap::from([(msg_id, message)]));
@@ -1783,6 +2134,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 800,
                 recipient: owner,
+            lock: false,
             }],
             100,
             CrossRecvCall { msg_id },
@@ -1805,6 +2157,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -1826,6 +2179,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
                     vec![OhmOutput {
                         amount: 900,
                         recipient: owner,
+                        lock: false,
                     }],
                     100,
                     CrossSendCall {
@@ -1858,6 +2212,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
                     vec![OhmOutput {
                         amount: 800,
                         recipient: owner,
+                        lock: false,
                     }],
                     100,
                     CrossRecvCall { msg_id },
@@ -1877,6 +2232,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 800,
                 recipient: owner,
+            lock: false,
             }],
             100,
             CrossRecvCall { msg_id },
@@ -1887,6 +2243,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 700,
                 recipient: owner,
+            lock: false,
             }],
             100,
             CrossRecvCall { msg_id },
@@ -1949,6 +2306,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -1963,6 +2321,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::CallContract {
@@ -2049,6 +2408,7 @@ let deploy = b.build_ovm_transaction(
             vec![OhmOutput {
                 amount: 950,
                 recipient: owner,
+            lock: false,
             }],
             50,
             Some(OvmAction::DeployContract {
@@ -2063,6 +2423,7 @@ let deploy = b.build_ovm_transaction(
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
+            lock: false,
             }],
             50,
             Some(OvmAction::CallContract {
@@ -2095,6 +2456,7 @@ let deploy = b.build_ovm_transaction(
             vec![OhmOutput {
                 amount: 950,
                 recipient: owner,
+            lock: false,
             }],
             50,
             Some(OvmAction::DeployContract {
@@ -2114,6 +2476,7 @@ let deploy = b.build_ovm_transaction(
                     vec![OhmOutput {
                         amount: 900,
                         recipient: owner,
+                        lock: false,
                     }],
                     100,
                     CrossSendCall {
@@ -2148,6 +2511,7 @@ let deploy = b.build_ovm_transaction(
                         vec![OhmOutput {
                             amount: 900,
                             recipient: owner,
+                            lock: false,
                         }],
                         50,
                         CrossRecvCall { msg_id },
@@ -2159,15 +2523,15 @@ let deploy = b.build_ovm_transaction(
                 &view,
             )
             .unwrap();
-        consumer.apply_block(&consume_block).unwrap();
+        consumer.apply_block_with(&consume_block, &view).unwrap();
 
         // The target's staged XCall landed in B's outbox, addressed back to A.
         assert_eq!(consumer.outbox.len(), 1);
         let (id, message) = consumer.outbox.iter().next().unwrap();
-        assert_eq!(*id, ohm_cross_msg_id(&consumer.ohm_id, 7, 0));
+        assert_eq!(*id, message.msg_id);
         assert_eq!(message.seq, 0);
         assert_eq!(message.source_ohm, consumer.ohm_id);
-        assert_eq!(message.source_height, 7);
+        assert_eq!(message.source_height, 1);
         assert_eq!(message.caller, owner);
         assert_eq!(message.target_ohm, source.ohm_id);
         assert_eq!(message.target_contract, target_contract);
@@ -2187,6 +2551,7 @@ let deploy = b.build_ovm_transaction(
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -2201,6 +2566,7 @@ let deploy = b.build_ovm_transaction(
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
+            lock: false,
             }],
             100,
             Some(OvmAction::CallContract {

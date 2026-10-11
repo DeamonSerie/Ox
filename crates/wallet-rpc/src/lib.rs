@@ -744,6 +744,7 @@ mod tests {
             OhmOutput {
                 amount: 100,
                 recipient,
+                lock: false,
             },
             0,
         );

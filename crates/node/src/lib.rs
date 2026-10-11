@@ -1495,6 +1495,7 @@ mod recovery_tests {
         let genesis_outputs = vec![OhmOutput {
             amount: 1000,
             recipient: maintainer.public(),
+            lock: false,
         }];
         let mut create = OhmOperation::new_unsigned(
             maintainer.public(),
@@ -1547,10 +1548,11 @@ mod recovery_tests {
         let genesis_out = ledger.utxos.values().next().unwrap().outpoint;
         let tx = ledger.build_transaction(
             vec![(genesis_out, maintainer.public())],
-            vec![OhmOutput {
-                amount: 900,
-                recipient: maintainer.public(),
-            }],
+             vec![OhmOutput {
+                 amount: 900,
+                 recipient: maintainer.public(),
+                 lock: false,
+             }],
             100,
             &maintainer,
         );
@@ -1649,6 +1651,7 @@ mod recovery_tests {
         let genesis_outputs = vec![OhmOutput {
             amount: 1000,
             recipient: maintainer.public(),
+            lock: false,
         }];
         let mut create = OhmOperation::new_unsigned(
             maintainer.public(),
@@ -1722,10 +1725,11 @@ mod recovery_tests {
         .unwrap();
         let deploy = ledger.build_ovm_transaction(
             vec![(genesis_out, maintainer.public())],
-            vec![OhmOutput {
-                amount: 900,
-                recipient: maintainer.public(),
-            }],
+             vec![OhmOutput {
+                 amount: 900,
+                 recipient: maintainer.public(),
+                 lock: false,
+             }],
             100,
             Some(OvmAction::DeployContract {
                 artifact,
@@ -1736,10 +1740,11 @@ mod recovery_tests {
         let contract_id = oxydome_ovm::contract_id(deploy.txid());
         let call = ledger.build_ovm_transaction(
             vec![(OutPoint::new(deploy.txid(), 0), maintainer.public())],
-            vec![OhmOutput {
-                amount: 800,
-                recipient: maintainer.public(),
-            }],
+             vec![OhmOutput {
+                 amount: 800,
+                 recipient: maintainer.public(),
+                 lock: false,
+             }],
             100,
             Some(OvmAction::CallContract {
                 contract_id,
@@ -1949,6 +1954,7 @@ mod recovery_tests {
                 genesis_outputs: vec![OhmOutput {
                     amount: 1000,
                     recipient: maintainer.public(),
+                    lock: false,
                 }],
             },
         );
@@ -2006,6 +2012,7 @@ mod recovery_tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: maintainer_b.public(),
+                lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -2031,6 +2038,7 @@ mod recovery_tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: maintainer_a.public(),
+                lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -2045,6 +2053,7 @@ mod recovery_tests {
             vec![OhmOutput {
                 amount: 800,
                 recipient: maintainer_a.public(),
+                lock: false,
             }],
             100,
             CrossSendCall {
@@ -2078,6 +2087,7 @@ mod recovery_tests {
             vec![OhmOutput {
                 amount: 800,
                 recipient: maintainer_b.public(),
+                lock: false,
             }],
             100,
             CrossRecvCall { msg_id },
@@ -2107,6 +2117,7 @@ mod recovery_tests {
             vec![OhmOutput {
                 amount: 700,
                 recipient: maintainer_a.public(),
+                lock: false,
             }],
             100,
             CrossRecvCall { msg_id: reply_id },

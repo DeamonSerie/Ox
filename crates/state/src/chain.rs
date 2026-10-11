@@ -1274,6 +1274,7 @@ mod tests {
                 genesis_outputs: vec![OhmOutput {
                     amount: 1_000,
                     recipient: maintainer.public(),
+                    lock: false,
                 }],
             },
         );

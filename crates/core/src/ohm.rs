@@ -182,6 +182,12 @@ pub struct OhmOutput {
     pub amount: Amount,
     /// Recipient's public key
     pub recipient: PublicKey,
+    /// Whether this output is locked in the cross-chain bridge escrow.
+    ///
+    /// Locked outputs cannot be spent in ordinary transactions; they can only be unlocked by
+    /// the bridge module when a corresponding burn is observed on the target OHM.
+    #[serde(default)]
+    pub lock: bool,
 }
 
 /// A transaction-carried outbound cross-OHM message request.
@@ -219,6 +225,33 @@ pub struct CrossRecvCall {
     pub msg_id: Hash,
 }
 
+/// A transaction-carried cross-chain asset transfer request.
+///
+/// Initiates a lock-and-mint bridge transfer: the specified `amount` is locked in escrow on the
+/// source OHM and an equivalent wrapped asset is minted to `recipient` on `target_ohm`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossTransferCall {
+    /// The OHM that should receive the wrapped asset.
+    pub target_ohm: Hash,
+    /// The amount to transfer (locked on source, minted on target).
+    pub amount: Amount,
+    /// The recipient of the wrapped asset on the target OHM.
+    pub recipient: PublicKey,
+}
+
+/// A transaction-carried cross-chain asset burn request.
+///
+/// Initiates the return leg of a bridge transfer: the specified `amount` of wrapped assets
+/// (previously minted by a transfer from `source_ohm`) is burned on this OHM, and an equivalent
+/// message is enqueued so the source OHM can unlock the original escrow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossBurnCall {
+    /// The OHM that originally issued the wrapped assets (where the escrow should be unlocked).
+    pub source_ohm: Hash,
+    /// The amount of wrapped assets to burn.
+    pub amount: Amount,
+}
+
 /// A committed, consensus-anchored outbound cross-OHM message.
 ///
 /// Lives in the source OHM's private outbox and is committed into the source OHM's state root
@@ -254,6 +287,18 @@ pub struct OutboundMessage {
     pub reply_entry_selector: Option<u64>,
     /// Set when this message is an auto-generated reply; the id of the message it answers.
     pub reply_to_msg_id: Option<Hash>,
+    /// Transfer metadata when this message represents a cross-chain asset transfer or burn.
+    #[serde(default)]
+    pub transfer: Option<TransferPayload>,
+}
+
+/// Transfer metadata carried by cross-chain asset transfer and burn messages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferPayload {
+    /// The amount being transferred or burned.
+    pub amount: Amount,
+    /// The recipient of the wrapped asset on the target OHM (for transfers).
+    pub recipient: Option<PublicKey>,
 }
 
 /// A committed, consensus-anchored inbound cross-OHM receipt.
@@ -319,6 +364,12 @@ pub struct OhmTransaction {
     /// Optional inbound cross-OHM message consumed by this transaction.
     #[serde(default)]
     pub cross_recv: Option<CrossRecvCall>,
+    /// Optional cross-chain asset transfer (lock on source, mint on target).
+    #[serde(default)]
+    pub cross_transfer: Option<CrossTransferCall>,
+    /// Optional cross-chain asset burn (burn wrapped, unlock on source).
+    #[serde(default)]
+    pub cross_burn: Option<CrossBurnCall>,
 }
 
 /// Canonical signature payload for OHM transaction inputs (excludes signatures).
@@ -331,6 +382,8 @@ struct OhmTxSigningData<'a> {
     ovm_action: &'a Option<OvmAction>,
     cross_send: &'a Option<CrossSendCall>,
     cross_recv: &'a Option<CrossRecvCall>,
+    cross_transfer: &'a Option<CrossTransferCall>,
+    cross_burn: &'a Option<CrossBurnCall>,
     input_index: u32,
 }
 
@@ -345,6 +398,8 @@ impl OhmTransaction {
             ovm_action: &self.ovm_action,
             cross_send: &self.cross_send,
             cross_recv: &self.cross_recv,
+            cross_transfer: &self.cross_transfer,
+            cross_burn: &self.cross_burn,
             input_index: input_index as u32,
         };
         hash_value(&data)
@@ -364,6 +419,8 @@ impl OhmTransaction {
             ovm_action: None,
             cross_send: None,
             cross_recv: None,
+            cross_transfer: None,
+            cross_burn: None,
         }
     }
 
@@ -382,6 +439,18 @@ impl OhmTransaction {
     /// Attaches an inbound cross-OHM message consume to this transaction.
     pub fn with_cross_recv(mut self, call: CrossRecvCall) -> Self {
         self.cross_recv = Some(call);
+        self
+    }
+
+    /// Attaches a cross-chain asset transfer to this transaction.
+    pub fn with_cross_transfer(mut self, call: CrossTransferCall) -> Self {
+        self.cross_transfer = Some(call);
+        self
+    }
+
+    /// Attaches a cross-chain asset burn to this transaction.
+    pub fn with_cross_burn(mut self, call: CrossBurnCall) -> Self {
+        self.cross_burn = Some(call);
         self
     }
 
@@ -428,9 +497,45 @@ impl OhmTransaction {
         if self.ovm_action.is_some() && self.cross_recv.is_some() {
             return Err("OHM transaction cannot combine an OVM action with a cross-chain recv".into());
         }
+        if self.ovm_action.is_some() && self.cross_transfer.is_some() {
+            return Err("OHM transaction cannot combine an OVM action with a cross-chain transfer".into());
+        }
+        if self.ovm_action.is_some() && self.cross_burn.is_some() {
+            return Err("OHM transaction cannot combine an OVM action with a cross-chain burn".into());
+        }
         if self.cross_send.is_some() && self.cross_recv.is_some() {
             return Err(
                 "OHM transaction cannot carry both a cross-chain send and a cross-chain recv"
+                    .into(),
+            );
+        }
+        if self.cross_send.is_some() && self.cross_transfer.is_some() {
+            return Err(
+                "OHM transaction cannot carry both a cross-chain send and a cross-chain transfer"
+                    .into(),
+            );
+        }
+        if self.cross_send.is_some() && self.cross_burn.is_some() {
+            return Err(
+                "OHM transaction cannot carry both a cross-chain send and a cross-chain burn"
+                    .into(),
+            );
+        }
+        if self.cross_recv.is_some() && self.cross_transfer.is_some() {
+            return Err(
+                "OHM transaction cannot carry both a cross-chain recv and a cross-chain transfer"
+                    .into(),
+            );
+        }
+        if self.cross_recv.is_some() && self.cross_burn.is_some() {
+            return Err(
+                "OHM transaction cannot carry both a cross-chain recv and a cross-chain burn"
+                    .into(),
+            );
+        }
+        if self.cross_transfer.is_some() && self.cross_burn.is_some() {
+            return Err(
+                "OHM transaction cannot carry both a cross-chain transfer and a cross-chain burn"
                     .into(),
             );
         }
@@ -498,6 +603,25 @@ impl OhmTransaction {
         if let Some(call) = &self.cross_recv {
             if call.msg_id.is_zero() {
                 return Err("OHM cross-chain recv has an empty message id".into());
+            }
+        }
+        if let Some(call) = &self.cross_transfer {
+            if call.target_ohm.is_zero() {
+                return Err("OHM cross-chain transfer has an empty target OHM".into());
+            }
+            if call.amount == 0 {
+                return Err("OHM cross-chain transfer has a zero amount".into());
+            }
+            if call.recipient == PublicKey::from([0u8; 32]) {
+                return Err("OHM cross-chain transfer has an empty recipient".into());
+            }
+        }
+        if let Some(call) = &self.cross_burn {
+            if call.source_ohm.is_zero() {
+                return Err("OHM cross-chain burn has an empty source OHM".into());
+            }
+            if call.amount == 0 {
+                return Err("OHM cross-chain burn has a zero amount".into());
             }
         }
         let mut seen = std::collections::BTreeSet::new();
@@ -1002,6 +1126,7 @@ mod tests {
                 genesis_outputs: vec![OhmOutput {
                     amount: 100,
                     recipient: key.public(),
+                    lock: false,
                 }],
             },
         );
@@ -1020,6 +1145,7 @@ mod tests {
                 genesis_outputs: vec![OhmOutput {
                     amount: 100,
                     recipient: key.public(),
+                    lock: false,
                 }],
             },
         );
@@ -1095,6 +1221,7 @@ mod tests {
                 genesis_outputs: vec![OhmOutput {
                     amount: 1_000_000,
                     recipient: key.public(),
+                    lock: false,
                 }],
             },
         );
@@ -1115,11 +1242,14 @@ mod tests {
             outputs: vec![OhmOutput {
                 amount: 90,
                 recipient: owner,
+                lock: false,
             }],
             fee: 10,
             ovm_action: None,
             cross_send: None,
             cross_recv: None,
+            cross_transfer: None,
+            cross_burn: None,
         };
         tx.sign_owned_inputs(&key);
         assert!(tx.validate_structure().is_ok());
@@ -1186,6 +1316,7 @@ mod tests {
                 reply_contract: None,
                 reply_entry_selector: None,
                 reply_to_msg_id: None,
+                transfer: None,
             },
         );
         assert_ne!(
@@ -1209,11 +1340,14 @@ mod tests {
                 outputs: vec![OhmOutput {
                     amount: 90,
                     recipient: owner,
+                    lock: false,
                 }],
                 fee: 10,
                 ovm_action: None,
                 cross_send: Some(call),
                 cross_recv: None,
+                cross_transfer: None,
+                cross_burn: None,
             };
             tx.sign_owned_inputs(&key);
             tx.validate_structure()
@@ -1271,11 +1405,14 @@ mod tests {
             outputs: vec![OhmOutput {
                 amount: 90,
                 recipient: owner,
+                lock: false,
             }],
             fee: 10,
             ovm_action: Some(default_ovm_dummy()),
             cross_send: Some(good),
             cross_recv: None,
+            cross_transfer: None,
+            cross_burn: None,
         };
         combined.sign_owned_inputs(&key);
         assert!(combined.validate_structure().is_err());
