@@ -84,6 +84,39 @@ pub struct RewardDistribution {
     pub node_outputs: Vec<TxOutput>,
 }
 
+/// Distribution of minted block rewards (separate from fee-based rewards).
+/// Server nodes receive validation rewards based on participation and GAS price derivatives.
+/// Master nodes receive initiation rewards based on server reward derivatives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockRewardDistribution {
+    pub server_outputs: Vec<TxOutput>,
+    pub master_outputs: Vec<TxOutput>,
+}
+
+impl BlockRewardDistribution {
+    pub fn server_total(&self) -> Amount {
+        self.server_outputs
+            .iter()
+            .map(|o| o.amount)
+            .fold(0u128, |a, b| a.saturating_add(b))
+    }
+
+    pub fn master_total(&self) -> Amount {
+        self.master_outputs
+            .iter()
+            .map(|o| o.amount)
+            .fold(0u128, |a, b| a.saturating_add(b))
+    }
+
+    pub fn total(&self) -> Amount {
+        self.server_total().saturating_add(self.master_total())
+    }
+
+    pub fn all_outputs(&self) -> impl Iterator<Item = &TxOutput> {
+        self.server_outputs.iter().chain(self.master_outputs.iter())
+    }
+}
+
 impl RewardDistribution {
     pub fn master_total(&self) -> Amount {
         self.master_outputs
@@ -129,6 +162,10 @@ enum SignableOperation {
         master_outputs: Vec<TxOutput>,
         node_outputs: Vec<TxOutput>,
     },
+    BlockRewards {
+        server_outputs: Vec<TxOutput>,
+        master_outputs: Vec<TxOutput>,
+    },
     Dao {
         actor: PublicKey,
         action: DaoAction,
@@ -158,6 +195,7 @@ pub enum Operation {
     Ohm(OhmOperation),
     Gas(GasOperation),
     PriceChange(TreasuryPriceChange),
+    BlockRewards(BlockRewardDistribution),
 }
 
 impl Operation {
@@ -198,6 +236,10 @@ impl Operation {
             Operation::PriceChange(tp) => SignableOperation::PriceChange {
                 new_price: tp.new_price,
             },
+            Operation::BlockRewards(b) => SignableOperation::BlockRewards {
+                server_outputs: b.server_outputs.clone(),
+                master_outputs: b.master_outputs.clone(),
+            },
         };
         hash_value(&signable)
     }
@@ -208,6 +250,7 @@ impl Operation {
             Operation::Burn(b) => &b.approvals,
             Operation::Gas(g) => &g.approvals,
             Operation::PriceChange(p) => &p.approvals,
+            Operation::BlockRewards(_) => &[],
             _ => &[],
         }
     }

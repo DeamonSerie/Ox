@@ -82,6 +82,24 @@ pub struct MvmsConfig {
     pub per_account_withdraw_bps: u32,
     /// Base fee per transaction at value index 1.000
     pub base_fee: u64,
+
+    // ---- block rewards (minted Ox) ----
+    /// Base server node reward per block, in Ox
+    pub server_base_reward: u64,
+    /// Base master node reward per block, in Ox
+    pub master_base_reward: u64,
+    /// GAS price derivative sensitivity for server rewards (bps per 1% price change)
+    pub gas_derivative_sensitivity_bps: u32,
+    /// Master reward sensitivity to server reward derivative (bps per 1% change)
+    pub master_derivative_sensitivity_bps: u32,
+    /// Maximum adjustment cap for server rewards from derivatives (bps)
+    pub server_reward_cap_bps: u32,
+    /// Maximum adjustment cap for master rewards from derivatives (bps)
+    pub master_reward_cap_bps: u32,
+    /// Minimum blocks between price updates for derivative calculation
+    pub min_price_update_interval: u64,
+    /// Whether minted block rewards are active
+    pub block_rewards_enabled: bool,
 }
 
 impl fmt::Display for MvmsConfig {
@@ -188,6 +206,14 @@ impl Default for MvmsConfig {
             withdraw_limit_bps: 10,
             per_account_withdraw_bps: 3000,
             base_fee: 100,
+            server_base_reward: 1000,
+            master_base_reward: 50,
+            gas_derivative_sensitivity_bps: 100,
+            master_derivative_sensitivity_bps: 50,
+            server_reward_cap_bps: 2000,
+            master_reward_cap_bps: 1000,
+            min_price_update_interval: 10,
+            block_rewards_enabled: true,
         }
     }
 }
@@ -301,6 +327,16 @@ impl MvmsConfig {
             withdraw_limit_bps: self.withdraw_limit_bps,
             per_account_withdraw_bps: self.per_account_withdraw_bps,
             base_fee,
+
+            // block rewards (minted Ox)
+            server_base_reward: Amount::from(self.server_base_reward),
+            master_base_reward: Amount::from(self.master_base_reward),
+            gas_derivative_sensitivity_bps: self.gas_derivative_sensitivity_bps,
+            master_derivative_sensitivity_bps: self.master_derivative_sensitivity_bps,
+            server_reward_cap_bps: self.server_reward_cap_bps,
+            master_reward_cap_bps: self.master_reward_cap_bps,
+            min_price_update_interval: self.min_price_update_interval,
+            block_rewards_enabled: self.block_rewards_enabled,
         }
     }
 
@@ -509,6 +545,46 @@ impl MvmsBuilder {
         self
     }
 
+    pub fn server_base_reward(mut self, reward: u64) -> Self {
+        self.config.server_base_reward = reward;
+        self
+    }
+
+    pub fn master_base_reward(mut self, reward: u64) -> Self {
+        self.config.master_base_reward = reward;
+        self
+    }
+
+    pub fn gas_derivative_sensitivity(mut self, bps: u32) -> Self {
+        self.config.gas_derivative_sensitivity_bps = bps;
+        self
+    }
+
+    pub fn master_derivative_sensitivity(mut self, bps: u32) -> Self {
+        self.config.master_derivative_sensitivity_bps = bps;
+        self
+    }
+
+    pub fn server_reward_cap(mut self, bps: u32) -> Self {
+        self.config.server_reward_cap_bps = bps;
+        self
+    }
+
+    pub fn master_reward_cap(mut self, bps: u32) -> Self {
+        self.config.master_reward_cap_bps = bps;
+        self
+    }
+
+    pub fn min_price_update_interval(mut self, blocks: u64) -> Self {
+        self.config.min_price_update_interval = blocks;
+        self
+    }
+
+    pub fn block_rewards_enabled(mut self, enabled: bool) -> Self {
+        self.config.block_rewards_enabled = enabled;
+        self
+    }
+
     pub fn build(self) -> MvmsResult<MvmsConfig> {
         self.config
             .validate()
@@ -623,6 +699,14 @@ min_tx_amount = 1
 withdraw_limit_bps = 10
 per_account_withdraw_bps = 3000
 base_fee = 100
+server_base_reward = 1000
+master_base_reward = 50
+gas_derivative_sensitivity_bps = 100
+master_derivative_sensitivity_bps = 50
+server_reward_cap_bps = 2000
+master_reward_cap_bps = 1000
+min_price_update_interval = 10
+block_rewards_enabled = true
 "#;
         let config = MvmsConfig::from_toml(toml_str).expect("parse toml");
         assert_eq!(config.chain_name, "TomlChain");

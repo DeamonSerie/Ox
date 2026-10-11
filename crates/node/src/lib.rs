@@ -11,8 +11,9 @@ use crate::index::{IndexStore, WalletIndex};
 use oxydome_audit::{attestation_quorum, AuditAttestation, AuditPackage, InputProof};
 use oxydome_consensus::{AdmissionCertificate, MasterCheck, QuorumCertificate, Vote, VoteKind};
 use oxydome_core::{
-    Amount, Block, ChainParams, GenesisConfig, GovernanceSet, Hash, InboundReceipt, OhmAction,
-    OhmBlock, OhmPolicy, OhmState, Operation, OutPoint, OvmAction, PublicKey, Transaction,
+    Amount, Block, BlockRewardDistribution, ChainParams, GenesisConfig, GovernanceSet, Hash,
+    InboundReceipt, OhmAction, OhmBlock, OhmPolicy, OhmState, Operation, OutPoint, OvmAction,
+    PublicKey, Transaction,
 };
 use oxydome_crypto::{CodeManifest, KeyPair, SparseProof};
 use oxydome_currency::rebound_utxo_spendable;
@@ -21,7 +22,10 @@ use oxydome_net::{
     TxStatus, UtxoInfo, ValueIndexInfo,
 };
 use oxydome_ohm::{CrossChainView, OhmCallOutcome, OhmContract, OhmLedger, OutboundMessage};
-use oxydome_rewards::{participation_weights, split_fees};
+use oxydome_rewards::{
+    build_block_reward_operation, calculate_master_block_rewards, calculate_server_block_rewards,
+    participation_weights, split_fees,
+};
 use oxydome_state::{ledger_diff, ChainState, LedgerStore, StateError, UtxoEntry};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use tokio::sync::broadcast;
@@ -74,6 +78,8 @@ pub struct Node {
     pub admission: Option<AdmissionCertificate>,
     pub manifest_root: Hash,
     pub epoch: u64,
+    /// Previous block's total server reward for master reward derivative calculation.
+    prev_server_block_reward: Option<Amount>,
     /// Durable ledger store, when persistence is attached.
     pub store: Option<LedgerStore>,
     /// Wallet-facing index of transaction locations and per-address history.
@@ -122,6 +128,7 @@ impl Node {
             admission,
             manifest_root,
             epoch: 0,
+            prev_server_block_reward: None,
             store: None,
             wallet_index: WalletIndex::new(),
             index_store: None,
@@ -842,6 +849,28 @@ impl Node {
         if total_fees > 0 {
             operations.push(self.reward_operation(total_fees, &self.public()));
         }
+
+        // Add minted block rewards if enabled
+        if self.params.block_rewards_enabled {
+            if let Some(block_reward_op) = build_block_reward_operation(
+                &self.params,
+                self.state.ox_price,
+                self.params.ox_price_reference,
+                self.state.price_last_update_height,
+                height,
+                &self.gov.nodes,
+                &self.public(),
+                &self.gov.masters,
+                self.prev_server_block_reward.unwrap_or(0),
+            ) {
+                // Track server reward for next block's master derivative calculation
+                if let Operation::BlockRewards(ref dist) = block_reward_op {
+                    self.prev_server_block_reward = Some(dist.server_total());
+                }
+                operations.push(block_reward_op);
+            }
+        }
+
         let block = self.state.build_block(
             &self.gov,
             &self.params,
@@ -1328,6 +1357,7 @@ pub fn default_config(masters: usize, nodes: usize, supply: Amount) -> oxydome_c
     use oxydome_core::{AllocationConfig, AppConfig, EndpointConfig};
     let mut params = oxydome_core::ChainParams::default_local();
     params.genesis_supply = supply;
+    params.block_rewards_enabled = false;
     let make_endpoint = |prefix: &str, i: usize| {
         let key = KeyPair::generate();
         EndpointConfig {

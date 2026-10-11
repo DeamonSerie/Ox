@@ -6,12 +6,16 @@
 //! periodic literal deep replay.
 
 use oxydome_core::{
-    conversion_split_with_bps, Amount, Block, ChainParams, GovernanceSet, Operation, OutPoint,
-    PublicKey, Sig, ValueIndex,
+    conversion_split_with_bps, Amount, Block, BlockRewardDistribution, ChainParams,
+    GovernanceSet, Operation, OutPoint, PublicKey, Sig, ValueIndex,
 };
 use oxydome_crypto::{hash_value, Hash, SparseProof};
 use oxydome_currency::{
     compute_value, rebound_utxo_spendable, supply_change_cap, withdraw_cap, WindowStats,
+};
+use oxydome_rewards::{
+    calculate_master_block_rewards, calculate_server_block_rewards, participation_weights,
+    split_fees,
 };
 use oxydome_state::{ChainState, StateError, UtxoEntry};
 use serde::{Deserialize, Serialize};
@@ -246,6 +250,9 @@ pub struct HeaderAuditContext<'a> {
     pub epoch_minted: Amount,
     pub epoch_burned: Amount,
     pub epoch_withdrawn: Amount,
+    pub prev_server_block_reward: Option<Amount>,
+    pub ox_price: Amount,
+    pub price_last_update_height: u64,
     pub gov: &'a GovernanceSet,
     pub params: &'a ChainParams,
 }
@@ -352,6 +359,59 @@ pub fn header_audit(
                 epoch_withdrawn = epoch_withdrawn.saturating_add(w.amount);
             }
             Operation::Rewards(_) => {}
+            Operation::BlockRewards(r) => {
+                // Verify minted block rewards match calculated expectations
+                let server_rewards = calculate_server_block_rewards(
+                    ctx.params,
+                    ctx.ox_price,
+                    ctx.params.ox_price_reference,
+                    ctx.price_last_update_height,
+                    block.header.height,
+                    &ctx.gov.nodes,
+                    &block.header.producer,
+                );
+                let expected_server_total: Amount = server_rewards.iter().map(|o| o.amount).sum();
+                if r.server_total() != expected_server_total {
+                    return Err(AuditError::Guardrail(format!(
+                        "block server reward total {} does not match expected {}",
+                        r.server_total(),
+                        expected_server_total
+                    )));
+                }
+                let master_rewards = calculate_master_block_rewards(
+                    ctx.params,
+                    ctx.prev_server_block_reward.unwrap_or(0),
+                    r.server_total(),
+                    &ctx.gov.masters,
+                );
+                let expected_master_total: Amount = master_rewards.iter().map(|o| o.amount).sum();
+                if r.master_total() != expected_master_total {
+                    return Err(AuditError::Guardrail(format!(
+                        "block master reward total {} does not match expected {}",
+                        r.master_total(),
+                        expected_master_total
+                    )));
+                }
+                // Verify individual output amounts match (allowing for rounding)
+                for (i, output) in r.server_outputs.iter().enumerate() {
+                    if i < server_rewards.len() && output.amount != server_rewards[i].amount {
+                        return Err(AuditError::Guardrail(format!(
+                            "server reward output {} amount {} does not match expected {}",
+                            i, output.amount, server_rewards[i].amount
+                        )));
+                    }
+                }
+                for (i, output) in r.master_outputs.iter().enumerate() {
+                    if i < master_rewards.len() && output.amount != master_rewards[i].amount {
+                        return Err(AuditError::Guardrail(format!(
+                            "master reward output {} amount {} does not match expected {}",
+                            i, output.amount, master_rewards[i].amount
+                        )));
+                    }
+                }
+                // Update supply with minted rewards
+                supply = supply.saturating_add(r.total());
+            }
             Operation::Dao(dao_operation) => {
                 if !dao_operation.is_valid() {
                     return Err(AuditError::Guardrail(

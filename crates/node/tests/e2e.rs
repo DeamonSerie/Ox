@@ -35,6 +35,7 @@ fn params() -> ChainParams {
     p.rebound_lock_blocks = 3;
     // Relax the supply-change cap so the tests can mint/burn visible amounts.
     p.supply_change_limit_bps = 1000;
+    p.block_rewards_enabled = false;
     p
 }
 

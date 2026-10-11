@@ -31,8 +31,8 @@ pub use gas::{
 pub use genesis::{GenesisAllocation, GenesisConfig};
 pub use governance::GovernanceSet;
 pub use operation::{
-    MasterApproval, NodeApproval, Operation, RewardDistribution, TreasuryBurn, TreasuryMint,
-    WithdrawRequest,
+    BlockRewardDistribution, MasterApproval, NodeApproval, Operation, RewardDistribution,
+    TreasuryBurn, TreasuryMint, WithdrawRequest,
 };
 pub use ohm::{
     build_ohm_server_outputs, compute_ohm_fee_split, hash_words, ohm_cross_msg_id,

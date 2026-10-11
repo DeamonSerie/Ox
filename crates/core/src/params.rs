@@ -115,6 +115,32 @@ pub airdrop_base_bps: u32,
     pub per_account_withdraw_bps: u32,
     /// Base fee charged per transaction at value index 1.000.
     pub base_fee: Amount,
+
+    // ---- block rewards (minted Ox) ----
+    /// Base server node reward per block, in Ox.
+    #[serde(default = "default_server_base_reward")]
+    pub server_base_reward: Amount,
+    /// Base master node reward per block, in Ox.
+    #[serde(default = "default_master_base_reward")]
+    pub master_base_reward: Amount,
+    /// GAS price derivative sensitivity for server rewards, in basis points per 1% price change.
+    #[serde(default = "default_gas_derivative_sensitivity_bps")]
+    pub gas_derivative_sensitivity_bps: u32,
+    /// Master reward sensitivity to server reward derivative, in basis points per 1% change.
+    #[serde(default = "default_master_derivative_sensitivity_bps")]
+    pub master_derivative_sensitivity_bps: u32,
+    /// Maximum adjustment cap for server rewards from derivatives, in basis points.
+    #[serde(default = "default_server_reward_cap_bps")]
+    pub server_reward_cap_bps: u32,
+    /// Maximum adjustment cap for master rewards from derivatives, in basis points.
+    #[serde(default = "default_master_reward_cap_bps")]
+    pub master_reward_cap_bps: u32,
+    /// Minimum blocks between price updates for derivative calculation.
+    #[serde(default = "default_min_price_update_interval")]
+    pub min_price_update_interval: u64,
+    /// Whether minted block rewards are active.
+    #[serde(default = "default_block_rewards_enabled")]
+    pub block_rewards_enabled: bool,
 }
 
 fn default_chain_name() -> String {
@@ -165,6 +191,38 @@ fn default_price_smoothing_bps() -> u32 {
     250
 }
 
+fn default_server_base_reward() -> Amount {
+    1_000
+}
+
+fn default_master_base_reward() -> Amount {
+    50
+}
+
+fn default_gas_derivative_sensitivity_bps() -> u32 {
+    100
+}
+
+fn default_master_derivative_sensitivity_bps() -> u32 {
+    50
+}
+
+fn default_server_reward_cap_bps() -> u32 {
+    2_000
+}
+
+fn default_master_reward_cap_bps() -> u32 {
+    1_000
+}
+
+fn default_min_price_update_interval() -> u64 {
+    10
+}
+
+fn default_block_rewards_enabled() -> bool {
+    true
+}
+
 impl ChainParams {
     pub fn execution_version_at(&self, height: u64) -> u32 {
         if height >= self.smart_contract_activation_height {
@@ -211,14 +269,22 @@ impl ChainParams {
             t_ref: 10_000,
             a_ref: 100,
             e_ref: 10_000,
-            initial_value_index: 1_000_000_000_000,
-            value_impact_limit_bps: 200,
-            supply_change_limit_bps: 10,
-            fee_affordability_bps: 100,
-            min_tx_amount: 100,
-            withdraw_limit_bps: 10,
-            per_account_withdraw_bps: 3000,
-            base_fee: 1,
+initial_value_index: 1_000_000_000_000,
+        value_impact_limit_bps: 200,
+        supply_change_limit_bps: 10,
+        fee_affordability_bps: 100,
+        min_tx_amount: 100,
+        withdraw_limit_bps: 10,
+        per_account_withdraw_bps: 3000,
+        base_fee: 1,
+        server_base_reward: 1_000,
+        master_base_reward: 50,
+        gas_derivative_sensitivity_bps: 100,
+        master_derivative_sensitivity_bps: 50,
+        server_reward_cap_bps: 2_000,
+        master_reward_cap_bps: 1_000,
+        min_price_update_interval: 10,
+        block_rewards_enabled: true,
         }
     }
 }

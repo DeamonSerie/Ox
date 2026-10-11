@@ -3,11 +3,11 @@
 
 use crate::utxo::{UtxoEntry, UtxoLedger};
 use oxydome_core::{
-    conversion_split_with_bps, Amount, Block, ChainParams, DaoAction, DaoOperation, DaoPeg, DaoPolicy,
-    DaoProposal, DaoProposalAction, DaoProposalStatus, DaoState, DaoWindowStats, GasAccount,
-    GasAction, GasOperation, GovernanceSet, OhmAction, OhmOperation, OhmPolicy, OhmState,
-    OhmUtxoEntry, Operation, OutPoint, OvmAction, OvmFailureCode, OvmLog, OvmReceipt, PublicKey,
-    RewardDistribution, Transaction, TxOutput, ValueIndex, MAX_DAO_PROPOSALS,
+    conversion_split_with_bps, Amount, Block, BlockRewardDistribution, ChainParams, DaoAction,
+    DaoOperation, DaoPeg, DaoPolicy, DaoProposal, DaoProposalAction, DaoProposalStatus, DaoState,
+    DaoWindowStats, GasAccount, GasAction, GasOperation, GovernanceSet, OhmAction, OhmOperation,
+    OhmPolicy, OhmState, OhmUtxoEntry, Operation, OutPoint, OvmAction, OvmFailureCode, OvmLog,
+    OvmReceipt, PublicKey, RewardDistribution, Transaction, TxOutput, ValueIndex, MAX_DAO_PROPOSALS,
     MAX_DAO_PROPOSAL_HEIGHTS, MAX_OVM_BLOCK_GAS_LIMIT,
 };
 use oxydome_core::{
@@ -612,6 +612,9 @@ impl ChainState {
         for op in &block.operations {
             match op {
                 Operation::Rewards(_) => {}
+                Operation::BlockRewards(r) => {
+                    apply_block_rewards(&mut next, r, new_height, params)?;
+                }
                 Operation::Dao(dao_operation) => {
                     apply_dao_operation(
                         &mut next,
@@ -1101,6 +1104,87 @@ impl ChainState {
             }
         }
     }
+}
+
+/// Applies minted block rewards (separate from fee-based rewards).
+/// Server and master rewards are minted as LockedReward outputs.
+fn apply_block_rewards(
+    next: &mut ChainState,
+    r: &BlockRewardDistribution,
+    height: u64,
+    params: &ChainParams,
+) -> Result<(), StateError> {
+    // Validate all outputs are LockedReward and go to valid recipients
+    for output in &r.server_outputs {
+        if !output.kind.is_locked_reward() {
+            return Err(StateError::BadRewardRecipient(output.recipient));
+        }
+    }
+    for output in &r.master_outputs {
+        if !output.kind.is_locked_reward() {
+            return Err(StateError::BadRewardRecipient(output.recipient));
+        }
+    }
+
+    let op_id = Operation::BlockRewards(r.clone()).id();
+    let convert = height >= params.gas_activation_height && params.gas_server_fee_bps > 0;
+    let mut out_idx = 0u32;
+
+    // Apply server rewards
+    for output in &r.server_outputs {
+        let (ox_kept, gas_minted) = if convert {
+            conversion_split_with_bps(output.amount, params.gas_server_fee_bps)
+        } else {
+            (output.amount, 0)
+        };
+        if ox_kept > 0 {
+            let mut kept = output.clone();
+            kept.amount = ox_kept;
+            let outpoint = OutPoint::new(op_id, out_idx);
+            next.utxo = next
+                .utxo
+                .insert(UtxoEntry::new(outpoint, kept, height));
+        }
+        if gas_minted > 0 {
+            // Burn the converted Ox and mint the GAS fuel to the same recipient.
+            next.supply = next.supply.saturating_sub(gas_minted);
+            next.mint_gas(output.recipient, gas_minted);
+        }
+        out_idx += 1;
+    }
+
+    // Apply master rewards
+    for output in &r.master_outputs {
+        let (ox_kept, gas_minted) = if convert {
+            conversion_split_with_bps(output.amount, params.gas_server_fee_bps)
+        } else {
+            (output.amount, 0)
+        };
+        if ox_kept > 0 {
+            let mut kept = output.clone();
+            kept.amount = ox_kept;
+            let outpoint = OutPoint::new(op_id, out_idx);
+            next.utxo = next
+                .utxo
+                .insert(UtxoEntry::new(outpoint, kept, height));
+        }
+        if gas_minted > 0 {
+            next.supply = next.supply.saturating_sub(gas_minted);
+            next.mint_gas(output.recipient, gas_minted);
+        }
+        out_idx += 1;
+    }
+
+    // Update total supply with minted rewards
+    let total_minted: Amount = r
+        .server_outputs
+        .iter()
+        .chain(r.master_outputs.iter())
+        .map(|o| o.amount)
+        .sum();
+    next.supply = next.supply.saturating_add(total_minted);
+
+    Ok(())
 }
 
 fn apply_rewards(

@@ -68,6 +68,12 @@ pub struct HeaderChain {
     pub epoch_minted: Amount,
     pub epoch_burned: Amount,
     pub epoch_withdrawn: Amount,
+    /// Previous block's total server reward for master reward derivative audit.
+    pub prev_server_block_reward: Option<Amount>,
+    /// On-chain Ox price oracle.
+    pub ox_price: Amount,
+    /// Last height at which the GAS price was updated.
+    pub price_last_update_height: u64,
 }
 
 impl HeaderChain {
@@ -83,6 +89,9 @@ impl HeaderChain {
             epoch_minted: 0,
             epoch_burned: 0,
             epoch_withdrawn: 0,
+            prev_server_block_reward: None,
+            ox_price: params.ox_price_reference,
+            price_last_update_height: 0,
         }
     }
 
@@ -135,6 +144,15 @@ impl HeaderChain {
                 }
                 oxydome_core::Operation::Withdraw(w) => {
                     self.epoch_withdrawn = self.epoch_withdrawn.saturating_add(w.amount)
+                }
+                oxydome_core::Operation::BlockRewards(_) => {
+                    // prev_server_block_reward is set by the block's BlockRewards operation
+                }
+                oxydome_core::Operation::Gas(g) => {
+                    if let oxydome_core::GasAction::SetOxPrice { price } = &g.action {
+                        self.ox_price = *price;
+                        self.price_last_update_height = block.header.height;
+                    }
                 }
                 oxydome_core::Operation::Rewards(_) 
                 | oxydome_core::Operation::Dao(_) 
@@ -234,6 +252,9 @@ impl MasterNode {
             } else {
                 self.chain.epoch_withdrawn
             },
+            prev_server_block_reward: self.chain.prev_server_block_reward,
+            ox_price: self.chain.ox_price,
+            price_last_update_height: self.chain.price_last_update_height,
             gov: &self.gov,
             params: &self.params,
         };
