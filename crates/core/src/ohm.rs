@@ -16,7 +16,7 @@
 //! An OHM's Ox treasury is held as a real locked Ox UTXO (kind `OhmTreasury`) owned by the
 //! maintainer, so deposits, transfers and fee settlements conserve the Ox supply invariant.
 
-use crate::tx::{OvmAction, TxOutput};
+use crate::tx::{OvmAction, OvmFailureCode, TxOutput};
 use crate::{Amount, OutPoint, PublicKey, Sig};
 use oxydome_crypto::{encode, hash_value, merkle_root, verify, Hash};
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,10 @@ pub const OHM_SERVER_FEE_BPS: u32 = 4000;
 pub const MAX_OHM_TX_ITEMS: usize = 4096;
 /// Maximum number of transactions allowed in a single OHM block.
 pub const MAX_OHM_BLOCK_TXS: usize = 4096;
+/// Maximum number of arguments carried by a cross-OHM message.
+pub const MAX_CROSS_MESSAGE_ARGS: usize = oxydome_ovm::MAX_ARGUMENTS;
+/// Maximum byte length of a cross-OHM message entry point name.
+pub const MAX_CROSS_MESSAGE_ENTRY_BYTES: usize = oxydome_ovm::MAX_FUNCTION_NAME_BYTES;
 
 /// Context for OHM chain continuity, anchored to Ox blocks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +184,103 @@ pub struct OhmOutput {
     pub recipient: PublicKey,
 }
 
+/// A transaction-carried outbound cross-OHM message request.
+///
+/// Enqueued into the OHM's outbox when its block is applied. The recipient OHM's maintainer
+/// later relays the resulting [`OutboundMessage`] to the target OHM by attaching
+/// [`CrossRecvCall`] to one of its own transactions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossSendCall {
+    /// The OHM that hosts the target contract.
+    pub target_ohm: Hash,
+    /// The target contract within `target_ohm`.
+    pub target_contract: Hash,
+    /// Entry point name on the target contract (resolved to a selector on enqueue).
+    pub entry_point: String,
+    /// Arguments passed to the entry point (after the caller's authority words).
+    pub arguments: Vec<u64>,
+    /// Gas limit for executing the target entry point on the receiving OHM.
+    pub gas_limit: u64,
+    /// Whether the recipient should auto-generate and relay a reply message back.
+    pub want_reply: bool,
+    /// The contract on this OHM that should receive a reply (required when `want_reply`).
+    pub reply_contract: Option<Hash>,
+    /// Entry point name on `reply_contract` to invoke with `[msg_id, outcome]` arguments.
+    pub reply_entry_point: Option<String>,
+}
+
+/// A transaction-carried inbound cross-OHM message consume.
+///
+/// Attached by the target OHM's maintainer to one of its transactions so the node re-deriving
+/// the target ledger deterministically executes the message against the target contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossRecvCall {
+    /// The id of the [`OutboundMessage`] to consume (must exist in the source OHM's outbox).
+    pub msg_id: Hash,
+}
+
+/// A committed, consensus-anchored outbound cross-OHM message.
+///
+/// Lives in the source OHM's private outbox and is committed into the source OHM's state root
+/// once the containing block is anchored. Receiving OHMs reference it only by [`msg_id`]; the
+/// consuming node re-derives the full body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboundMessage {
+    /// [`ohm_cross_msg_id`] of this message: commits source/height/seq.
+    pub msg_id: Hash,
+    /// The OHM that created and committed this message.
+    pub source_ohm: Hash,
+    /// Height of the source block that enqueued this message.
+    pub source_height: u64,
+    /// Per-source monotonic sequence number (FIFO order).
+    pub seq: u64,
+    /// The original sender (used as the caller's authority words on both sides).
+    pub caller: PublicKey,
+    /// The OHM that should consume this message.
+    pub target_ohm: Hash,
+    /// The target contract within `target_ohm`.
+    pub target_contract: Hash,
+    /// Entry point selector on the target contract.
+    pub entry_selector: u64,
+    /// Arguments passed to the entry point (after the caller's authority words).
+    pub arguments: Vec<u64>,
+    /// Gas limit for executing the target entry point.
+    pub gas_limit: u64,
+    /// Whether the target should auto-generate and relay a reply.
+    pub want_reply: bool,
+    /// Contract to receive the reply, if a reply was requested.
+    pub reply_contract: Option<Hash>,
+    /// Entry point selector for the reply handler, if a reply was requested.
+    pub reply_entry_selector: Option<u64>,
+    /// Set when this message is an auto-generated reply; the id of the message it answers.
+    pub reply_to_msg_id: Option<Hash>,
+}
+
+/// A committed, consensus-anchored inbound cross-OHM receipt.
+///
+/// Lives in the receiving OHM's private inbox once the message is consumed, preventing
+/// re-processing and letting contracts read replies. `msg_id` is the receipt's map key; for
+/// auto-generated replies `reply_to_msg_id` points back at the message that was answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InboundReceipt {
+    /// The consumed message id.
+    pub msg_id: Hash,
+    /// The OHM the message came from.
+    pub origin: Hash,
+    /// Height the message was enqueued at on `origin`.
+    pub origin_height: u64,
+    /// Height of the consuming block on this OHM.
+    pub processed_height: u64,
+    /// Failure code when the target entry point execution reverted or ran out of gas.
+    pub failure: Option<OvmFailureCode>,
+    /// Return value of the executed entry point (or the reply entry point).
+    pub return_value: Option<u64>,
+    /// The auto-generated reply message id, when this consume enqueued a reply.
+    pub reply_msg_id: Option<Hash>,
+    /// Set on reply receipts: the original message this reply answers.
+    pub reply_to_msg_id: Option<Hash>,
+}
+
 /// The private state of an OVM contract hosted inside a single OHM.
 ///
 /// A contract body never leaves the tenant: only the resulting OHM state root (which commits the
@@ -212,6 +313,12 @@ pub struct OhmTransaction {
     /// Optional OVM action executed privately inside the OHM (contract deploy or call).
     #[serde(default)]
     pub ovm_action: Option<OvmAction>,
+    /// Optional outbound cross-OHM message enqueued by this transaction.
+    #[serde(default)]
+    pub cross_send: Option<CrossSendCall>,
+    /// Optional inbound cross-OHM message consumed by this transaction.
+    #[serde(default)]
+    pub cross_recv: Option<CrossRecvCall>,
 }
 
 /// Canonical signature payload for OHM transaction inputs (excludes signatures).
@@ -222,6 +329,8 @@ struct OhmTxSigningData<'a> {
     outputs: &'a [OhmOutput],
     fee: Amount,
     ovm_action: &'a Option<OvmAction>,
+    cross_send: &'a Option<CrossSendCall>,
+    cross_recv: &'a Option<CrossRecvCall>,
     input_index: u32,
 }
 
@@ -234,6 +343,8 @@ impl OhmTransaction {
             outputs: &self.outputs,
             fee: self.fee,
             ovm_action: &self.ovm_action,
+            cross_send: &self.cross_send,
+            cross_recv: &self.cross_recv,
             input_index: input_index as u32,
         };
         hash_value(&data)
@@ -244,19 +355,33 @@ impl OhmTransaction {
         hash_value(self)
     }
 
-    /// Builds an OHM transaction with no OVM action.
+    /// Builds an OHM transaction with no OVM action or cross-chain action.
     pub fn new(inputs: Vec<OhmInput>, outputs: Vec<OhmOutput>, fee: Amount) -> Self {
         Self {
             inputs,
             outputs,
             fee,
             ovm_action: None,
+            cross_send: None,
+            cross_recv: None,
         }
     }
 
     /// Attaches a private OVM action (contract deploy or call) to this transaction.
     pub fn with_ovm_action(mut self, action: OvmAction) -> Self {
         self.ovm_action = Some(action);
+        self
+    }
+
+    /// Attaches an outbound cross-OHM message request to this transaction.
+    pub fn with_cross_send(mut self, call: CrossSendCall) -> Self {
+        self.cross_send = Some(call);
+        self
+    }
+
+    /// Attaches an inbound cross-OHM message consume to this transaction.
+    pub fn with_cross_recv(mut self, call: CrossRecvCall) -> Self {
+        self.cross_recv = Some(call);
         self
     }
 
@@ -297,6 +422,18 @@ impl OhmTransaction {
                 return Err("OHM transaction output amount is zero".into());
             }
         }
+        if self.ovm_action.is_some() && self.cross_send.is_some() {
+            return Err("OHM transaction cannot combine an OVM action with a cross-chain send".into());
+        }
+        if self.ovm_action.is_some() && self.cross_recv.is_some() {
+            return Err("OHM transaction cannot combine an OVM action with a cross-chain recv".into());
+        }
+        if self.cross_send.is_some() && self.cross_recv.is_some() {
+            return Err(
+                "OHM transaction cannot carry both a cross-chain send and a cross-chain recv"
+                    .into(),
+            );
+        }
         if let Some(action) = &self.ovm_action {
             if action.gas_limit() == 0 {
                 return Err("OHM OVM action has a zero gas limit".into());
@@ -324,6 +461,43 @@ impl OhmTransaction {
                         return Err("OHM OVM contract call is out of bounds".into());
                     }
                 }
+            }
+        }
+        if let Some(call) = &self.cross_send {
+            if call.target_ohm.is_zero() || call.target_contract.is_zero() {
+                return Err("OHM cross-chain send has an empty target".into());
+            }
+            if !oxydome_ovm::valid_function_name(&call.entry_point)
+                || call.entry_point.len() > MAX_CROSS_MESSAGE_ENTRY_BYTES
+            {
+                return Err("OHM cross-chain send has an invalid entry point".into());
+            }
+            if call.arguments.len() > MAX_CROSS_MESSAGE_ARGS {
+                return Err("OHM cross-chain send exceeds the argument limit".into());
+            }
+            if call.gas_limit == 0 {
+                return Err("OHM cross-chain send has a zero gas limit".into());
+            }
+            if call.want_reply {
+                let Some(reply_contract) = call.reply_contract else {
+                    return Err("OHM cross-chain send requests a reply without a reply contract"
+                        .into());
+                };
+                let Some(reply_entry) = &call.reply_entry_point else {
+                    return Err("OHM cross-chain send requests a reply without a reply entry"
+                        .into());
+                };
+                if reply_contract.is_zero()
+                    || !oxydome_ovm::valid_function_name(reply_entry)
+                    || reply_entry.len() > MAX_CROSS_MESSAGE_ENTRY_BYTES
+                {
+                    return Err("OHM cross-chain send has an invalid reply target".into());
+                }
+            }
+        }
+        if let Some(call) = &self.cross_recv {
+            if call.msg_id.is_zero() {
+                return Err("OHM cross-chain recv has an empty message id".into());
             }
         }
         let mut seen = std::collections::BTreeSet::new();
@@ -632,6 +806,66 @@ pub fn ohm_state_root(
     ))
 }
 
+/// Deterministic commitment to an OHM's private outbox (cross-OHM messages it has enqueued).
+pub fn ohm_outbox_root(outbox: &BTreeMap<Hash, OutboundMessage>) -> Hash {
+    hash_value(&("oxydome-ohm-outbox-root-v1", outbox))
+}
+
+/// Deterministic commitment to an OHM's private inbox (cross-OHM messages it has consumed).
+pub fn ohm_inbox_root(inbox: &BTreeMap<Hash, InboundReceipt>) -> Hash {
+    hash_value(&("oxydome-ohm-inbox-root-v1", inbox))
+}
+
+/// Deterministic commitment to the full private OHM state including its cross-OHM outbox and
+/// inbox.
+///
+/// Back-compatible: when both the outbox and inbox are empty this returns exactly the
+/// [`ohm_state_root`] v1 value, so pre-existing chains and anchors remain valid; the root
+/// switches to the v2 domain string the moment the first cross-OHM message exists.
+pub fn ohm_state_root_full(
+    utxos: &BTreeMap<Hash, OhmUtxoEntry>,
+    contracts: &BTreeMap<Hash, OhmContract>,
+    outbox: &BTreeMap<Hash, OutboundMessage>,
+    inbox: &BTreeMap<Hash, InboundReceipt>,
+) -> Hash {
+    if outbox.is_empty() && inbox.is_empty() {
+        return ohm_state_root(utxos, contracts);
+    }
+    hash_value(&(
+        "oxydome-ohm-state-root-v2",
+        ohm_utxo_root(utxos),
+        contracts,
+        ohm_outbox_root(outbox),
+        ohm_inbox_root(inbox),
+    ))
+}
+
+/// The deterministic id of a cross-OHM message enqueued by `source_ohm` at `source_height`.
+pub fn ohm_cross_msg_id(source_ohm: &Hash, source_height: u64, seq: u64) -> Hash {
+    hash_value(&("oxydome-xchain-msg-v1", source_ohm, source_height, seq))
+}
+
+/// Splits a 64-byte [`Hash`] into eight little-endian `u64` words. Cross-OHM messages carry full
+/// identifiers (never truncated), so hashes use all eight words; the four-word authority prefix
+/// is reserved for 32-byte signer public keys and is built separately.
+pub fn hash_words(hash: &Hash) -> [u64; 8] {
+    let mut words = [0u64; 8];
+    for (chunk, word) in hash.0.chunks_exact(8).zip(words.iter_mut()) {
+        *word = u64::from_le_bytes(chunk.try_into().unwrap_or([0u8; 8]));
+    }
+    words
+}
+
+/// The canonical shape of the automatic reply arguments: the message id it answers (eight
+/// words), a success flag (`1` on success, `0` on failure) and the value (`return_value` on
+/// success, the failure code on failure).
+pub fn reply_arguments(msg_id: &Hash, success: bool, value: u64) -> Vec<u64> {
+    let mut words = hash_words(msg_id).to_vec();
+    let mut tail = vec![u64::from(success), value];
+    words.append(&mut tail);
+    words
+}
+
 /// The well-known outpoint holding an OHM's locked Ox treasury on the main ledger.
 pub fn ohm_treasury_outpoint(ohm_id: &Hash) -> OutPoint {
     OutPoint::new(hash_value(&("oxydome-ohm-treasury-v1", ohm_id)), 0)
@@ -727,6 +961,14 @@ mod tests {
             name: "TestOHM".to_string(),
             genesis_supply: supply,
             block_window: 100,
+        }
+    }
+
+    fn default_ovm_dummy() -> OvmAction {
+        OvmAction::Call {
+            contract_id: Hash::zero(),
+            arguments: Vec::new(),
+            gas_limit: 100,
         }
     }
 
@@ -876,6 +1118,8 @@ mod tests {
             }],
             fee: 10,
             ovm_action: None,
+            cross_send: None,
+            cross_recv: None,
         };
         tx.sign_owned_inputs(&key);
         assert!(tx.validate_structure().is_ok());
@@ -900,5 +1144,140 @@ mod tests {
         assert!(block.is_maintainer_signed());
         assert_eq!(block.hash(), block.header.hash());
         assert_eq!(block.tx_root(), Hash::zero());
+    }
+
+    #[test]
+    fn cross_msg_id_is_domain_separated_and_sequential() {
+        let ohm = ohm_genesis_hash(&Hash::from([3u8; 64]));
+        let one = ohm_cross_msg_id(&ohm, 7, 0);
+        let two = ohm_cross_msg_id(&ohm, 7, 1);
+        assert_ne!(one, two);
+        assert_eq!(one, ohm_cross_msg_id(&ohm, 7, 0));
+        assert_ne!(one, ohm_cross_msg_id(&ohm, 8, 0));
+        assert_ne!(one, ohm_cross_msg_id(&Hash::from([4u8; 64]), 7, 0));
+    }
+
+    #[test]
+    fn cross_roots_empty_back_compat_with_v1() {
+        let utxos = BTreeMap::new();
+        let contracts = BTreeMap::new();
+        let outbox = BTreeMap::new();
+        let inbox = BTreeMap::new();
+        assert_eq!(
+            ohm_state_root_full(&utxos, &contracts, &outbox, &inbox),
+            ohm_state_root(&utxos, &contracts)
+        );
+        // The full root diverges from v1 once a message is present.
+        let mut non_empty = outbox.clone();
+        non_empty.insert(
+            Hash::from([1u8; 64]),
+            OutboundMessage {
+                msg_id: Hash::from([1u8; 64]),
+                source_ohm: Hash::zero(),
+                source_height: 1,
+                seq: 0,
+                caller: PublicKey::from([1u8; 32]),
+                target_ohm: Hash::from([2u8; 64]),
+                target_contract: Hash::from([3u8; 64]),
+                entry_selector: 42,
+                arguments: vec![],
+                gas_limit: 100,
+                want_reply: false,
+                reply_contract: None,
+                reply_entry_selector: None,
+                reply_to_msg_id: None,
+            },
+        );
+        assert_ne!(
+            ohm_state_root_full(&utxos, &contracts, &non_empty, &inbox),
+            ohm_state_root(&utxos, &contracts)
+        );
+    }
+
+    #[test]
+    fn cross_send_shape_validation() {
+        let key = KeyPair::from_seed(&[7u8; 32]);
+        let owner = key.public();
+        let target = ohm_genesis_hash(&Hash::from([1u8; 64]));
+        let build = |call: CrossSendCall| {
+            let mut tx = OhmTransaction {
+                inputs: vec![OhmInput {
+                    prev_out: OutPoint::new(Hash::zero(), 0),
+                    owner,
+                    signature: Sig([0u8; 64]),
+                }],
+                outputs: vec![OhmOutput {
+                    amount: 90,
+                    recipient: owner,
+                }],
+                fee: 10,
+                ovm_action: None,
+                cross_send: Some(call),
+                cross_recv: None,
+            };
+            tx.sign_owned_inputs(&key);
+            tx.validate_structure()
+        };
+
+        let good = CrossSendCall {
+            target_ohm: target,
+            target_contract: Hash::from([2u8; 64]),
+            entry_point: "invoke".into(),
+            arguments: vec![1, 2],
+            gas_limit: 100,
+            want_reply: false,
+            reply_contract: None,
+            reply_entry_point: None,
+        };
+        assert!(build(good.clone()).is_ok());
+
+        // Names must be valid.
+        assert!(build(CrossSendCall {
+            entry_point: "not valid!".into(),
+            ..good.clone()
+        })
+        .is_err());
+
+        // A reply requires both reply fields.
+        assert!(build(CrossSendCall {
+            want_reply: true,
+            reply_contract: None,
+            reply_entry_point: None,
+            ..good.clone()
+        })
+        .is_err());
+        assert!(build(CrossSendCall {
+            want_reply: true,
+            reply_contract: Some(Hash::from([3u8; 64])),
+            reply_entry_point: None,
+            ..good.clone()
+        })
+        .is_err());
+        assert!(build(CrossSendCall {
+            want_reply: true,
+            reply_contract: Some(Hash::from([3u8; 64])),
+            reply_entry_point: Some("on_reply".into()),
+            ..good.clone()
+        })
+        .is_ok());
+
+        // A cross-exchange action cannot be combined with a local OVM action.
+        let mut combined = OhmTransaction {
+            inputs: vec![OhmInput {
+                prev_out: OutPoint::new(Hash::zero(), 0),
+                owner,
+                signature: Sig([0u8; 64]),
+            }],
+            outputs: vec![OhmOutput {
+                amount: 90,
+                recipient: owner,
+            }],
+            fee: 10,
+            ovm_action: Some(default_ovm_dummy()),
+            cross_send: Some(good),
+            cross_recv: None,
+        };
+        combined.sign_owned_inputs(&key);
+        assert!(combined.validate_structure().is_err());
     }
 }

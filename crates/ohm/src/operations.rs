@@ -1,6 +1,6 @@
 //! Helper functions for building and signing OHM operations.
 
-use crate::{Amount, Hash, OhmContext, OhmOperation, OhmOutput, OutPoint, PublicKey};
+use crate::{Amount, CrossSendCall, Hash, OhmContext, OhmOperation, OhmOutput, OutPoint, PublicKey};
 use oxydome_core::OhmAction;
 use oxydome_crypto::KeyPair;
 
@@ -80,4 +80,37 @@ pub fn treasury_deposit_ohm_unsigned(
 /// Signs an OHM operation with the actor's key.
 pub fn sign_operation(op: &mut OhmOperation, key: &KeyPair) {
     op.sign(key);
+}
+
+/// Constructs a cross-OHM send request targeting `entry_point` on `target_contract` hosted in
+/// `target_ohm`. Does not request a reply.
+pub fn cross_send_call(
+    target_ohm: Hash,
+    target_contract: Hash,
+    entry_point: impl Into<String>,
+    arguments: Vec<u64>,
+    gas_limit: u64,
+) -> CrossSendCall {
+    CrossSendCall {
+        target_ohm,
+        target_contract,
+        entry_point: entry_point.into(),
+        arguments,
+        gas_limit,
+        want_reply: false,
+        reply_contract: None,
+        reply_entry_point: None,
+    }
+}
+
+/// Marks `call` as requesting an auto-reply to `reply_contract`'s `reply_entry_point`.
+pub fn with_reply(
+    mut call: CrossSendCall,
+    reply_contract: Hash,
+    reply_entry_point: impl Into<String>,
+) -> CrossSendCall {
+    call.want_reply = true;
+    call.reply_contract = Some(reply_contract);
+    call.reply_entry_point = Some(reply_entry_point.into());
+    call
 }

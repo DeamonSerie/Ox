@@ -7,7 +7,10 @@
 
 use crate::Node;
 use oxydome_consensus::AdmissionCertificate;
-use oxydome_core::{Amount, Block, Hash, OhmBlock, OhmState, OutPoint, PublicKey, Transaction};
+use oxydome_core::{
+    Amount, Block, Hash, InboundReceipt, OhmBlock, OhmState, OutPoint, OutboundMessage, PublicKey,
+    Transaction,
+};
 use oxydome_crypto::SparseProof;
 use oxydome_net::{
     recv_message, send_message, BalanceInfo, HistoryEntry, Message, NetError, NodeEvent,
@@ -356,6 +359,24 @@ async fn handle_connection(
                         error: Some(error.to_string()),
                     }),
                 }
+            }
+            Message::GetOhmOutbox { ohm_id } => {
+                let messages = node
+                    .lock()
+                    .unwrap()
+                    .ohm_outbox(&ohm_id)
+                    .map(|outbox| outbox.values().cloned().collect())
+                    .unwrap_or_default();
+                Some(Message::OhmOutboxResponse { ohm_id, messages })
+            }
+            Message::GetOhmInbox { ohm_id } => {
+                let receipts = node
+                    .lock()
+                    .unwrap()
+                    .ohm_inbox(&ohm_id)
+                    .map(|inbox| inbox.values().cloned().collect())
+                    .unwrap_or_default();
+                Some(Message::OhmInboxResponse { ohm_id, receipts })
             }
             Message::GetOvmCode { contract_id } => {
                 let code = node.lock().unwrap().ovm_code(&contract_id);
@@ -1060,6 +1081,28 @@ pub async fn call_ohm_contract(
         },
     )
     .await
+}
+
+/// Fetches the committed cross-OHM outbox of `ohm_id`.
+pub async fn get_ohm_outbox(
+    peer: SocketAddr,
+    ohm_id: Hash,
+) -> Result<Vec<OutboundMessage>, NetError> {
+    match request(peer, &Message::GetOhmOutbox { ohm_id }).await? {
+        Message::OhmOutboxResponse { messages, .. } => Ok(messages),
+        other => Err(NetError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Fetches the committed cross-OHM inbox (consumed receipts) of `ohm_id`.
+pub async fn get_ohm_inbox(
+    peer: SocketAddr,
+    ohm_id: Hash,
+) -> Result<Vec<InboundReceipt>, NetError> {
+    match request(peer, &Message::GetOhmInbox { ohm_id }).await? {
+        Message::OhmInboxResponse { receipts, .. } => Ok(receipts),
+        other => Err(NetError::Unexpected(format!("{other:?}"))),
+    }
 }
 
 /// Submits `tx`, returning its txid, whether it was accepted, and the rejection reason.

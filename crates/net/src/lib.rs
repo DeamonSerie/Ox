@@ -4,8 +4,8 @@
 use oxydome_audit::{AuditAttestation, AuditPackage};
 use oxydome_consensus::{AdmissionCertificate, MasterCheck, QuorumCertificate, Vote};
 use oxydome_core::{
-    Amount, Block, DaoState, Hash, OhmBlock, OhmState, Operation, OutPoint, OutputKind,
-    OvmFailureCode, OvmLog, PublicKey, Transaction,
+    Amount, Block, DaoState, Hash, InboundReceipt, OhmBlock, OhmState, Operation, OutPoint,
+    OutboundMessage, OutputKind, OvmFailureCode, OvmLog, PublicKey, Transaction,
 };
 use oxydome_crypto::{CodeManifest, SparseProof};
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,20 @@ pub enum Message {
         return_value: Option<u64>,
         logs: Vec<OvmLog>,
         error: Option<String>,
+    },
+    GetOhmOutbox {
+        ohm_id: Hash,
+    },
+    OhmOutboxResponse {
+        ohm_id: Hash,
+        messages: Vec<OutboundMessage>,
+    },
+    GetOhmInbox {
+        ohm_id: Hash,
+    },
+    OhmInboxResponse {
+        ohm_id: Hash,
+        receipts: Vec<InboundReceipt>,
     },
     // -- GAS (walletd <-> node) --
     GetGasBalance {

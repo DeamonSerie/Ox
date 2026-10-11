@@ -27,6 +27,10 @@ pub const MAX_STORAGE_SLOTS: usize = 1_024;
 pub const MAX_CONTRACTS: usize = 10_000;
 pub const ACTION_INTRINSIC_GAS: u64 = 10;
 pub const CONTRACT_DISPATCH_GAS: u64 = 5;
+/// Upper bound on the payload arguments a contract may stage in a single `XCall` message.
+pub const MAX_CROSS_ARGUMENTS: usize = 64;
+/// Fixed base cost charged for staging a cross-OHM message (`XCall`) or reading a receipt.
+pub const CROSS_HOST_GAS: u64 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Instruction {
@@ -50,6 +54,14 @@ pub enum Instruction {
     Jump(u32),
     JumpIfFalse(u32),
     Emit(u32),
+    /// Stages a contract-originated cross-OHM message. Pop order (top first): `gas_limit`,
+    /// `entry_selector`, eight `target_contract` words, eight `target_ohm` words, then
+    /// `arg_count` payload words. Pushes the staged-call token onto the stack. Requires a
+    /// [`CrossHost`].
+    XCall { arg_count: u16 },
+    /// Reads the receipt for `msg_id` (eight words). Pushes `success` then `value`. Requires a
+    /// [`CrossHost`]; a missing receipt resolves to `(success = 0, value = 0)`.
+    ReadReply,
     Return,
     Revert,
 }
@@ -370,16 +382,14 @@ impl ContractArtifact {
             .ok()
             .map(|index| &self.functions[index])
     }
-}
 
-fn valid_function_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    name.len() <= MAX_FUNCTION_NAME_BYTES
-        && (first.is_ascii_alphabetic() || first == b'_')
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    /// Finds a function by its deterministic [`fn_selector`], the numeric address used by the
+    /// cross-OHM message dispatcher.
+    pub fn function_by_selector(&self, selector: u64) -> Option<&ContractFunction> {
+        self.functions
+            .iter()
+            .find(|function| fn_selector(&function.name) == selector)
+    }
 }
 
 fn encode_value_type(value_type: ContractValueType) -> u8 {
@@ -429,12 +439,57 @@ pub struct Log {
     pub value: u64,
 }
 
+/// A cross-OHM message staged by a contract via the `XCall` instruction.
+///
+/// The executing ledger assigns each call a message id in execution order (its own outbox
+/// sequence under the current block height). `token` is the per-execution index and is what the
+/// contract receives from the instruction for correlation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedCrossCall {
+    pub token: u64,
+    pub target_ohm: Hash,
+    pub target_contract: Hash,
+    pub entry_selector: u64,
+    pub gas_limit: u64,
+    pub arguments: Vec<u64>,
+}
+
+/// The receipt summary a contract may observe through `ReadReply`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptView {
+    pub success: bool,
+    pub value: u64,
+}
+
+/// Host context for contract-originated cross-OHM instructions.
+///
+/// `origin_ohm` is the ledger executing the contract (the source of any staged `XCall`
+/// messages). `inbox` is the set of receipts already recorded on that ledger that `ReadReply`
+/// may consult. A [`CrossHost`] is never serialized and only exists while a block is being
+/// derived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossHost {
+    pub origin_ohm: Hash,
+    pub inbox: BTreeMap<Hash, ReceiptView>,
+}
+
+impl Default for CrossHost {
+    fn default() -> Self {
+        Self {
+            origin_ohm: Hash::zero(),
+            inbox: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Execution {
     pub return_value: Option<u64>,
     pub gas_used: u64,
     pub logs: Vec<Log>,
     pub storage: BTreeMap<u64, u64>,
+    /// Contract-originated cross-OHM calls staged during this execution, in program order.
+    pub staged_calls: Vec<StagedCrossCall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -482,6 +537,26 @@ pub fn contract_id(deployment_txid: Hash) -> Hash {
     hash_value(&("oxydome-contract-v1", deployment_txid))
 }
 
+/// The deterministic numeric selector for a named function, used by cross-OHM messages and the
+/// Phase-2 contract-originated `XCall` instruction (contracts address entry points with `u64`s,
+/// never with strings).
+pub fn fn_selector(name: &str) -> u64 {
+    let hash = hash_value(&("oxydome-fn-sel-v1", name));
+    u64::from_le_bytes(hash.0[..8].try_into().expect("8-byte selector"))
+}
+
+/// Whether `name` is a valid exported function name. Public so cross-chain entry point
+/// validation shares the exact same rule as artifact encoding.
+pub fn valid_function_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    name.len() <= MAX_FUNCTION_NAME_BYTES
+        && (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 pub fn verify(program: &Program) -> Result<(), VmError> {
     if program.instructions.is_empty()
         || program.argument_count as usize > MAX_ARGUMENTS
@@ -505,6 +580,9 @@ pub fn verify(program: &Program) -> Result<(), VmError> {
             {
                 return Err(VmError::InvalidProgram)
             }
+            Instruction::XCall { arg_count } if *arg_count as usize > MAX_CROSS_ARGUMENTS => {
+                return Err(VmError::InvalidProgram)
+            }
             _ => {}
         }
     }
@@ -517,6 +595,19 @@ pub fn execute(
     initial_storage: &BTreeMap<u64, u64>,
     gas_limit: u64,
 ) -> Result<Execution, ExecutionFailure> {
+    execute_with_host(program, arguments, initial_storage, gas_limit, None)
+}
+
+/// Executes `program` with an optional [`CrossHost`]. Without a host, the cross-OHM
+/// instructions (`XCall`, `ReadReply`) fail deterministically with
+/// [`VmError::InvalidProgram`].
+pub fn execute_with_host(
+    program: &Program,
+    arguments: &[u64],
+    initial_storage: &BTreeMap<u64, u64>,
+    gas_limit: u64,
+    host: Option<&CrossHost>,
+) -> Result<Execution, ExecutionFailure> {
     verify(program).map_err(|error| ExecutionFailure { error, gas_used: 0 })?;
     if arguments.len() != program.argument_count as usize {
         return Err(ExecutionFailure {
@@ -528,13 +619,16 @@ pub fn execute(
     let mut locals = vec![0u64; program.local_count as usize];
     let mut storage = initial_storage.clone();
     let mut logs = Vec::new();
+    let mut staged_calls = Vec::new();
     let mut pc = 0usize;
     let mut gas_used = 0u64;
+    let mut token_base: u64 = 0;
 
     while let Some(instruction) = program.instructions.get(pc) {
         let cost = match instruction {
             Instruction::LoadStorage(_) | Instruction::StoreStorage(_) => 5,
             Instruction::Emit(_) => 3,
+            Instruction::XCall { .. } | Instruction::ReadReply => CROSS_HOST_GAS,
             Instruction::Push(_)
             | Instruction::LoadArg(_)
             | Instruction::LoadLocal(_)
@@ -622,6 +716,105 @@ pub fn execute(
                     value,
                 });
             }),
+            Instruction::XCall { arg_count } => {
+                if host.is_none() {
+                    return Err(ExecutionFailure {
+                        error: VmError::InvalidProgram,
+                        gas_used,
+                    });
+                }
+                let arg_count = *arg_count as usize;
+                if arg_count > MAX_CROSS_ARGUMENTS {
+                    return Err(ExecutionFailure {
+                        error: VmError::InvalidProgram,
+                        gas_used,
+                    });
+                }
+                let gas_limit = match pop(&mut stack) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(ExecutionFailure { error, gas_used })
+                    }
+                };
+                let entry_selector = match pop(&mut stack) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(ExecutionFailure { error, gas_used })
+                    }
+                };
+                let mut contract_words = [0u64; 8];
+                for word in contract_words.iter_mut().rev() {
+                    *word = match pop(&mut stack) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Err(ExecutionFailure { error, gas_used })
+                        }
+                    };
+                }
+                let target_contract = Hash(words_to_hash_bytes(&contract_words));
+                let mut ohm_words = [0u64; 8];
+                for word in ohm_words.iter_mut().rev() {
+                    *word = match pop(&mut stack) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Err(ExecutionFailure { error, gas_used })
+                        }
+                    };
+                }
+                let target_ohm = Hash(words_to_hash_bytes(&ohm_words));
+                let mut arguments = Vec::with_capacity(arg_count);
+                for _ in 0..arg_count {
+                    arguments.push(match pop(&mut stack) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Err(ExecutionFailure { error, gas_used })
+                        }
+                    });
+                }
+                arguments.reverse();
+                staged_calls.push(StagedCrossCall {
+                    token: token_base,
+                    target_ohm,
+                    target_contract,
+                    entry_selector,
+                    gas_limit,
+                    arguments,
+                });
+                token_base += 1;
+                push(&mut stack, token_base - 1)
+            }
+            Instruction::ReadReply => {
+                let host = match host {
+                    Some(host) => host,
+                    None => {
+                        return Err(ExecutionFailure {
+                            error: VmError::InvalidProgram,
+                            gas_used,
+                        })
+                    }
+                };
+                let mut words = [0u64; 8];
+                for word in words.iter_mut().rev() {
+                    *word = match pop(&mut stack) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Err(ExecutionFailure { error, gas_used })
+                        }
+                    };
+                }
+                let msg_id = Hash(words_to_hash_bytes(&words));
+                let view = host
+                    .inbox
+                    .get(&msg_id)
+                    .copied()
+                    .unwrap_or(ReceiptView {
+                        success: false,
+                        value: 0,
+                    });
+                push(&mut stack, u64::from(view.success)).and_then(|()| {
+                    push(&mut stack, view.value)
+                })
+            }
             Instruction::Return => {
                 let return_value = if stack.is_empty() {
                     None
@@ -638,6 +831,7 @@ pub fn execute(
                     gas_used,
                     logs,
                     storage,
+                    staged_calls,
                 });
             }
             Instruction::Revert => {
@@ -663,6 +857,16 @@ fn push(stack: &mut Vec<u64>, value: u64) -> Result<(), VmError> {
     }
     stack.push(value);
     Ok(())
+}
+
+/// Serialises eight little-endian `u64` words (the OVM cross-message identifier convention) back
+/// into the 64-byte `Hash` byte representation they were derived from.
+fn words_to_hash_bytes(words: &[u64; 8]) -> [u8; 64] {
+    let mut bytes = [0u8; 64];
+    for (chunk, word) in bytes.chunks_exact_mut(8).zip(words.iter()) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    bytes
 }
 
 fn pop(stack: &mut Vec<u64>) -> Result<u64, VmError> {
@@ -733,6 +937,11 @@ fn encode_instruction(instruction: &Instruction, output: &mut Vec<u8>) {
             output.push(0x30);
             output.extend_from_slice(&topic.to_le_bytes());
         }
+        Instruction::XCall { arg_count } => {
+            output.push(0x40);
+            output.extend_from_slice(&arg_count.to_le_bytes());
+        }
+        Instruction::ReadReply => output.push(0x41),
         Instruction::Return => output.push(0xf0),
         Instruction::Revert => output.push(0xf1),
     }
@@ -775,6 +984,10 @@ fn decode_instruction(bytes: &[u8], cursor: &mut usize) -> Result<Instruction, V
         0x20 => Instruction::Jump(u32::from_le_bytes(take(bytes, cursor)?)),
         0x21 => Instruction::JumpIfFalse(u32::from_le_bytes(take(bytes, cursor)?)),
         0x30 => Instruction::Emit(u32::from_le_bytes(take(bytes, cursor)?)),
+        0x40 => Instruction::XCall {
+            arg_count: u16::from_le_bytes(take(bytes, cursor)?),
+        },
+        0x41 => Instruction::ReadReply,
         0xf0 => Instruction::Return,
         0xf1 => Instruction::Revert,
         _ => return Err(VmError::InvalidBytecode),
@@ -982,5 +1195,141 @@ mod tests {
                 Err(VmError::InvalidProgram)
             );
         }
+    }
+
+    fn words(hash: &Hash) -> [u64; 8] {
+        let mut words = [0u64; 8];
+        for (chunk, word) in hash.0.chunks_exact(8).zip(words.iter_mut()) {
+            *word = u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        words
+    }
+
+    #[test]
+    fn xcall_stages_message_and_returns_token() {
+        let target_ohm = Hash::from([1u8; 64]);
+        let target_contract = Hash::from([2u8; 64]);
+        let mut instructions = vec![Instruction::Push(123), Instruction::Push(456)];
+        for word in words(&target_ohm) {
+            instructions.push(Instruction::Push(word));
+        }
+        for word in words(&target_contract) {
+            instructions.push(Instruction::Push(word));
+        }
+        instructions.push(Instruction::Push(fn_selector("poke")));
+        instructions.push(Instruction::Push(400));
+        instructions.push(Instruction::XCall { arg_count: 2 });
+        instructions.push(Instruction::StoreLocal(0));
+        instructions.push(Instruction::LoadLocal(0));
+        instructions.push(Instruction::Return);
+        let program = Program {
+            argument_count: 0,
+            local_count: 1,
+            instructions,
+        };
+        let execution = execute_with_host(
+            &program,
+            &[],
+            &BTreeMap::new(),
+            1_000,
+            Some(&CrossHost {
+                origin_ohm: Hash::zero(),
+                inbox: BTreeMap::new(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(execution.staged_calls.len(), 1);
+        let call = &execution.staged_calls[0];
+        assert_eq!(call.token, 0);
+        assert_eq!(call.target_ohm, target_ohm);
+        assert_eq!(call.target_contract, target_contract);
+        assert_eq!(call.entry_selector, fn_selector("poke"));
+        assert_eq!(call.gas_limit, 400);
+        assert_eq!(call.arguments, vec![123, 456]);
+        assert_eq!(execution.return_value, Some(0));
+    }
+
+    #[test]
+    fn xcall_and_read_reply_require_a_host() {
+        let mut instructions = Vec::new();
+        for word in words(&Hash::from([1u8; 64])) {
+            instructions.push(Instruction::Push(word));
+        }
+        instructions.push(Instruction::XCall { arg_count: 0 });
+        instructions.push(Instruction::Return);
+        let xcall = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions,
+        };
+        assert_eq!(
+            execute(&xcall, &[], &BTreeMap::new(), 1_000).unwrap_err().error,
+            VmError::InvalidProgram
+        );
+        let readprogram = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![Instruction::Push(1), Instruction::ReadReply, Instruction::Return],
+        };
+        assert_eq!(
+            execute(&readprogram, &[], &BTreeMap::new(), 1_000)
+                .unwrap_err()
+                .error,
+            VmError::InvalidProgram
+        );
+    }
+
+    #[test]
+    fn read_reply_returns_receipt_or_zeros() {
+        let msg_id = Hash::from([9u8; 64]);
+        let mut instructions = Vec::new();
+        for word in words(&msg_id) {
+            instructions.push(Instruction::Push(word));
+        }
+        instructions.push(Instruction::ReadReply);
+        instructions.push(Instruction::StoreStorage(0));
+        instructions.push(Instruction::StoreStorage(1));
+        instructions.push(Instruction::Return);
+        let program = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions,
+        };
+        let mut inbox = BTreeMap::new();
+        inbox.insert(
+            msg_id,
+            ReceiptView {
+                success: true,
+                value: 41,
+            },
+        );
+        let host = CrossHost {
+            origin_ohm: Hash::zero(),
+            inbox,
+        };
+        let execution = execute_with_host(&program, &[], &BTreeMap::new(), 1_000, Some(&host))
+            .unwrap();
+        assert_eq!(execution.storage.get(&0), Some(&41));
+        assert_eq!(execution.storage.get(&1), Some(&1));
+        // Missing receipts resolve to `(success = 0, value = 0)`; zero values are pruned from
+        // storage, so both slots disappear.
+        let missing = execute_with_host(&program, &[], &BTreeMap::new(), 1_000, Some(&CrossHost {
+            origin_ohm: Hash::zero(),
+            inbox: BTreeMap::new(),
+        }))
+        .unwrap();
+        assert!(missing.storage.is_empty());
+    }
+
+    #[test]
+    fn xcall_rejects_oversized_argument_lists() {
+        let program = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![Instruction::XCall {
+                arg_count: (MAX_CROSS_ARGUMENTS + 1) as u16,
+            }],
+        };
+        assert_eq!(program.encode(), Err(VmError::InvalidProgram));
     }
 }

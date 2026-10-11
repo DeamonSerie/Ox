@@ -1,11 +1,13 @@
 //! The node-side OHM ledger: private UTXO state re-derived from anchored [`OhmBlock`]s.
 
 use crate::{
-    ohm_genesis_hash, ohm_state_root, Amount, Hash, OhmBlock, OhmContract, OhmInput, OhmOutput,
-    OhmTransaction, OhmUtxoEntry, OutPoint, PublicKey,
+    ohm_cross_msg_id, ohm_genesis_hash, ohm_state_root_full, Amount, Hash, InboundReceipt,
+    OhmBlock, OhmContract, OhmInput, OhmOutput, OhmTransaction, OhmUtxoEntry, OutboundMessage,
+    OutPoint, PublicKey, reply_arguments,
 };
-use oxydome_core::{OvmAction, OvmFailureCode};
+use oxydome_core::{CrossRecvCall, CrossSendCall, OvmAction, OvmFailureCode};
 use oxydome_crypto::KeyPair;
+use oxydome_ovm::{CrossHost, ReceiptView, StagedCrossCall};
 use std::collections::BTreeMap;
 
 /// The result of simulating an OHM-hosted contract call (never mutates the ledger).
@@ -15,6 +17,72 @@ pub struct OhmCallOutcome {
     pub gas_used: u64,
     pub return_value: Option<u64>,
     pub logs: Vec<oxydome_ovm::Log>,
+}
+
+/// The materialised result of executing a cross-chain target entry point.
+struct ExecuteOutcome {
+    failure: Option<OvmFailureCode>,
+    return_value: Option<u64>,
+    storage: Option<BTreeMap<u64, u64>>,
+}
+
+/// Flattens the in-progress cross receipts into the host view contracts observe via `ReadReply`.
+fn receipt_view(inbox: &BTreeMap<Hash, InboundReceipt>) -> BTreeMap<Hash, ReceiptView> {
+    inbox
+        .iter()
+        .map(|(id, receipt)| {
+            (
+                *id,
+                ReceiptView {
+                    success: receipt.failure.is_none(),
+                    value: receipt.return_value.unwrap_or(0),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Enqueues the staged cross calls produced by a contract execution into this ledger's outbox,
+/// preserving execution order and using the invocant's caller as the message caller. Staged
+/// calls never request replies in v1.
+fn enqueue_staged_calls(
+    outbox: &mut BTreeMap<Hash, OutboundMessage>,
+    outbox_seq: &mut u64,
+    origin_ohm: &Hash,
+    origin_height: u64,
+    caller: PublicKey,
+    staged: &[StagedCrossCall],
+) -> Result<(), OhmError> {
+    for call in staged {
+        if &call.target_ohm == origin_ohm {
+            return Err(OhmError::CrossChain(
+                "a contract cannot send a cross message to its own OHM".into(),
+            ));
+        }
+        let seq = *outbox_seq;
+        *outbox_seq = outbox_seq.checked_add(1).ok_or(OhmError::Overflow)?;
+        let msg_id = ohm_cross_msg_id(origin_ohm, origin_height, seq);
+        outbox.insert(
+            msg_id,
+            OutboundMessage {
+                msg_id,
+                source_ohm: *origin_ohm,
+                source_height: origin_height,
+                seq,
+                caller,
+                target_ohm: call.target_ohm,
+                target_contract: call.target_contract,
+                entry_selector: call.entry_selector,
+                arguments: call.arguments.clone(),
+                gas_limit: call.gas_limit,
+                want_reply: false,
+                reply_contract: None,
+                reply_entry_selector: None,
+                reply_to_msg_id: None,
+            },
+        );
+    }
+    Ok(())
 }
 
 /// Maps an OVM execution error to its stable, consensus-visible failure code.
@@ -74,12 +142,73 @@ pub enum OhmError {
     OvmContractCollision,
     #[error("OHM OVM contract limit reached")]
     OvmContractLimit,
+    #[error("a cross-chain view is required to process inbound OHM messages")]
+    CrossViewMissing,
+    #[error("cross-chain message {0:?} is unknown (not in any committed source outbox)")]
+    CrossMessageUnknown(Hash),
+    #[error("cross-chain message {0:?} was already consumed")]
+    CrossMessageDuplicate(Hash),
+    #[error("cross-chain message {0:?} targets a different OHM")]
+    CrossMessageWrongTarget(Hash),
+    #[error("cross-chain message is invalid: {0}")]
+    CrossChain(String),
+}
+
+/// A read-only view over other OHMs' *committed* outboxes, used to verify and execute inbound
+/// cross-chain messages during OHM ledger re-derivation.
+///
+/// It is built exclusively from ledgers that were finalized in a strictly earlier Ox block, so a
+/// message is only consumable one full Ox block after its source block was anchored. Messages
+/// enqueued by an OHM `Update` in the *same* Ox block are invisible here and are rejected with
+/// [`OhmError::CrossMessageUnknown`], which keeps consumption pinned to finalized state.
+#[derive(Debug, Clone, Default)]
+pub struct CrossChainView {
+    outboxes: BTreeMap<Hash, BTreeMap<Hash, OutboundMessage>>,
+}
+
+impl CrossChainView {
+    /// An empty view (no inbound messages can be resolved).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces the committed outbox view for `ohm_id`.
+    pub fn insert(&mut self, ohm_id: Hash, outbox: BTreeMap<Hash, OutboundMessage>) {
+        self.outboxes.insert(ohm_id, outbox);
+    }
+
+    /// Builds the view from a set of committed [`OhmLedger`]s.
+    pub fn from_ledgers(ledgers: &BTreeMap<Hash, OhmLedger>) -> Self {
+        let mut view = Self::new();
+        for ledger in ledgers.values() {
+            view.outboxes.insert(ledger.ohm_id, ledger.outbox.clone());
+        }
+        view
+    }
+
+    /// Resolves `msg_id` within `source_ohm`'s committed outbox.
+    pub fn resolve(&self, source_ohm: &Hash, msg_id: &Hash) -> Option<&OutboundMessage> {
+        self.outboxes.get(source_ohm)?.get(msg_id)
+    }
+
+    /// Finds `msg_id` across every outbox in the view.
+    ///
+    /// Message ids are globally unique (they commit their source OHM), so this returns at most
+    /// one message. Its `target_ohm` field determines which OHM may consume it.
+    pub fn find(&self, msg_id: &Hash) -> Option<&OutboundMessage> {
+        self.outboxes
+            .values()
+            .find_map(|outbox| outbox.get(msg_id))
+    }
 }
 
 /// The materialised result of applying a batch of OHM transactions.
 struct LedgerDelta {
     utxos: BTreeMap<Hash, OhmUtxoEntry>,
     contracts: BTreeMap<Hash, OhmContract>,
+    outbox: BTreeMap<Hash, OutboundMessage>,
+    inbox: BTreeMap<Hash, InboundReceipt>,
+    outbox_seq: u64,
     supply: Amount,
     fee_total: Amount,
 }
@@ -97,6 +226,12 @@ pub struct OhmLedger {
     pub utxos: BTreeMap<Hash, OhmUtxoEntry>,
     /// OVM contracts hosted privately by this OHM, keyed by contract id.
     pub contracts: BTreeMap<Hash, OhmContract>,
+    /// Cross-OHM messages this OHM has enqueued, keyed by [`OutboundMessage::msg_id`].
+    pub outbox: BTreeMap<Hash, OutboundMessage>,
+    /// Cross-OHM messages this OHM has consumed, keyed by [`InboundReceipt::msg_id`].
+    pub inbox: BTreeMap<Hash, InboundReceipt>,
+    /// Next per-source sequence number for outbound messages.
+    outbox_seq: u64,
     blocks: Vec<OhmBlock>,
     roots: BTreeMap<u64, Hash>,
 }
@@ -120,7 +255,9 @@ impl OhmLedger {
         }
         let supply = genesis_outputs.iter().map(|o| o.amount).sum();
         let contracts = BTreeMap::new();
-        let state_root = ohm_state_root(&utxos, &contracts);
+        let outbox = BTreeMap::new();
+        let inbox = BTreeMap::new();
+        let state_root = ohm_state_root_full(&utxos, &contracts, &outbox, &inbox);
         let block_hash = ohm_genesis_hash(&ohm_id);
         let mut roots = BTreeMap::new();
         roots.insert(0u64, state_root);
@@ -134,6 +271,9 @@ impl OhmLedger {
             state_root,
             utxos,
             contracts,
+            outbox,
+            inbox,
+            outbox_seq: 0,
             blocks: Vec::new(),
             roots,
         }
@@ -142,6 +282,16 @@ impl OhmLedger {
     /// The stored blocks, ordered by height.
     pub fn blocks(&self) -> &[OhmBlock] {
         &self.blocks
+    }
+
+    /// An outbound message by id, if this OHM has enqueued it.
+    pub fn outbound(&self, msg_id: &Hash) -> Option<&OutboundMessage> {
+        self.outbox.get(msg_id)
+    }
+
+    /// An inbound receipt by message id, if this OHM has consumed it.
+    pub fn receipt(&self, msg_id: &Hash) -> Option<&InboundReceipt> {
+        self.inbox.get(msg_id)
     }
 
     /// The state root committed at `height`, if the ledger has applied it.
@@ -161,19 +311,28 @@ impl OhmLedger {
     }
 
     /// Verifies `block` against the current ledger without mutating it.
+    ///
+    /// Uses no cross-chain view, so a block containing inbound messages is rejected. See
+    /// [`OhmLedger::verify_block_with`].
     pub fn verify_block(&self, block: &OhmBlock) -> Result<(), OhmError> {
+        self.verify_block_with(block, &CrossChainView::new())
+    }
+
+    /// Verifies `block` against the current ledger, resolving inbound cross-chain messages
+    /// against `view`, without mutating the ledger.
+    pub fn verify_block_with(&self, block: &OhmBlock, view: &CrossChainView) -> Result<(), OhmError> {
         self.check_continuity(block)?;
         if block.transactions.len() > crate::MAX_OHM_BLOCK_TXS {
             return Err(OhmError::TooManyTransactions);
         }
-        let delta = self.apply_transactions(&block.transactions)?;
+        let delta = self.apply_transactions_with(&block.transactions, Some(view))?;
         if delta.fee_total != block.header.fee_total {
             return Err(OhmError::BadFeeTotal(
                 block.header.fee_total,
                 delta.fee_total,
             ));
         }
-        let root = ohm_state_root(&delta.utxos, &delta.contracts);
+        let root = ohm_state_root_full(&delta.utxos, &delta.contracts, &delta.outbox, &delta.inbox);
         if root != block.header.state_root {
             return Err(OhmError::BadStateRoot(block.header.state_root, root));
         }
@@ -181,12 +340,23 @@ impl OhmLedger {
     }
 
     /// Applies `block`, advancing the ledger. Fails (without mutation) on any inconsistency.
+    ///
+    /// Uses no cross-chain view; see [`OhmLedger::apply_block_with`].
     pub fn apply_block(&mut self, block: &OhmBlock) -> Result<(), OhmError> {
-        self.verify_block(block)?;
-        let delta = self.apply_transactions(&block.transactions)?;
-        let root = ohm_state_root(&delta.utxos, &delta.contracts);
+        self.apply_block_with(block, &CrossChainView::new())
+    }
+
+    /// Applies `block`, advancing the ledger, resolving inbound cross-chain messages against
+    /// `view`. Fails (without mutation) on any inconsistency.
+    pub fn apply_block_with(&mut self, block: &OhmBlock, view: &CrossChainView) -> Result<(), OhmError> {
+        self.verify_block_with(block, view)?;
+        let delta = self.apply_transactions_with(&block.transactions, Some(view))?;
+        let root = ohm_state_root_full(&delta.utxos, &delta.contracts, &delta.outbox, &delta.inbox);
         self.utxos = delta.utxos;
         self.contracts = delta.contracts;
+        self.outbox = delta.outbox;
+        self.inbox = delta.inbox;
+        self.outbox_seq = delta.outbox_seq;
         self.supply = delta.supply;
         self.height = block.header.height;
         self.block_hash = block.hash();
@@ -197,11 +367,26 @@ impl OhmLedger {
     }
 
     /// Builds, signs and verifies the next block from `transactions`.
+    ///
+    /// Uses no cross-chain view, so inbound messages cannot be built; see
+    /// [`OhmLedger::build_block_with`].
     pub fn build_block(
         &self,
         transactions: Vec<OhmTransaction>,
         timestamp: u64,
         key: &KeyPair,
+    ) -> Result<OhmBlock, OhmError> {
+        self.build_block_with(transactions, timestamp, key, &CrossChainView::new())
+    }
+
+    /// Builds, signs and verifies the next block from `transactions`, resolving inbound
+    /// cross-chain messages against `view`.
+    pub fn build_block_with(
+        &self,
+        transactions: Vec<OhmTransaction>,
+        timestamp: u64,
+        key: &KeyPair,
+        view: &CrossChainView,
     ) -> Result<OhmBlock, OhmError> {
         if key.public() != self.maintainer {
             return Err(OhmError::BadMaintainer);
@@ -219,11 +404,16 @@ impl OhmLedger {
             transactions,
         );
         // Compute the resulting root and commit it to the header before signing.
-        let delta = self.apply_transactions(&block.transactions)?;
-        block.header.state_root = ohm_state_root(&delta.utxos, &delta.contracts);
+        let delta = self.apply_transactions_with(&block.transactions, Some(view))?;
+        block.header.state_root = ohm_state_root_full(
+            &delta.utxos,
+            &delta.contracts,
+            &delta.outbox,
+            &delta.inbox,
+        );
         block.header.fee_total = delta.fee_total;
         block.sign(key);
-        self.verify_block(&block)?;
+        self.verify_block_with(&block, view)?;
         Ok(block)
     }
 
@@ -251,6 +441,43 @@ impl OhmLedger {
         ovm_action: Option<OvmAction>,
         key: &KeyPair,
     ) -> OhmTransaction {
+        self.build_action_transaction(inputs, outputs, fee, ovm_action, None, None, key)
+    }
+
+    /// Builds and signs an OHM transaction with an outbound cross-chain message request.
+    pub fn build_cross_send_transaction(
+        &self,
+        inputs: Vec<(OutPoint, PublicKey)>,
+        outputs: Vec<OhmOutput>,
+        fee: Amount,
+        call: CrossSendCall,
+        key: &KeyPair,
+    ) -> OhmTransaction {
+        self.build_action_transaction(inputs, outputs, fee, None, Some(call), None, key)
+    }
+
+    /// Builds and signs an OHM transaction consuming an inbound cross-chain message.
+    pub fn build_cross_recv_transaction(
+        &self,
+        inputs: Vec<(OutPoint, PublicKey)>,
+        outputs: Vec<OhmOutput>,
+        fee: Amount,
+        call: CrossRecvCall,
+        key: &KeyPair,
+    ) -> OhmTransaction {
+        self.build_action_transaction(inputs, outputs, fee, None, None, Some(call), key)
+    }
+
+    fn build_action_transaction(
+        &self,
+        inputs: Vec<(OutPoint, PublicKey)>,
+        outputs: Vec<OhmOutput>,
+        fee: Amount,
+        ovm_action: Option<OvmAction>,
+        cross_send: Option<CrossSendCall>,
+        cross_recv: Option<CrossRecvCall>,
+        key: &KeyPair,
+    ) -> OhmTransaction {
         let mut tx = OhmTransaction {
             inputs: inputs
                 .into_iter()
@@ -263,6 +490,8 @@ impl OhmLedger {
             outputs,
             fee,
             ovm_action,
+            cross_send,
+            cross_recv,
         };
         tx.sign_owned_inputs(key);
         tx
@@ -367,9 +596,16 @@ impl OhmLedger {
         Ok(())
     }
 
-    fn apply_transactions(&self, transactions: &[OhmTransaction]) -> Result<LedgerDelta, OhmError> {
+    fn apply_transactions_with(
+        &self,
+        transactions: &[OhmTransaction],
+        view: Option<&CrossChainView>,
+    ) -> Result<LedgerDelta, OhmError> {
         let mut utxos = self.utxos.clone();
         let mut contracts = self.contracts.clone();
+        let mut outbox = self.outbox.clone();
+        let mut inbox = self.inbox.clone();
+        let mut outbox_seq = self.outbox_seq;
         let mut fee_total: Amount = 0;
         for (index, tx) in transactions.iter().enumerate() {
             tx.validate_structure()
@@ -397,7 +633,33 @@ impl OhmLedger {
             }
             let txid = tx.txid();
             if let Some(action) = &tx.ovm_action {
-                Self::apply_ovm_action(&mut contracts, action, txid, index, tx)?;
+                Self::apply_ovm_action(
+                    &mut contracts,
+                    action,
+                    txid,
+                    index,
+                    tx,
+                    &self.ohm_id,
+                    self.height + 1,
+                    &inbox,
+                    &mut outbox,
+                    &mut outbox_seq,
+                )?;
+            }
+            if let Some(call) = &tx.cross_send {
+                self.apply_cross_send(call, tx, &mut outbox, &mut outbox_seq)?;
+            }
+            if let Some(call) = &tx.cross_recv {
+                Self::apply_cross_recv(
+                    &self.ohm_id,
+                    self.height + 1,
+                    call,
+                    view,
+                    &mut contracts,
+                    &mut outbox,
+                    &mut outbox_seq,
+                    &mut inbox,
+                )?;
             }
             for (out_index, output) in tx.outputs.iter().enumerate() {
                 let outpoint = OutPoint::new(txid, out_index as u32);
@@ -413,21 +675,282 @@ impl OhmLedger {
         Ok(LedgerDelta {
             utxos,
             contracts,
+            outbox,
+            inbox,
+            outbox_seq,
             supply,
             fee_total,
         })
     }
 
-    /// Executes a private OVM action against the in-progress contract map.
+    /// Enqueues an outbound cross-chain message into the ledger's outbox.
+    fn apply_cross_send(
+        &self,
+        call: &CrossSendCall,
+        tx: &OhmTransaction,
+        outbox: &mut BTreeMap<Hash, OutboundMessage>,
+        outbox_seq: &mut u64,
+    ) -> Result<(), OhmError> {
+        if call.target_ohm == self.ohm_id {
+            return Err(OhmError::CrossChain(
+                "a message cannot target its own OHM".into(),
+            ));
+        }
+        let seq = *outbox_seq;
+        *outbox_seq = outbox_seq.checked_add(1).ok_or(OhmError::Overflow)?;
+        let msg_id = ohm_cross_msg_id(&self.ohm_id, self.height + 1, seq);
+        let message = OutboundMessage {
+            msg_id,
+            source_ohm: self.ohm_id,
+            source_height: self.height + 1,
+            seq,
+            caller: tx.inputs[0].owner,
+            target_ohm: call.target_ohm,
+            target_contract: call.target_contract,
+            entry_selector: oxydome_ovm::fn_selector(&call.entry_point),
+            arguments: call.arguments.clone(),
+            gas_limit: call.gas_limit,
+            want_reply: call.want_reply,
+            reply_contract: call.reply_contract,
+            reply_entry_selector: call
+                .reply_entry_point
+                .as_ref()
+                .map(|name| oxydome_ovm::fn_selector(name)),
+            reply_to_msg_id: None,
+        };
+        outbox.insert(msg_id, message);
+        Ok(())
+    }
+
+    /// Consumes an inbound cross-chain message: verifies it against the committed source outbox,
+    /// deterministically executes the target entry point and records a receipt. When the message
+    /// requested a reply, auto-enqueues the reply into this ledger's outbox.
+    fn apply_cross_recv(
+        consumer: &Hash,
+        processed_height: u64,
+        call: &CrossRecvCall,
+        view: Option<&CrossChainView>,
+        contracts: &mut BTreeMap<Hash, OhmContract>,
+        outbox: &mut BTreeMap<Hash, OutboundMessage>,
+        outbox_seq: &mut u64,
+        inbox: &mut BTreeMap<Hash, InboundReceipt>,
+    ) -> Result<(), OhmError> {
+        let view = view.ok_or(OhmError::CrossViewMissing)?;
+        let message = view
+            .find(&call.msg_id)
+            .cloned()
+            .ok_or(OhmError::CrossMessageUnknown(call.msg_id))?;
+        if &message.target_ohm != consumer {
+            return Err(OhmError::CrossMessageWrongTarget(call.msg_id));
+        }
+        if inbox.contains_key(&call.msg_id) {
+            return Err(OhmError::CrossMessageDuplicate(call.msg_id));
+        }
+
+        let mut failure: Option<OvmFailureCode> = None;
+        let mut return_value: Option<u64> = None;
+        let intrinsic_gas =
+            oxydome_ovm::ACTION_INTRINSIC_GAS + oxydome_ovm::CONTRACT_DISPATCH_GAS;
+        if message.gas_limit >= intrinsic_gas {
+            let mut execution_arguments: Vec<u64> = message
+                .caller
+                .0
+                .chunks_exact(8)
+                .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+                .collect();
+            execution_arguments.extend(message.arguments.iter().copied());
+            let host = CrossHost {
+                origin_ohm: *consumer,
+                inbox: receipt_view(inbox),
+            };
+            match Self::execute_cross_entry(
+                contracts,
+                &message.target_contract,
+                message.entry_selector,
+                &message.arguments,
+                &execution_arguments,
+                message.gas_limit,
+                intrinsic_gas,
+                &host,
+                outbox,
+                outbox_seq,
+                consumer,
+                processed_height,
+                message.caller,
+            ) {
+                Ok(result) => {
+                    if let Some(storage) = result.storage {
+                        if let Some(contract) = contracts.get_mut(&message.target_contract) {
+                            contract.storage = storage;
+                        }
+                    }
+                    if let Some(reverted) = result.failure {
+                        failure = Some(reverted);
+                    }
+                    return_value = result.return_value;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let mut reply_msg_id = None;
+        if message.want_reply {
+            let reply_contract = message.reply_contract.ok_or_else(|| {
+                OhmError::CrossChain("message requests a reply without a reply contract".into())
+            })?;
+            let reply_entry_selector = message.reply_entry_selector.ok_or_else(|| {
+                OhmError::CrossChain("message requests a reply without a reply entry".into())
+            })?;
+            let seq = *outbox_seq;
+            *outbox_seq = outbox_seq.checked_add(1).ok_or(OhmError::Overflow)?;
+            let reply_id = ohm_cross_msg_id(consumer, processed_height, seq);
+            let success = failure.is_none();
+            let value = match (success, failure, return_value) {
+                (true, _, Some(value)) => value,
+                (true, _, None) => 0,
+                (false, Some(code), _) => code as u64,
+                (false, None, _) => 0,
+            };
+            let reply = OutboundMessage {
+                msg_id: reply_id,
+                source_ohm: *consumer,
+                source_height: processed_height,
+                seq,
+                caller: message.caller,
+                target_ohm: message.source_ohm,
+                target_contract: reply_contract,
+                entry_selector: reply_entry_selector,
+                arguments: reply_arguments(&call.msg_id, success, value),
+                gas_limit: message.gas_limit,
+                want_reply: false,
+                reply_contract: None,
+                reply_entry_selector: None,
+                reply_to_msg_id: Some(call.msg_id),
+            };
+            outbox.insert(reply_id, reply);
+            reply_msg_id = Some(reply_id);
+        }
+
+        inbox.insert(
+            call.msg_id,
+            InboundReceipt {
+                msg_id: call.msg_id,
+                origin: message.source_ohm,
+                origin_height: message.source_height,
+                processed_height,
+                failure,
+                return_value,
+                reply_msg_id,
+                reply_to_msg_id: message.reply_to_msg_id,
+            },
+        );
+        Ok(())
+    }
+
+    /// Runs the cross-chain target entry point, returning any failure code, the storage to
+    /// commit and the staged cross calls to enqueue. Invalid bytecode and invalid programs
+    /// hard-fail the block; runtime failures (revert, out-of-gas, argument mismatch) become
+    /// failed receipts.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_cross_entry(
+        contracts: &BTreeMap<Hash, OhmContract>,
+        target_contract: &Hash,
+        entry_selector: u64,
+        arguments: &[u64],
+        execution_arguments: &[u64],
+        gas_limit: u64,
+        intrinsic_gas: u64,
+        host: &CrossHost,
+        outbox: &mut BTreeMap<Hash, OutboundMessage>,
+        outbox_seq: &mut u64,
+        origin_ohm: &Hash,
+        origin_height: u64,
+        caller: PublicKey,
+    ) -> Result<ExecuteOutcome, OhmError> {
+        let Some(contract) = contracts.get(target_contract) else {
+            return Ok(ExecuteOutcome {
+                failure: Some(OvmFailureCode::ContractNotFound),
+                return_value: None,
+                storage: None,
+            });
+        };
+        let artifact = oxydome_ovm::ContractArtifact::decode(&contract.code)
+            .map_err(|error| OhmError::Ovm(error.to_string()))?;
+        let function = artifact.function_by_selector(entry_selector);
+        let Some(function) = function else {
+            return Ok(ExecuteOutcome {
+                failure: Some(OvmFailureCode::FunctionNotFound),
+                return_value: None,
+                storage: None,
+            });
+        };
+        if function.inputs.len() != arguments.len() {
+            return Ok(ExecuteOutcome {
+                failure: Some(OvmFailureCode::ArgumentCount),
+                return_value: None,
+                storage: None,
+            });
+        }
+        let program = oxydome_ovm::Program::decode(&function.code)
+            .map_err(|error| OhmError::Ovm(error.to_string()))?;
+        let execution_limit = gas_limit - intrinsic_gas;
+        let storage = contract.storage.clone();
+        match oxydome_ovm::execute_with_host(
+            &program,
+            execution_arguments,
+            &storage,
+            execution_limit,
+            Some(host),
+        ) {
+            Ok(execution) => {
+                enqueue_staged_calls(
+                    outbox,
+                    outbox_seq,
+                    origin_ohm,
+                    origin_height,
+                    caller,
+                    &execution.staged_calls,
+                )?;
+                Ok(ExecuteOutcome {
+                    failure: None,
+                    return_value: execution.return_value,
+                    storage: Some(execution.storage),
+                })
+            }
+            Err(failure) => match failure.error {
+                oxydome_ovm::VmError::InvalidBytecode
+                | oxydome_ovm::VmError::ProgramTooLarge
+                | oxydome_ovm::VmError::InvalidProgram => {
+                    Err(OhmError::Ovm(failure.error.to_string()))
+                }
+                _ => Ok(ExecuteOutcome {
+                    failure: Some(failure_code(failure.error)),
+                    return_value: None,
+                    storage: None,
+                }),
+            },
+        }
+    }
+
+    /// Executes a private OVM action against the in-progress contract map. Calls observe a
+    /// [`CrossHost`]: staged [`Instruction::XCall`](oxydome_ovm::Instruction::XCall) results are
+    /// enqueued into the ledger outbox, and contract-originated `ReadReply` reads the receipts
+    /// recorded so far in the in-progress inbox.
     ///
     /// Mirrors the Ox execution model: a failed call leaves storage untouched (the transaction
     /// still settles), while a deploy of undecodable code invalidates the block.
+    #[allow(clippy::too_many_arguments)]
     fn apply_ovm_action(
         contracts: &mut BTreeMap<Hash, OhmContract>,
         action: &OvmAction,
         txid: Hash,
         tx_index: usize,
         tx: &OhmTransaction,
+        origin_ohm: &Hash,
+        origin_height: u64,
+        inbox: &BTreeMap<Hash, InboundReceipt>,
+        outbox: &mut BTreeMap<Hash, OutboundMessage>,
+        outbox_seq: &mut u64,
     ) -> Result<(), OhmError> {
         match action {
             OvmAction::Deploy { code, gas_limit } => {
@@ -498,6 +1021,15 @@ impl OhmLedger {
                     arguments,
                     *gas_limit,
                     oxydome_ovm::ACTION_INTRINSIC_GAS,
+                    tx.inputs[0].owner,
+                    origin_ohm,
+                    origin_height,
+                    &CrossHost {
+                        origin_ohm: *origin_ohm,
+                        inbox: receipt_view(inbox),
+                    },
+                    outbox,
+                    outbox_seq,
                 )
             }
             OvmAction::CallContract {
@@ -538,6 +1070,7 @@ impl OhmLedger {
                 execution_arguments.extend(arguments.iter().copied());
                 let program = oxydome_ovm::Program::decode(&function.code)
                     .map_err(|error| OhmError::Ovm(error.to_string()))?;
+                let caller = authority.owner;
                 Self::execute_contract_call(
                     contracts,
                     contract_id,
@@ -545,11 +1078,21 @@ impl OhmLedger {
                     &execution_arguments,
                     *gas_limit,
                     intrinsic_gas,
+                    caller,
+                    origin_ohm,
+                    origin_height,
+                    &CrossHost {
+                        origin_ohm: *origin_ohm,
+                        inbox: receipt_view(inbox),
+                    },
+                    outbox,
+                    outbox_seq,
                 )
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_contract_call(
         contracts: &mut BTreeMap<Hash, OhmContract>,
         contract_id: &Hash,
@@ -557,6 +1100,12 @@ impl OhmLedger {
         arguments: &[u64],
         gas_limit: u64,
         intrinsic_gas: u64,
+        caller: PublicKey,
+        origin_ohm: &Hash,
+        origin_height: u64,
+        host: &CrossHost,
+        outbox: &mut BTreeMap<Hash, OutboundMessage>,
+        outbox_seq: &mut u64,
     ) -> Result<(), OhmError> {
         if gas_limit < intrinsic_gas {
             return Ok(());
@@ -566,8 +1115,22 @@ impl OhmLedger {
             .get(contract_id)
             .map(|contract| contract.storage.clone())
             .unwrap_or_default();
-        match oxydome_ovm::execute(program, arguments, &storage, execution_limit) {
+        match oxydome_ovm::execute_with_host(
+            program,
+            arguments,
+            &storage,
+            execution_limit,
+            Some(host),
+        ) {
             Ok(execution) => {
+                enqueue_staged_calls(
+                    outbox,
+                    outbox_seq,
+                    origin_ohm,
+                    origin_height,
+                    caller,
+                    &execution.staged_calls,
+                )?;
                 if let Some(contract) = contracts.get_mut(contract_id) {
                     contract.storage = execution.storage;
                 }
@@ -588,7 +1151,7 @@ impl OhmLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ohm_utxo_root, OhmOutput};
+    use crate::{ohm_state_root, ohm_utxo_root, OhmOutput};
 
     fn key() -> KeyPair {
         KeyPair::from_seed(&[5u8; 32])
@@ -608,6 +1171,20 @@ mod tests {
             owner,
             &outs,
             Hash::from([9u8; 64]),
+        )
+    }
+
+    /// A second OHM (id differs from [`ledger`]) used as a cross-chain counterparty.
+    fn target_ledger(pool: Amount) -> OhmLedger {
+        let owner = key().public();
+        OhmLedger::from_genesis(
+            ohm_genesis_hash(&Hash::from([7u8; 64])),
+            owner,
+            &[OhmOutput {
+                amount: pool,
+                recipient: owner,
+            }],
+            Hash::from([8u8; 64]),
         )
     }
 
@@ -866,5 +1443,778 @@ mod tests {
         assert_eq!(outcome.return_value, Some(41));
         // Simulation never mutates the committed ledger.
         assert_eq!(deployed.contracts[&contract_id].storage.get(&0), None);
+    }
+
+    fn echo_artifact(arg_count: usize) -> Vec<u8> {
+        let code = oxydome_ovm::Program {
+            argument_count: (oxydome_ovm::AUTHORITY_WORD_COUNT + arg_count) as u8,
+            local_count: 0,
+            instructions: vec![
+                oxydome_ovm::Instruction::LoadArg(
+                    (oxydome_ovm::AUTHORITY_WORD_COUNT + arg_count - 1) as u8,
+                ),
+                oxydome_ovm::Instruction::Return,
+            ],
+        }
+        .encode()
+        .unwrap();
+        oxydome_ovm::ContractArtifact {
+            source_hash: None,
+            asset_manifest_hash: None,
+            functions: vec![oxydome_ovm::ContractFunction {
+                name: "echo".into(),
+                inputs: (0..arg_count)
+                    .map(|_| oxydome_ovm::ContractValueType::U64)
+                    .collect(),
+                output: Some(oxydome_ovm::ContractValueType::U64),
+                code,
+            }],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn on_reply_artifact() -> Vec<u8> {
+        // reply_arguments(msg_id, success, value) is 10 words (8 msg-id words + flag + value);
+        // the receiving function sees all 10 as payload arguments.
+        let arg_count = 10usize;
+        let code = oxydome_ovm::Program {
+            argument_count: (oxydome_ovm::AUTHORITY_WORD_COUNT + arg_count) as u8,
+            local_count: 0,
+            instructions: vec![
+                oxydome_ovm::Instruction::LoadArg(
+                    (oxydome_ovm::AUTHORITY_WORD_COUNT + arg_count - 1) as u8,
+                ),
+                oxydome_ovm::Instruction::StoreStorage(1),
+                oxydome_ovm::Instruction::LoadStorage(1),
+                oxydome_ovm::Instruction::Return,
+            ],
+        }
+        .encode()
+        .unwrap();
+        oxydome_ovm::ContractArtifact {
+            source_hash: None,
+            asset_manifest_hash: None,
+            functions: vec![oxydome_ovm::ContractFunction {
+                name: "on_reply".into(),
+                inputs: (0..arg_count)
+                    .map(|_| oxydome_ovm::ContractValueType::U64)
+                    .collect(),
+                output: Some(oxydome_ovm::ContractValueType::U64),
+                code,
+            }],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[test]
+    fn cross_send_enqueues_message_and_commits_root() {
+        let l = ledger(1000, 1);
+        let owner = key().public();
+        let genesis_out = l.utxos.values().next().unwrap().outpoint;
+        let target_ohm = target_ledger(1000).ohm_id;
+
+        let send = l.build_cross_send_transaction(
+            vec![(genesis_out, owner)],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: owner,
+            }],
+            100,
+            CrossSendCall {
+                target_ohm,
+                target_contract: Hash::from([3u8; 64]),
+                entry_point: "echo".into(),
+                arguments: vec![41],
+                gas_limit: 200,
+                want_reply: false,
+                reply_contract: None,
+                reply_entry_point: None,
+            },
+            &key(),
+        );
+        let block = l.build_block(vec![send], 5, &key()).unwrap();
+        let mut applied = l.clone();
+        applied.apply_block(&block).unwrap();
+
+        assert_eq!(applied.outbox.len(), 1);
+        let msg = applied.outbox.values().next().unwrap();
+        assert_eq!(msg.source_ohm, l.ohm_id);
+        assert_eq!(msg.source_height, 1);
+        assert_eq!(msg.seq, 0);
+        assert_eq!(msg.target_ohm, target_ohm);
+        assert_eq!(msg.entry_selector, oxydome_ovm::fn_selector("echo"));
+        assert_eq!(msg.caller, owner);
+        assert_eq!(msg.arguments, vec![41]);
+        // The message id is deterministic.
+        assert_eq!(msg.msg_id, ohm_cross_msg_id(&l.ohm_id, 1, 0));
+        // The committed root now commits the outbox.
+        assert_eq!(applied.state_root, block.header.state_root);
+        assert_eq!(
+            applied.state_root,
+            ohm_state_root_full(&applied.utxos, &applied.contracts, &applied.outbox, &applied.inbox)
+        );
+        assert_ne!(applied.state_root, ohm_state_root(&applied.utxos, &applied.contracts));
+    }
+
+    #[test]
+    fn cross_recv_consumes_and_auto_replies() {
+        let source = ledger(1000, 1);
+        let mut consumer = target_ledger(1000);
+        let owner = key().public();
+
+        // Consumer hosts an echo contract.
+        let deploy_tx = consumer.build_ovm_transaction(
+            vec![(consumer.utxos.values().next().unwrap().outpoint, owner)],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: owner,
+            }],
+            100,
+            Some(OvmAction::DeployContract {
+                artifact: echo_artifact(1),
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        let target_contract = oxydome_ovm::contract_id(deploy_tx.txid());
+        consumer
+            .apply_block(&consumer.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
+            .unwrap();
+
+        // Sender hosts an on_reply contract to collect the automatic reply.
+        let mut source_applied = source.clone();
+        let source_deploy_tx = source_applied.build_ovm_transaction(
+            vec![(source_applied.utxos.values().next().unwrap().outpoint, owner)],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: owner,
+            }],
+            100,
+            Some(OvmAction::DeployContract {
+                artifact: on_reply_artifact(),
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        let reply_contract = oxydome_ovm::contract_id(source_deploy_tx.txid());
+        source_applied
+            .apply_block(
+                &source_applied
+                    .build_block(vec![source_deploy_tx.clone()], 1, &key())
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // Sender enqueues a message requesting a reply.
+        let block = source_applied
+            .build_block(
+                vec![source_applied.build_cross_send_transaction(
+                    vec![(OutPoint::new(source_deploy_tx.txid(), 0), owner)],
+                    vec![OhmOutput {
+                        amount: 800,
+                        recipient: owner,
+                    }],
+                    100,
+                    CrossSendCall {
+                        target_ohm: consumer.ohm_id,
+                        target_contract,
+                        entry_point: "echo".into(),
+                        arguments: vec![41],
+                        gas_limit: 200,
+                        want_reply: true,
+                        reply_contract: Some(reply_contract),
+                        reply_entry_point: Some("on_reply".into()),
+                    },
+                    &key(),
+                )],
+                5,
+                &key(),
+            )
+            .unwrap();
+        source_applied.apply_block(&block).unwrap();
+        let msg = source_applied.outbox.values().next().unwrap().clone();
+
+        // The view is built from the *committed* sender ledger (finalized earlier).
+        let ledgers = BTreeMap::from([
+            (source_applied.ohm_id, source_applied.clone()),
+            (consumer.ohm_id, consumer.clone()),
+        ]);
+        let view = CrossChainView::from_ledgers(&ledgers);
+
+        let consume = consumer.build_cross_recv_transaction(
+            vec![(OutPoint::new(deploy_tx.txid(), 0), owner)],
+            vec![OhmOutput {
+                amount: 800,
+                recipient: owner,
+            }],
+            100,
+            CrossRecvCall { msg_id: msg.msg_id },
+            &key(),
+        );
+        let consume_block = consumer
+            .build_block_with(vec![consume], 6, &key(), &view)
+            .unwrap();
+        let mut consumed = consumer.clone();
+        consumed.apply_block_with(&consume_block, &view).unwrap();
+
+        // The target ran and its storage change is committed (echo writes nothing, but the
+        // receipt and the auto-reply are both recorded).
+        assert!(consumed.inbox.contains_key(&msg.msg_id));
+        let receipt = &consumed.inbox[&msg.msg_id];
+        assert_eq!(receipt.origin, source.ohm_id);
+        assert_eq!(receipt.origin_height, 2);
+        assert_eq!(receipt.processed_height, 2);
+        assert_eq!(receipt.failure, None);
+        assert_eq!(receipt.return_value, Some(41));
+        assert!(receipt.reply_msg_id.is_some());
+
+        // The reply is enqueued into the consumer's outbox, addressed back at the sender.
+        let reply_id = receipt.reply_msg_id.unwrap();
+        let reply = &consumed.outbox[&reply_id];
+        assert_eq!(reply.target_ohm, source.ohm_id);
+        assert_eq!(reply.target_contract, reply_contract);
+        assert_eq!(reply.entry_selector, oxydome_ovm::fn_selector("on_reply"));
+        assert_eq!(reply.reply_to_msg_id, Some(msg.msg_id));
+        assert_eq!(
+            reply.arguments,
+            reply_arguments(&msg.msg_id, true, 41)
+        );
+
+        // The sender then consumes the reply.
+        let reply_msg = consumed.outbox[&reply_id].clone();
+        let ledgers2 = BTreeMap::from([(consumed.ohm_id, consumed.clone())]);
+        let view2 = CrossChainView::from_ledgers(&ledgers2);
+        let reply_consume = source_applied;
+        let reply_tx = reply_consume.build_cross_recv_transaction(
+            vec![(reply_consume.utxos.values().next().unwrap().outpoint, owner)],
+            vec![OhmOutput {
+                amount: 700,
+                recipient: owner,
+            }],
+            100,
+            CrossRecvCall { msg_id: reply_msg.msg_id },
+            &key(),
+        );
+        let reply_block = reply_consume
+            .build_block_with(vec![reply_tx], 7, &key(), &view2)
+            .unwrap();
+        let mut final_source = reply_consume.clone();
+        final_source.apply_block_with(&reply_block, &view2).unwrap();
+
+        let reply_receipt = &final_source.inbox[&reply_msg.msg_id];
+        assert_eq!(reply_receipt.reply_to_msg_id, Some(msg.msg_id));
+        assert_eq!(reply_receipt.failure, None);
+        assert_eq!(reply_receipt.return_value, Some(41));
+        // The on_reply contract consumed the reply argument (value 41) and stored it.
+        assert_eq!(
+            final_source.contracts[&reply_contract].storage.get(&1),
+            Some(&41)
+        );
+    }
+
+    #[test]
+    fn cross_recv_unknown_message_rejected() {
+        let l = ledger(1000, 1);
+        let owner = key().public();
+        let genesis_out = l.utxos.values().next().unwrap().outpoint;
+        let tx = l.build_cross_recv_transaction(
+            vec![(genesis_out, owner)],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: owner,
+            }],
+            100,
+            CrossRecvCall {
+                msg_id: Hash::from([7u8; 64]),
+            },
+            &key(),
+        );
+        let res = l.build_block_with(vec![tx], 1, &key(), &CrossChainView::new());
+        assert!(matches!(res, Err(OhmError::CrossMessageUnknown(_))));
+    }
+
+    #[test]
+    fn cross_recv_wrong_target_rejected() {
+        let mut l = target_ledger(1000);
+        let owner = key().public();
+        let deploy_tx = l.build_ovm_transaction(
+            vec![(l.utxos.values().next().unwrap().outpoint, owner)],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: owner,
+            }],
+            100,
+            Some(OvmAction::DeployContract {
+                artifact: echo_artifact(1),
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        let target_contract = oxydome_ovm::contract_id(deploy_tx.txid());
+l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
+    .unwrap();
+
+        let other = ledger(1000, 1);
+        // The message targets `other`'s OHM, but we try to consume it here.
+        let msg_id = ohm_cross_msg_id(&other.ohm_id, 1, 0);
+        let message = OutboundMessage {
+            msg_id,
+            source_ohm: other.ohm_id,
+            source_height: 1,
+            seq: 0,
+            caller: owner,
+            target_ohm: other.ohm_id,
+            target_contract,
+            entry_selector: oxydome_ovm::fn_selector("echo"),
+            arguments: vec![41],
+            gas_limit: 200,
+            want_reply: false,
+            reply_contract: None,
+            reply_entry_selector: None,
+            reply_to_msg_id: None,
+        };
+        let mut view = CrossChainView::new();
+        view.insert(other.ohm_id, BTreeMap::from([(msg_id, message)]));
+
+        let tx = l.build_cross_recv_transaction(
+            vec![(OutPoint::new(deploy_tx.txid(), 0), owner)],
+            vec![OhmOutput {
+                amount: 800,
+                recipient: owner,
+            }],
+            100,
+            CrossRecvCall { msg_id },
+            &key(),
+        );
+        assert!(matches!(
+            l.build_block_with(vec![tx], 4, &key(), &view),
+            Err(OhmError::CrossMessageWrongTarget(_))
+        ));
+    }
+
+    #[test]
+    fn cross_recv_duplicate_rejected() {
+        let source = ledger(1000, 1);
+        let mut consumer = target_ledger(1000);
+        let owner = key().public();
+
+        let deploy_tx = consumer.build_ovm_transaction(
+            vec![(consumer.utxos.values().next().unwrap().outpoint, owner)],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: owner,
+            }],
+            100,
+            Some(OvmAction::DeployContract {
+                artifact: echo_artifact(1),
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        let target_contract = oxydome_ovm::contract_id(deploy_tx.txid());
+        consumer
+            .apply_block(&consumer.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
+            .unwrap();
+
+        let mut source_applied = source.clone();
+        let send_block = source_applied
+            .build_block(
+                vec![source_applied.build_cross_send_transaction(
+                    vec![(source_applied.utxos.values().next().unwrap().outpoint, owner)],
+                    vec![OhmOutput {
+                        amount: 900,
+                        recipient: owner,
+                    }],
+                    100,
+                    CrossSendCall {
+                        target_ohm: consumer.ohm_id,
+                        target_contract,
+                        entry_point: "echo".into(),
+                        arguments: vec![1],
+                        gas_limit: 200,
+                        want_reply: false,
+                        reply_contract: None,
+                        reply_entry_point: None,
+                    },
+                    &key(),
+                )],
+                5,
+                &key(),
+            )
+            .unwrap();
+        source_applied.apply_block(&send_block).unwrap();
+        let msg_id = source_applied.outbox.values().next().unwrap().msg_id;
+
+        let ledgers = BTreeMap::from([(source_applied.ohm_id, source_applied.clone())]);
+        let view = CrossChainView::from_ledgers(&ledgers);
+
+        // A single consume is fine.
+        let consume_block = consumer
+            .build_block_with(
+                vec![consumer.build_cross_recv_transaction(
+                    vec![(OutPoint::new(deploy_tx.txid(), 0), owner)],
+                    vec![OhmOutput {
+                        amount: 800,
+                        recipient: owner,
+                    }],
+                    100,
+                    CrossRecvCall { msg_id },
+                    &key(),
+                )],
+                6,
+                &key(),
+                &view,
+            )
+            .unwrap();
+        assert!(consume_block.transactions.len() == 1);
+
+        // A second consume of the same message, chained on the first transaction's output, must
+        // be rejected as a duplicate within a single derivation context.
+        let consume_tx = consumer.build_cross_recv_transaction(
+            vec![(OutPoint::new(deploy_tx.txid(), 0), owner)],
+            vec![OhmOutput {
+                amount: 800,
+                recipient: owner,
+            }],
+            100,
+            CrossRecvCall { msg_id },
+            &key(),
+        );
+        let second = consumer.build_cross_recv_transaction(
+            vec![(OutPoint::new(consume_tx.txid(), 0), owner)],
+            vec![OhmOutput {
+                amount: 700,
+                recipient: owner,
+            }],
+            100,
+            CrossRecvCall { msg_id },
+            &key(),
+        );
+        assert!(matches!(
+            consumer.build_block_with(vec![consume_tx, second], 7, &key(), &view),
+            Err(OhmError::CrossMessageDuplicate(_))
+        ));
+    }
+
+    /// A contract whose `fire(0)` entry point stages an `XCall` to `target_ohm` / `target_contract`
+    /// with payload `[123, 456]` and `gas_limit 400`.
+    fn xcall_launcher_artifact(target_ohm: Hash, target_contract: Hash) -> Vec<u8> {
+        use oxydome_core::hash_words;
+        let mut instructions =
+            vec![oxydome_ovm::Instruction::Push(123), oxydome_ovm::Instruction::Push(456)];
+        for word in hash_words(&target_ohm) {
+            instructions.push(oxydome_ovm::Instruction::Push(word));
+        }
+        for word in hash_words(&target_contract) {
+            instructions.push(oxydome_ovm::Instruction::Push(word));
+        }
+        instructions.push(oxydome_ovm::Instruction::Push(oxydome_ovm::fn_selector("poke")));
+        instructions.push(oxydome_ovm::Instruction::Push(400));
+        instructions.push(oxydome_ovm::Instruction::XCall { arg_count: 2 });
+        instructions.push(oxydome_ovm::Instruction::Return);
+        let code = oxydome_ovm::Program {
+            argument_count: oxydome_ovm::AUTHORITY_WORD_COUNT as u8,
+            local_count: 0,
+            instructions,
+        }
+        .encode()
+        .unwrap();
+        oxydome_ovm::ContractArtifact {
+            source_hash: None,
+            asset_manifest_hash: None,
+            functions: vec![oxydome_ovm::ContractFunction {
+                name: "fire".into(),
+                inputs: vec![],
+                output: Some(oxydome_ovm::ContractValueType::U64),
+                code,
+            }],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    #[test]
+    fn cross_contract_xcall_enqueues_staged_message() {
+        let mut a = ledger(1000, 2);
+        let b = target_ledger(1000);
+        let owner = key().public();
+        let target_contract = Hash::from([7u8; 64]);
+        let poke_selector = oxydome_ovm::fn_selector("poke");
+
+        let utxos: Vec<_> = a.utxos.values().map(|entry| entry.outpoint).collect();
+        let deploy = a.build_ovm_transaction(
+            vec![(utxos[0], owner)],
+            vec![OhmOutput {
+                amount: 400,
+                recipient: owner,
+            }],
+            100,
+            Some(OvmAction::DeployContract {
+                artifact: xcall_launcher_artifact(b.ohm_id, target_contract),
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        let contract_id = oxydome_ovm::contract_id(deploy.txid());
+        let call = a.build_ovm_transaction(
+            vec![(utxos[1], owner)],
+            vec![OhmOutput {
+                amount: 400,
+                recipient: owner,
+            }],
+            100,
+            Some(OvmAction::CallContract {
+                contract_id,
+                entry_point: "fire".into(),
+                arguments: vec![],
+                authority_input: 0,
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        let block = a.build_block(vec![deploy, call], 1, &key()).unwrap();
+        a.apply_block(&block).unwrap();
+
+        assert_eq!(a.outbox.len(), 1);
+        let (id, message) = a.outbox.iter().next().unwrap();
+        assert_eq!(*id, ohm_cross_msg_id(&a.ohm_id, 1, 0));
+        assert_eq!(message.seq, 0);
+        assert_eq!(message.source_ohm, a.ohm_id);
+        assert_eq!(message.source_height, 1);
+        assert_eq!(message.caller, owner);
+        assert_eq!(message.target_ohm, b.ohm_id);
+        assert_eq!(message.target_contract, target_contract);
+        assert_eq!(message.entry_selector, poke_selector);
+        assert_eq!(message.arguments, vec![123, 456]);
+        assert_eq!(message.gas_limit, 400);
+        assert!(!message.want_reply);
+        assert_eq!(message.reply_contract, None);
+        assert_eq!(message.reply_to_msg_id, None);
+    }
+
+    #[test]
+    fn cross_contract_read_reply_reads_committed_receipt() {
+        use oxydome_core::hash_words;
+
+        let owner = key().public();
+        let mut b = target_ledger(1000);
+        let msg_id = ohm_cross_msg_id(&b.ohm_id, 1, 0);
+        b.inbox.insert(
+            msg_id,
+            InboundReceipt {
+                msg_id,
+                origin: b.ohm_id,
+                origin_height: 1,
+                processed_height: 2,
+                failure: None,
+                return_value: Some(41),
+                reply_msg_id: None,
+                reply_to_msg_id: None,
+            },
+        );
+
+        let mut instructions = Vec::new();
+        for word in hash_words(&msg_id) {
+            instructions.push(oxydome_ovm::Instruction::Push(word));
+        }
+        instructions.push(oxydome_ovm::Instruction::ReadReply);
+        instructions.push(oxydome_ovm::Instruction::StoreStorage(0));
+        instructions.push(oxydome_ovm::Instruction::StoreStorage(1));
+        instructions.push(oxydome_ovm::Instruction::Return);
+        let code = oxydome_ovm::Program {
+            argument_count: oxydome_ovm::AUTHORITY_WORD_COUNT as u8,
+            local_count: 0,
+            instructions,
+        }
+        .encode()
+        .unwrap();
+        let artifact = oxydome_ovm::ContractArtifact {
+            source_hash: None,
+            asset_manifest_hash: None,
+            functions: vec![oxydome_ovm::ContractFunction {
+                name: "check".into(),
+                inputs: vec![],
+                output: Some(oxydome_ovm::ContractValueType::U64),
+                code,
+            }],
+        }
+        .encode()
+        .unwrap();
+
+        let utxos: Vec<_> = b.utxos.values().map(|entry| entry.outpoint).collect();
+let deploy = b.build_ovm_transaction(
+            vec![(utxos[0], owner)],
+            vec![OhmOutput {
+                amount: 950,
+                recipient: owner,
+            }],
+            50,
+            Some(OvmAction::DeployContract {
+                artifact,
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        let contract_id = oxydome_ovm::contract_id(deploy.txid());
+        let call = b.build_ovm_transaction(
+            vec![(OutPoint::new(deploy.txid(), 0), owner)],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: owner,
+            }],
+            50,
+            Some(OvmAction::CallContract {
+                contract_id,
+                entry_point: "check".into(),
+                arguments: vec![],
+                authority_input: 0,
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        let block = b.build_block(vec![deploy, call], 3, &key()).unwrap();
+        b.apply_block(&block).unwrap();
+
+        let contract = b.contracts.get(&contract_id).unwrap();
+        assert_eq!(contract.storage.get(&0), Some(&41));
+        assert_eq!(contract.storage.get(&1), Some(&1));
+    }
+
+    #[test]
+    fn cross_inbound_target_xcall_stages_message() {
+        let source = ledger(1000, 1);
+        let mut consumer = target_ledger(1000);
+        let owner = key().public();
+        let target_contract = Hash::from([7u8; 64]);
+
+        let utxos: Vec<_> = consumer.utxos.values().map(|entry| entry.outpoint).collect();
+        let deploy = consumer.build_ovm_transaction(
+            vec![(utxos[0], owner)],
+            vec![OhmOutput {
+                amount: 950,
+                recipient: owner,
+            }],
+            50,
+            Some(OvmAction::DeployContract {
+                artifact: xcall_launcher_artifact(source.ohm_id, target_contract),
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        let contract_id = oxydome_ovm::contract_id(deploy.txid());
+
+        // A dispatches a message that B's `fire` target answers by staging a message back to A.
+        let mut source_applied = source.clone();
+        let send_block = source_applied
+            .build_block(
+                vec![source_applied.build_cross_send_transaction(
+                    vec![(source_applied.utxos.values().next().unwrap().outpoint, owner)],
+                    vec![OhmOutput {
+                        amount: 900,
+                        recipient: owner,
+                    }],
+                    100,
+                    CrossSendCall {
+                        target_ohm: consumer.ohm_id,
+                        target_contract: contract_id,
+                        entry_point: "fire".into(),
+                        arguments: vec![],
+                        gas_limit: 2_000,
+                        want_reply: false,
+                        reply_contract: None,
+                        reply_entry_point: None,
+                    },
+                    &key(),
+                )],
+                5,
+                &key(),
+            )
+            .unwrap();
+        source_applied.apply_block(&send_block).unwrap();
+        let msg_id = source_applied.outbox.values().next().unwrap().msg_id;
+        // assert_eq!(msg_id, ohm_cross_msg_id(&source.ohm_id, 1, 0));
+
+        let ledgers = BTreeMap::from([(source_applied.ohm_id, source_applied.clone())]);
+        let view = CrossChainView::from_ledgers(&ledgers);
+
+        let consume_block = consumer
+            .build_block_with(
+                vec![
+                    deploy.clone(),
+                    consumer.build_cross_recv_transaction(
+                        vec![(OutPoint::new(deploy.txid(), 0), owner)],
+                        vec![OhmOutput {
+                            amount: 900,
+                            recipient: owner,
+                        }],
+                        50,
+                        CrossRecvCall { msg_id },
+                        &key(),
+                    ),
+                ],
+                6,
+                &key(),
+                &view,
+            )
+            .unwrap();
+        consumer.apply_block(&consume_block).unwrap();
+
+        // The target's staged XCall landed in B's outbox, addressed back to A.
+        assert_eq!(consumer.outbox.len(), 1);
+        let (id, message) = consumer.outbox.iter().next().unwrap();
+        assert_eq!(*id, ohm_cross_msg_id(&consumer.ohm_id, 7, 0));
+        assert_eq!(message.seq, 0);
+        assert_eq!(message.source_ohm, consumer.ohm_id);
+        assert_eq!(message.source_height, 7);
+        assert_eq!(message.caller, owner);
+        assert_eq!(message.target_ohm, source.ohm_id);
+        assert_eq!(message.target_contract, target_contract);
+        assert_eq!(message.entry_selector, oxydome_ovm::fn_selector("poke"));
+        assert_eq!(message.arguments, vec![123, 456]);
+        assert_eq!(message.gas_limit, 400);
+        assert!(!message.want_reply);
+    }
+
+    #[test]
+    fn cross_contract_xcall_to_self_rejected() {
+        let mut a = ledger(1000, 2);
+        let owner = key().public();
+        let utxos: Vec<_> = a.utxos.values().map(|entry| entry.outpoint).collect();
+        let deploy = a.build_ovm_transaction(
+            vec![(utxos[0], owner)],
+            vec![OhmOutput {
+                amount: 400,
+                recipient: owner,
+            }],
+            100,
+            Some(OvmAction::DeployContract {
+                artifact: xcall_launcher_artifact(a.ohm_id, Hash::from([7u8; 64])),
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        let contract_id = oxydome_ovm::contract_id(deploy.txid());
+        let call = a.build_ovm_transaction(
+            vec![(utxos[1], owner)],
+            vec![OhmOutput {
+                amount: 400,
+                recipient: owner,
+            }],
+            100,
+            Some(OvmAction::CallContract {
+                contract_id,
+                entry_point: "fire".into(),
+                arguments: vec![],
+                authority_input: 0,
+                gas_limit: 2_000,
+            }),
+            &key(),
+        );
+        assert!(matches!(
+            a.build_block(vec![deploy, call], 1, &key()),
+            Err(OhmError::CrossChain(_))
+        ));
     }
 }

@@ -11,8 +11,8 @@ use crate::index::{IndexStore, WalletIndex};
 use oxydome_audit::{attestation_quorum, AuditAttestation, AuditPackage, InputProof};
 use oxydome_consensus::{AdmissionCertificate, MasterCheck, QuorumCertificate, Vote, VoteKind};
 use oxydome_core::{
-    Amount, Block, ChainParams, GenesisConfig, GovernanceSet, Hash, OhmAction, OhmBlock, OhmPolicy,
-    OhmState, Operation, OutPoint, OvmAction, PublicKey, Transaction,
+    Amount, Block, ChainParams, GenesisConfig, GovernanceSet, Hash, InboundReceipt, OhmAction,
+    OhmBlock, OhmPolicy, OhmState, Operation, OutPoint, OvmAction, PublicKey, Transaction,
 };
 use oxydome_crypto::{CodeManifest, KeyPair, SparseProof};
 use oxydome_currency::rebound_utxo_spendable;
@@ -20,7 +20,7 @@ use oxydome_net::{
     BalanceInfo, FinalityEvidence, FinalizedBlockRecord, HistoryEntry, NodeEvent, TxLocation,
     TxStatus, UtxoInfo, ValueIndexInfo,
 };
-use oxydome_ohm::{OhmCallOutcome, OhmContract, OhmLedger};
+use oxydome_ohm::{CrossChainView, OhmCallOutcome, OhmContract, OhmLedger, OutboundMessage};
 use oxydome_rewards::{participation_weights, split_fees};
 use oxydome_state::{ledger_diff, ChainState, LedgerStore, StateError, UtxoEntry};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -644,11 +644,12 @@ impl Node {
     /// advanced until the anchor is finalized on Ox.
     pub fn submit_ohm_block(&mut self, block: OhmBlock) -> Result<Hash, NodeError> {
         let ohm_id = block.header.ohm_id;
+        let view = CrossChainView::from_ledgers(&self.ohm_ledgers);
         let ledger = self.ohm_ledgers.get(&ohm_id).ok_or_else(|| {
             NodeError::Operation("OHM ledger is not tracked (create is not anchored yet)".into())
         })?;
         ledger
-            .verify_block(&block)
+            .verify_block_with(&block, &view)
             .map_err(|error| NodeError::Operation(format!("invalid OHM block: {error}")))?;
         let hash = block.hash();
         if let Some(store) = &mut self.store {
@@ -700,6 +701,30 @@ impl Node {
         self.ohm_ledger(ohm_id)?.contract(contract_id)
     }
 
+    /// The committed cross-OHM outbox of `ohm_id`, if this node tracks it.
+    pub fn ohm_outbox(&self, ohm_id: &Hash) -> Option<&BTreeMap<Hash, OutboundMessage>> {
+        Some(&self.ohm_ledger(ohm_id)?.outbox)
+    }
+
+    /// The committed cross-OHM inbox (consumed receipts) of `ohm_id`, if this node tracks it.
+    pub fn ohm_inbox(&self, ohm_id: &Hash) -> Option<&BTreeMap<Hash, InboundReceipt>> {
+        Some(&self.ohm_ledger(ohm_id)?.inbox)
+    }
+
+    /// A committed outbound message by id across every tracked OHM.
+    pub fn ohm_message(&self, msg_id: &Hash) -> Option<&OutboundMessage> {
+        self.ohm_ledgers
+            .values()
+            .find_map(|ledger| ledger.outbound(msg_id))
+    }
+
+    /// A committed inbound receipt by message id across every tracked OHM.
+    pub fn ohm_receipt(&self, msg_id: &Hash) -> Option<&InboundReceipt> {
+        self.ohm_ledgers
+            .values()
+            .find_map(|ledger| ledger.receipt(msg_id))
+    }
+
     /// Simulates an OHM-hosted contract call against the current private state.
     ///
     /// Read-only: it never advances the ledger or mutates any contract storage.
@@ -728,6 +753,9 @@ impl Node {
         block: &Block,
     ) -> Result<BTreeMap<Hash, OhmLedger>, NodeError> {
         let mut ledgers = self.ohm_ledgers.clone();
+        // The cross-chain view is built once from the *committed* ledgers (finalized strictly
+        // before this block), so inbound messages always reference finalized source outboxes.
+        let view = CrossChainView::from_ledgers(&self.ohm_ledgers);
         for operation in &block.operations {
             let Operation::Ohm(ohm_operation) = operation else {
                 continue;
@@ -771,7 +799,7 @@ impl Node {
                         NodeError::Operation("OHM ledger is not tracked".into())
                     })?;
                     ledger
-                        .apply_block(ohm_block)
+                        .apply_block_with(ohm_block, &view)
                         .map_err(|error| NodeError::Operation(error.to_string()))?;
                     if ledger.height != context.ohm_height
                         || ledger.state_root != context.ohm_state_root
@@ -1339,7 +1367,8 @@ pub fn default_config(masters: usize, nodes: usize, supply: Amount) -> oxydome_c
 mod recovery_tests {
     use super::*;
     use oxydome_core::{
-        OhmOperation, OhmOutput, OHM_POLICY_VERSION, Operation, OvmAction, Transaction, TxOutput,
+        CrossRecvCall, CrossSendCall, OhmOperation, OhmOutput, OHM_POLICY_VERSION, Operation,
+        OvmAction, Transaction, TxOutput,
     };
     use oxydome_rewards::split_fees;
 
@@ -1807,5 +1836,325 @@ mod recovery_tests {
             .unwrap();
         assert_eq!(outcome.failure, None);
         assert_eq!(outcome.return_value, Some(6));
+    }
+
+    fn echo_artifact(arg_count: usize) -> Vec<u8> {
+        let code = oxydome_ovm::Program {
+            argument_count: (oxydome_ovm::AUTHORITY_WORD_COUNT + arg_count) as u8,
+            local_count: 0,
+            instructions: vec![
+                oxydome_ovm::Instruction::LoadArg(
+                    (oxydome_ovm::AUTHORITY_WORD_COUNT + arg_count - 1) as u8,
+                ),
+                oxydome_ovm::Instruction::Return,
+            ],
+        }
+        .encode()
+        .unwrap();
+        oxydome_ovm::ContractArtifact {
+            source_hash: None,
+            asset_manifest_hash: None,
+            functions: vec![oxydome_ovm::ContractFunction {
+                name: "echo".into(),
+                inputs: (0..arg_count)
+                    .map(|_| oxydome_ovm::ContractValueType::U64)
+                    .collect(),
+                output: Some(oxydome_ovm::ContractValueType::U64),
+                code,
+            }],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    fn on_reply_artifact() -> Vec<u8> {
+        // reply_arguments(msg_id, success, value) is 10 words (8 msg-id words + flag + value);
+        // stores the value for inspection.
+        let arg_count = 10usize;
+        let code = oxydome_ovm::Program {
+            argument_count: (oxydome_ovm::AUTHORITY_WORD_COUNT + arg_count) as u8,
+            local_count: 0,
+            instructions: vec![
+                oxydome_ovm::Instruction::LoadArg(
+                    (oxydome_ovm::AUTHORITY_WORD_COUNT + arg_count - 1) as u8,
+                ),
+                oxydome_ovm::Instruction::StoreStorage(1),
+                oxydome_ovm::Instruction::Return,
+            ],
+        }
+        .encode()
+        .unwrap();
+        oxydome_ovm::ContractArtifact {
+            source_hash: None,
+            asset_manifest_hash: None,
+            functions: vec![oxydome_ovm::ContractFunction {
+                name: "on_reply".into(),
+                inputs: (0..arg_count)
+                    .map(|_| oxydome_ovm::ContractValueType::U64)
+                    .collect(),
+                output: Some(oxydome_ovm::ContractValueType::U64),
+                code,
+            }],
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// Produces, applies, persists and commits the next Ox block from `node.pending_ops`.
+    fn anchor_ox_block(node: &mut Node) {
+        let height = node.state.height + 1;
+        let block = node.produce_block(height).unwrap();
+        let state = node
+            .state
+            .apply_block(&block, &node.gov, &node.params)
+            .unwrap();
+        let ledgers = node.advance_ohm_ledgers(&block).unwrap();
+        node.store
+            .as_mut()
+            .unwrap()
+            .save_version_with_ohm_and_block(
+                state.height,
+                block.hash(),
+                &state.utxo,
+                &ledger_diff(&node.state.utxo, &state.utxo),
+                &state.contracts,
+                &state.daos,
+                &state.ohm_states,
+                &(
+                    state.gas.clone(),
+                    state.gas_supply,
+                    state.ox_price,
+                    state.last_airdrop_height,
+                ),
+                &block,
+            )
+            .unwrap();
+        node.state = state;
+        node.ohm_ledgers = ledgers;
+        node.pending_ops.clear();
+    }
+
+    fn create_ohm_op(maintainer: &KeyPair, name: &str) -> OhmOperation {
+        let policy = OhmPolicy {
+            version: OHM_POLICY_VERSION,
+            maintainer: maintainer.public(),
+            name: name.to_string(),
+            genesis_supply: 1000,
+            block_window: 10,
+        };
+        let mut create = OhmOperation::new_unsigned(
+            maintainer.public(),
+            OhmAction::Create {
+                policy_bytes: policy.encode().unwrap(),
+                genesis_outputs: vec![OhmOutput {
+                    amount: 1000,
+                    recipient: maintainer.public(),
+                }],
+            },
+        );
+        create.sign(maintainer);
+        create
+    }
+
+    fn anchor_ohm_block(node: &mut Node, ohm_id: Hash, block: OhmBlock, maintainer: &KeyPair) {
+        let mut update = OhmOperation::new_unsigned(
+            block.header.maintainer,
+            OhmAction::Update {
+                ohm_id,
+                context: block.context(),
+                block_hash: block.hash(),
+                fee_total: block.header.fee_total,
+            },
+        );
+        update.sign(maintainer);
+        node.pending_ops.push(Operation::Ohm(update));
+        node.submit_ohm_block(block).unwrap();
+        anchor_ox_block(node);
+    }
+
+    #[test]
+    fn cross_ohm_relay_reply_and_restore() {
+        let app_config = default_config(1, 1, 100_000);
+        let genesis_config = app_config.genesis().unwrap();
+        let key = app_config.nodes[0].keypair().unwrap();
+        let (mut node, genesis) = Node::new(key.clone(), &genesis_config, None).unwrap();
+
+        let mut store = LedgerStore::open_temporary().unwrap();
+        store
+            .init_genesis_with_block(&genesis, &node.state.utxo, &node.state.contracts)
+            .unwrap();
+        node.store = Some(store);
+
+        let maintainer_a = KeyPair::from_seed(&[11u8; 32]);
+        let maintainer_b = KeyPair::from_seed(&[12u8; 32]);
+
+        // Create OHM A and OHM B.
+        let create_a = create_ohm_op(&maintainer_a, "tenant-a");
+        let ohm_a = create_a.created_ohm_id().unwrap();
+        node.pending_ops.push(Operation::Ohm(create_a));
+        anchor_ox_block(&mut node);
+
+        let create_b = create_ohm_op(&maintainer_b, "tenant-b");
+        let ohm_b = create_b.created_ohm_id().unwrap();
+        node.pending_ops.push(Operation::Ohm(create_b));
+        anchor_ox_block(&mut node);
+
+        // B hosts an echo contract.
+        let ledger_b = node.ohm_ledgers[&ohm_b].clone();
+        let deploy_b = ledger_b.build_ovm_transaction(
+            vec![(ledger_b.utxos.values().next().unwrap().outpoint, maintainer_b.public())],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: maintainer_b.public(),
+            }],
+            100,
+            Some(OvmAction::DeployContract {
+                artifact: echo_artifact(1),
+                gas_limit: 2_000,
+            }),
+            &maintainer_b,
+        );
+        let target_contract = oxydome_ovm::contract_id(deploy_b.txid());
+        anchor_ohm_block(
+            &mut node,
+            ohm_b,
+            ledger_b
+                .build_block(vec![deploy_b.clone()], 3, &maintainer_b)
+                .unwrap(),
+            &maintainer_b,
+        );
+
+        // A hosts an on_reply contract and sends a message requesting a reply.
+        let ledger_a = node.ohm_ledgers[&ohm_a].clone();
+        let deploy_a = ledger_a.build_ovm_transaction(
+            vec![(ledger_a.utxos.values().next().unwrap().outpoint, maintainer_a.public())],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: maintainer_a.public(),
+            }],
+            100,
+            Some(OvmAction::DeployContract {
+                artifact: on_reply_artifact(),
+                gas_limit: 2_000,
+            }),
+            &maintainer_a,
+        );
+        let reply_contract = oxydome_ovm::contract_id(deploy_a.txid());
+        let send = ledger_a.build_cross_send_transaction(
+            vec![(OutPoint::new(deploy_a.txid(), 0), maintainer_a.public())],
+            vec![OhmOutput {
+                amount: 800,
+                recipient: maintainer_a.public(),
+            }],
+            100,
+            CrossSendCall {
+                target_ohm: ohm_b,
+                target_contract,
+                entry_point: "echo".into(),
+                arguments: vec![41],
+                gas_limit: 200,
+                want_reply: true,
+                reply_contract: Some(reply_contract),
+                reply_entry_point: Some("on_reply".into()),
+            },
+            &maintainer_a,
+        );
+        anchor_ohm_block(
+            &mut node,
+            ohm_a,
+            ledger_a.build_block(vec![deploy_a, send], 5, &maintainer_a).unwrap(),
+            &maintainer_a,
+        );
+
+        // A's outbox now carries the outbound message.
+        let msg_id = node.ohm_outbox(&ohm_a).unwrap().values().next().unwrap().msg_id;
+        assert!(node.ohm_message(&msg_id).is_some());
+
+        // B consumes the message in a later Ox block, executing the target and auto-replying.
+        let view = CrossChainView::from_ledgers(&node.ohm_ledgers);
+        let ledger_b = node.ohm_ledgers[&ohm_b].clone();
+        let consume = ledger_b.build_cross_recv_transaction(
+            vec![(OutPoint::new(deploy_b.txid(), 0), maintainer_b.public())],
+            vec![OhmOutput {
+                amount: 800,
+                recipient: maintainer_b.public(),
+            }],
+            100,
+            CrossRecvCall { msg_id },
+            &maintainer_b,
+        );
+        anchor_ohm_block(
+            &mut node,
+            ohm_b,
+            ledger_b.build_block_with(vec![consume], 6, &maintainer_b, &view).unwrap(),
+            &maintainer_b,
+        );
+
+        let receipt = &node.ohm_ledgers[&ohm_b].inbox[&msg_id];
+        assert_eq!(receipt.failure, None);
+        assert_eq!(receipt.return_value, Some(41));
+        let reply_id = receipt.reply_msg_id.unwrap();
+        let reply = &node.ohm_ledgers[&ohm_b].outbox[&reply_id];
+        assert_eq!(reply.target_ohm, ohm_a);
+        assert_eq!(reply.target_contract, reply_contract);
+        assert_eq!(reply.reply_to_msg_id, Some(msg_id));
+
+        // A consumes the reply.
+        let view = CrossChainView::from_ledgers(&node.ohm_ledgers);
+        let ledger_a = node.ohm_ledgers[&ohm_a].clone();
+        let consume_reply = ledger_a.build_cross_recv_transaction(
+            vec![(ledger_a.utxos.values().next().unwrap().outpoint, maintainer_a.public())],
+            vec![OhmOutput {
+                amount: 700,
+                recipient: maintainer_a.public(),
+            }],
+            100,
+            CrossRecvCall { msg_id: reply_id },
+            &maintainer_a,
+        );
+        anchor_ohm_block(
+            &mut node,
+            ohm_a,
+            ledger_a.build_block_with(vec![consume_reply], 7, &maintainer_a, &view).unwrap(),
+            &maintainer_a,
+        );
+
+        let reply_receipt = &node.ohm_ledgers[&ohm_a].inbox[&reply_id];
+        assert_eq!(reply_receipt.failure, None);
+        assert_eq!(reply_receipt.reply_to_msg_id, Some(msg_id));
+        assert_eq!(
+            node.ohm_ledgers[&ohm_a].contracts[&reply_contract].storage.get(&1),
+            Some(&41)
+        );
+        assert!(node.ohm_receipt(&reply_id).is_some());
+
+        // Outbox entries persist (no pruning in v1); the message and reply are both queryable.
+        assert_eq!(node.ohm_ledgers[&ohm_a].outbox.len(), 1);
+        assert_eq!(node.ohm_ledgers[&ohm_b].outbox.len(), 1);
+
+        // Restore from the persisted store and confirm the cross-chain state is re-derived
+        // identically (the one-Ox-block view rule makes replay deterministic).
+        let store = node.store.take().unwrap();
+        let (fresh_node, _) = Node::new(key, &genesis_config, None).unwrap();
+        let restored = fresh_node.restore_from_store(store, None).unwrap();
+
+        assert_eq!(
+            restored.ohm_ledgers[&ohm_a].state_root,
+            node.ohm_ledgers[&ohm_a].state_root
+        );
+        assert_eq!(
+            restored.ohm_ledgers[&ohm_b].state_root,
+            node.ohm_ledgers[&ohm_b].state_root
+        );
+        assert!(restored.ohm_receipt(&reply_id).is_some());
+        assert!(restored.ohm_message(&msg_id).is_some());
+        assert_eq!(
+            restored.ohm_ledgers[&ohm_b].inbox[&msg_id].failure,
+            None
+        );
+        assert_eq!(
+            restored.ohm_ledgers[&ohm_a].inbox[&reply_id].reply_to_msg_id,
+            Some(msg_id)
+        );
     }
 }
