@@ -392,20 +392,41 @@ pub fn header_audit(
                         expected_master_total
                     )));
                 }
-                // Verify individual output amounts match (allowing for rounding)
-                for (i, output) in r.server_outputs.iter().enumerate() {
-                    if i < server_rewards.len() && output.amount != server_rewards[i].amount {
+                // Verify individual server outputs match the expected amount and recipient.
+                if r.server_outputs.len() != server_rewards.len() {
+                    return Err(AuditError::Guardrail(
+                        "server reward output count does not match expected".into(),
+                    ));
+                }
+                for (i, (output, expected)) in r
+                    .server_outputs
+                    .iter()
+                    .zip(server_rewards.iter())
+                    .enumerate()
+                {
+                    if output.amount != expected.amount || output.recipient != expected.recipient {
                         return Err(AuditError::Guardrail(format!(
-                            "server reward output {} amount {} does not match expected {}",
-                            i, output.amount, server_rewards[i].amount
+                            "server reward output {} amount {} differs from expected {} (or recipient differs)",
+                            i, output.amount, expected.amount
                         )));
                     }
                 }
-                for (i, output) in r.master_outputs.iter().enumerate() {
-                    if i < master_rewards.len() && output.amount != master_rewards[i].amount {
+                // Verify individual master outputs match the expected amount and recipient.
+                if r.master_outputs.len() != master_rewards.len() {
+                    return Err(AuditError::Guardrail(
+                        "master reward output count does not match expected".into(),
+                    ));
+                }
+                for (i, (output, expected)) in r
+                    .master_outputs
+                    .iter()
+                    .zip(master_rewards.iter())
+                    .enumerate()
+                {
+                    if output.amount != expected.amount || output.recipient != expected.recipient {
                         return Err(AuditError::Guardrail(format!(
-                            "master reward output {} amount {} does not match expected {}",
-                            i, output.amount, master_rewards[i].amount
+                            "master reward output {} amount {} differs from expected {} (or recipient differs)",
+                            i, output.amount, expected.amount
                         )));
                     }
                 }

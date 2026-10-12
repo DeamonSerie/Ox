@@ -795,13 +795,22 @@ impl Node {
                     ohm_id,
                     context,
                     block_hash,
-                    ..
+                    fee_total,
                 } => {
                     let ohm_block = self.ohm_blocks.get(block_hash).ok_or_else(|| {
                         NodeError::Operation(
                             "anchored OHM block is not retained by this node".into(),
                         )
                     })?;
+                    // The Ox anchor settles `fee_total` Ox of fees into the Ox supply. It must
+                    // equal the fees actually committed by the anchored OHM block; otherwise a
+                    // maintainer could anchor a valid block while claiming an arbitrary fee total
+                    // and mint unbacked Ox.
+                    if *fee_total != ohm_block.header.fee_total {
+                        return Err(NodeError::Operation(
+                            "OHM anchor fee total does not match the anchored block".into(),
+                        ));
+                    }
                     let ledger = ledgers.get_mut(ohm_id).ok_or_else(|| {
                         NodeError::Operation("OHM ledger is not tracked".into())
                     })?;
@@ -1654,6 +1663,93 @@ mod recovery_tests {
             restored_ledger.state_root,
             restored.state.ohm_states[&ohm_id].state_root
         );
+    }
+
+    #[test]
+    fn rejects_ohm_anchor_with_unmatched_fee_total() {
+        let app_config = default_config(1, 1, 100_000);
+        let genesis_config = app_config.genesis().unwrap();
+        let key = app_config.nodes[0].keypair().unwrap();
+        let (mut node, _genesis) = Node::new(key, &genesis_config, None).unwrap();
+
+        // Create the OHM and anchor the Create operation at Ox height 1.
+        let maintainer = KeyPair::from_seed(&[42u8; 32]);
+        let policy = OhmPolicy {
+            version: OHM_POLICY_VERSION,
+            maintainer: maintainer.public(),
+            name: "tenant".to_string(),
+            genesis_supply: 1000,
+            block_window: 10,
+        };
+        let genesis_outputs = vec![OhmOutput {
+            amount: 1000,
+            recipient: maintainer.public(),
+            lock: false,
+        }];
+        let mut create = OhmOperation::new_unsigned(
+            maintainer.public(),
+            OhmAction::Create {
+                policy_bytes: policy.encode().unwrap(),
+                genesis_outputs,
+            },
+        );
+        create.sign(&maintainer);
+        let ohm_id = create.created_ohm_id().unwrap();
+        node.pending_ops.push(Operation::Ohm(create));
+
+        let block1 = node.produce_block(1).unwrap();
+        let state1 = node
+            .state
+            .apply_block(&block1, &node.gov, &node.params)
+            .unwrap();
+        let ohm1 = node.advance_ohm_ledgers(&block1).unwrap();
+        node.state = state1;
+        node.ohm_ledgers = ohm1;
+        node.pending_ops.clear();
+
+        // Build and submit a private OHM block moving 900 with a 100 fee.
+        let ledger = node.ohm_ledgers[&ohm_id].clone();
+        let genesis_out = ledger.utxos.values().next().unwrap().outpoint;
+        let tx = ledger.build_transaction(
+            vec![(genesis_out, maintainer.public())],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: maintainer.public(),
+                lock: false,
+            }],
+            100,
+            &maintainer,
+        );
+        let ohm_block = ledger.build_block(vec![tx], 5, &maintainer).unwrap();
+        let ohm_block_hash = node.submit_ohm_block(ohm_block.clone()).unwrap();
+
+        // Anchor a *mismatched* fee total: the maintainer claims 1_100 Ox of fees instead of
+        // the 100 actually committed by the OHM block. The node must refuse the anchor so no
+        // unbacked Ox is settled into the Ox supply.
+        let mut update = OhmOperation::new_unsigned(
+            maintainer.public(),
+            OhmAction::Update {
+                ohm_id,
+                context: ohm_block.context(),
+                block_hash: ohm_block_hash,
+                fee_total: ohm_block.header.fee_total + 1_000,
+            },
+        );
+        update.sign(&maintainer);
+        node.pending_ops.push(Operation::Ohm(update));
+
+        let block2 = node.produce_block(2).unwrap();
+        let _state2 = node
+            .state
+            .apply_block(&block2, &node.gov, &node.params)
+            .unwrap();
+        assert!(matches!(
+            node.advance_ohm_ledgers(&block2),
+            Err(NodeError::Operation(_))
+        ));
+        // The OHM ledger must not have advanced to the anchored height nor moved any value.
+        assert_eq!(node.ohm_ledgers[&ohm_id].height, 0);
+        assert_eq!(node.ohm_ledgers[&ohm_id].supply, 1000);
     }
 
     #[test]

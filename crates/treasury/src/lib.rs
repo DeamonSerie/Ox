@@ -8,18 +8,20 @@ use oxydome_core::{
 use oxydome_crypto::KeyPair;
 use oxydome_currency::{max_supply_change, supply_change_cap, WindowStats};
 
-/// Creates a mint proposal with no approvals yet.
-pub fn mint_proposal(amount: Amount, recipient: PublicKey) -> TreasuryMint {
+/// Creates a mint proposal with no approvals yet. `nonce` must be unique per proposal so that
+/// a previously signed proposal cannot be replayed.
+pub fn mint_proposal(amount: Amount, recipient: PublicKey, nonce: u64) -> TreasuryMint {
     TreasuryMint {
         amount,
         recipient,
+        nonce,
         approvals: Vec::new(),
     }
 }
 
 /// The proposal id that master approvals must sign for a mint.
-pub fn mint_proposal_id(amount: Amount, recipient: PublicKey) -> Hash {
-    Operation::Mint(mint_proposal(amount, recipient)).proposal_id()
+pub fn mint_proposal_id(amount: Amount, recipient: PublicKey, nonce: u64) -> Hash {
+    Operation::Mint(mint_proposal(amount, recipient, nonce)).proposal_id()
 }
 
 /// Appends a master's approval to a mint.

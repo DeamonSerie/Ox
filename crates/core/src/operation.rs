@@ -38,10 +38,15 @@ impl NodeApproval {
 }
 
 /// A proposal to mint new Ox. Requires master super-majority approval.
+///
+/// `nonce` makes each proposal (and its derived proposal id and minted outpoint) unique. It is
+/// part of the signed payload, so a previously approved proposal cannot be replayed to mint the
+/// same amount again without fresh approvals for a new nonce.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreasuryMint {
     pub amount: Amount,
     pub recipient: PublicKey,
+    pub nonce: u64,
     pub approvals: Vec<MasterApproval>,
 }
 
@@ -147,6 +152,7 @@ enum SignableOperation {
     Mint {
         amount: Amount,
         recipient: PublicKey,
+        nonce: u64,
     },
     Burn {
         source: OutPoint,
@@ -205,6 +211,7 @@ impl Operation {
             Operation::Mint(m) => SignableOperation::Mint {
                 amount: m.amount,
                 recipient: m.recipient,
+                nonce: m.nonce,
             },
             Operation::Burn(b) => SignableOperation::Burn {
                 source: b.source,

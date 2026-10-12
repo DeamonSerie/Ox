@@ -117,12 +117,15 @@ impl HeaderChain {
     }
 
     /// Records a finalized block header.
-    pub fn append(&mut self, block: &Block, params: &ChainParams) {
+    pub fn append(&mut self, block: &Block, params: &ChainParams) -> Result<(), String> {
+        // An epoch change is effectuated by a governance-co-signed `EpochTransition`, never by
+        // a self-declared header field. Rejecting it here (and in `MasterNode::audit`) stops a
+        // proposer from resetting the per-epoch mint/burn/withdraw caps by bumping the header.
         if block.header.epoch != self.epoch {
-            self.epoch = block.header.epoch;
-            self.epoch_minted = 0;
-            self.epoch_burned = 0;
-            self.epoch_withdrawn = 0;
+            return Err(format!(
+                "unsolicited epoch change from {} to {}",
+                self.epoch, block.header.epoch
+            ));
         }
         self.stats.push_back(WindowStats {
             volume: block.header.volume,
@@ -145,8 +148,12 @@ impl HeaderChain {
                 oxydome_core::Operation::Withdraw(w) => {
                     self.epoch_withdrawn = self.epoch_withdrawn.saturating_add(w.amount)
                 }
-                oxydome_core::Operation::BlockRewards(_) => {
-                    // prev_server_block_reward is set by the block's BlockRewards operation
+                oxydome_core::Operation::BlockRewards(r) => {
+                    // Derive the next block's master-reward baseline from this block's server
+                    // rewards (the producing node does the same in `produce_block`). Without
+                    // tracking it, `header_audit` would derive a different master-reward total
+                    // than the proposer and reject every reward-bearing block.
+                    self.prev_server_block_reward = Some(r.server_total());
                 }
                 oxydome_core::Operation::Gas(g) => {
                     if let oxydome_core::GasAction::SetOxPrice { price } = &g.action {
@@ -154,10 +161,9 @@ impl HeaderChain {
                         self.price_last_update_height = block.header.height;
                     }
                 }
-                oxydome_core::Operation::Rewards(_) 
-                | oxydome_core::Operation::Dao(_) 
-                | oxydome_core::Operation::Ohm(_) => {}
-                | oxydome_core::Operation::Gas(_) => {}
+                oxydome_core::Operation::Rewards(_)
+                | oxydome_core::Operation::Dao(_)
+                | oxydome_core::Operation::Ohm(_)
                 | oxydome_core::Operation::PriceChange(_) => {}
             }
         }
@@ -165,6 +171,7 @@ impl HeaderChain {
         self.value_index = block.header.value_index;
         self.generation = block.header.generation;
         self.headers.push(block.header.clone());
+        Ok(())
     }
 }
 
@@ -229,7 +236,13 @@ impl MasterNode {
 
     /// Audits a proposed block and returns the master's signed attestation.
     pub fn audit(&self, package: &AuditPackage) -> Result<AuditAttestation, AuditError> {
-        let epoch_changed = package.block.header.epoch != self.chain.epoch;
+        // Epoch changes are governance-co-signed transitions, not self-declared header fields.
+        if package.block.header.epoch != self.chain.epoch {
+            return Err(AuditError::Guardrail(format!(
+                "unsolicited epoch change from {} to {}",
+                self.chain.epoch, package.block.header.epoch
+            )));
+        }
         let ctx = HeaderAuditContext {
             pre_utxo_root: self.chain.prev_utxo_root(),
             prev_supply: self.chain.supply,
@@ -237,21 +250,9 @@ impl MasterNode {
             prev_generation: self.chain.generation,
             previous_window: self.chain.previous_window(&self.params),
             genesis_supply: self.chain.genesis_supply,
-            epoch_minted: if epoch_changed {
-                0
-            } else {
-                self.chain.epoch_minted
-            },
-            epoch_burned: if epoch_changed {
-                0
-            } else {
-                self.chain.epoch_burned
-            },
-            epoch_withdrawn: if epoch_changed {
-                0
-            } else {
-                self.chain.epoch_withdrawn
-            },
+            epoch_minted: self.chain.epoch_minted,
+            epoch_burned: self.chain.epoch_burned,
+            epoch_withdrawn: self.chain.epoch_withdrawn,
             prev_server_block_reward: self.chain.prev_server_block_reward,
             ox_price: self.chain.ox_price,
             price_last_update_height: self.chain.price_last_update_height,
@@ -300,7 +301,7 @@ impl MasterNode {
         ) {
             return Err("finalized block lacks a valid master-check quorum".into());
         }
-        self.chain.append(block, &self.params);
+        self.chain.append(block, &self.params)?;
         Ok(())
     }
 
@@ -344,3 +345,106 @@ pub fn genesis_master(key: KeyPair, config: &GenesisConfig, genesis: &Block) -> 
 
 /// Convenience alias for [`MasterProposal`] re-export.
 pub type Proposal = MasterProposal;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxydome_core::{GenesisAllocation, GenesisConfig, TxOutput};
+    use oxydome_state::ChainState;
+
+    fn reward_config() -> (
+        MasterNode,
+        ChainState,
+        GovernanceSet,
+        ChainParams,
+        KeyPair,
+        KeyPair,
+    ) {
+        let master_key = KeyPair::from_seed(&[1u8; 32]);
+        let node_key = KeyPair::from_seed(&[2u8; 32]);
+        let filler_key = KeyPair::from_seed(&[3u8; 32]);
+        let mut params = ChainParams::default_local();
+        params.block_window = 10;
+        params.block_rewards_enabled = true;
+        let config = GenesisConfig {
+            params: params.clone(),
+            allocations: vec![
+                GenesisAllocation {
+                    recipient: node_key.public(),
+                    amount: 10_000,
+                },
+                GenesisAllocation {
+                    recipient: master_key.public(),
+                    amount: 10_000,
+                },
+                GenesisAllocation {
+                    recipient: filler_key.public(),
+                    amount: 999_980_000,
+                },
+            ],
+            masters: vec![master_key.public()],
+            nodes: vec![node_key.public()],
+            timestamp: 0,
+        };
+        let (state, genesis, gov) = ChainState::genesis(&config).unwrap();
+        let master = MasterNode::new(master_key.clone(), gov.clone(), params.clone(), &genesis);
+        (master, state, gov, params, master_key, node_key)
+    }
+
+    #[test]
+    fn master_tracks_previous_server_reward_from_block_rewards() {
+        let (mut master, state, gov, params, _master_key, node_key) = reward_config();
+
+        let reward = oxydome_core::Operation::BlockRewards(
+            oxydome_core::BlockRewardDistribution {
+                server_outputs: vec![TxOutput::locked_reward(42, node_key.public())],
+                master_outputs: Vec::new(),
+            },
+        );
+        let block = state
+            .build_block(
+                &gov,
+                &params,
+                Vec::new(),
+                vec![reward],
+                node_key.public(),
+                1,
+            )
+            .unwrap();
+        master.chain.append(&block, &params).unwrap();
+        assert_eq!(master.chain.prev_server_block_reward, Some(42));
+
+        // The baseline rolls forward to the next reward-bearing block so `header_audit` can
+        // derive the same master-reward total as the proposer.
+        let state1 = state.apply_block(&block, &gov, &params).unwrap();
+        let reward2 = oxydome_core::Operation::BlockRewards(
+            oxydome_core::BlockRewardDistribution {
+                server_outputs: vec![TxOutput::locked_reward(88, node_key.public())],
+                master_outputs: Vec::new(),
+            },
+        );
+        let block2 = state1
+            .build_block(
+                &gov,
+                &params,
+                Vec::new(),
+                vec![reward2],
+                node_key.public(),
+                2,
+            )
+            .unwrap();
+        master.chain.append(&block2, &params).unwrap();
+        assert_eq!(master.chain.prev_server_block_reward, Some(88));
+    }
+
+    #[test]
+    fn master_rejects_a_self_declared_epoch_change() {
+        let (mut master, state, gov, params, _master_key, node_key) = reward_config();
+        let mut block = state
+            .build_block(&gov, &params, Vec::new(), Vec::new(), node_key.public(), 1)
+            .unwrap();
+        block.header.epoch = block.header.epoch + 1;
+        assert!(master.chain.append(&block, &params).is_err());
+        assert_eq!(master.chain.epoch_minted, 0);
+    }
+}

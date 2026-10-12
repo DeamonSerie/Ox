@@ -16,3 +16,6 @@ thiserror.workspace = true
 sled.workspace = true
 
 [dev-dependencies]
+oxydome-rewards.workspace = true
+oxydome-treasury.workspace = true
+tempfile.workspace = true

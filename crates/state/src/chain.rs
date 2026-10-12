@@ -20,7 +20,7 @@ use oxydome_currency::{
     compute_value, max_withdraw_per_account, rebound_utxo_spendable, supply_change_cap,
     supply_impact_ok, withdraw_cap, WindowStats,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OvmContract {
@@ -57,6 +57,10 @@ pub enum StateError {
     Conservation,
     #[error("reward distribution is missing or duplicated")]
     BadRewardCount,
+    #[error("block contains duplicate operations")]
+    DuplicateOperation,
+    #[error("mint outpoint was already recorded")]
+    AlreadyMinted,
     #[error("reward total {0} does not equal block fees {1}")]
     RewardTotalMismatch(Amount, Amount),
     #[error("reward split is incorrect")]
@@ -95,8 +99,8 @@ pub enum StateError {
     GenerationMismatch(u64, u64),
     #[error("computed state root does not match header")]
     StateRootMismatch,
-    #[error("epoch regression from {0} to {1}")]
-    EpochRegression(u64, u64),
+    #[error("unsolicited epoch change from {0} to {1}")]
+    EpochChange(u64, u64),
     #[error("header window statistics do not match the block body")]
     StatsMismatch,
     #[error("OVM execution failed in transaction {0}: {1}")]
@@ -447,18 +451,27 @@ impl ChainState {
         if !gov.contains_node(&block.header.producer) {
             return Err(StateError::UnauthorizedProducer(block.header.producer));
         }
-        if block.header.epoch < self.epoch {
-            return Err(StateError::EpochRegression(self.epoch, block.header.epoch));
+        // An epoch change is effectuated by a governance-co-signed `EpochTransition`, never by a
+        // self-declared header field. Letting a proposer bump the epoch would reset the
+        // per-epoch mint/burn/withdraw caps at will, so the header must match the chain's epoch.
+        if block.header.epoch != self.epoch {
+            return Err(StateError::EpochChange(self.epoch, block.header.epoch));
         }
 
         let new_height = block.header.height;
         let mut next = self.clone();
         next.ovm_receipts.clear();
-        if block.header.epoch != self.epoch {
-            next.epoch = block.header.epoch;
-            next.epoch_minted = 0;
-            next.epoch_burned = 0;
-            next.epoch_withdrawn = 0;
+
+        // Reject duplicate operations up front. Two identical operations share an `id()` (and
+        // therefore identical minted outpoints), so applying both would inflate the supply while
+        // overwriting the same UTXO entries, breaking the `utxo.total() == supply` invariant.
+        {
+            let mut seen_ops: BTreeSet<Hash> = BTreeSet::new();
+            for op in &block.operations {
+                if !seen_ops.insert(op.id()) {
+                    return Err(StateError::DuplicateOperation);
+                }
+            }
         }
 
         // ---- 1. Transactions ----
@@ -613,7 +626,7 @@ impl ChainState {
             match op {
                 Operation::Rewards(_) => {}
                 Operation::BlockRewards(r) => {
-                    apply_block_rewards(&mut next, r, new_height, params)?;
+                    apply_block_rewards(&mut next, r, new_height, params, gov)?;
                 }
                 Operation::Dao(dao_operation) => {
                     apply_dao_operation(
@@ -662,6 +675,12 @@ impl ChainState {
                         return Err(StateError::MintValueImpact);
                     }
                     let outpoint = OutPoint::new(op.id(), 0);
+                    // Reject re-application of an already-recorded mint. The outpoint derives
+                    // from the proposal id (amount + recipient + nonce), so a replay of the same
+                    // proposal would otherwise mint the amount again against a single UTXO entry.
+                    if next.utxo.get(&outpoint).is_some() {
+                        return Err(StateError::AlreadyMinted);
+                    }
                     next.utxo = next.utxo.insert(UtxoEntry::new(
                         outpoint,
                         TxOutput::spendable(m.amount, m.recipient),
@@ -722,6 +741,9 @@ impl ChainState {
                     let threshold = gov.node_threshold(params);
                     if approvals < threshold {
                         return Err(StateError::NodeApprovalMissing(approvals, threshold));
+                    }
+                    if w.inputs.is_empty() {
+                        return Err(StateError::BadWithdrawInput(OutPoint::new(Hash::zero(), 0)));
                     }
                     if !verify(&w.node, &op.proposal_id().0, &w.node_signature) {
                         return Err(StateError::BadWithdrawSignature);
@@ -1113,15 +1135,18 @@ fn apply_block_rewards(
     r: &BlockRewardDistribution,
     height: u64,
     params: &ChainParams,
+    gov: &GovernanceSet,
 ) -> Result<(), StateError> {
-    // Validate all outputs are LockedReward and go to valid recipients
+    // Validate all outputs are LockedReward and go to valid governance recipients.
+    // Server rewards may only be minted to current server nodes and master rewards to current
+    // masters; otherwise a producer could redirect minted rewards to arbitrary keys.
     for output in &r.server_outputs {
-        if !output.kind.is_locked_reward() {
+        if !output.kind.is_locked_reward() || !gov.contains_node(&output.recipient) {
             return Err(StateError::BadRewardRecipient(output.recipient));
         }
     }
     for output in &r.master_outputs {
-        if !output.kind.is_locked_reward() {
+        if !output.kind.is_locked_reward() || !gov.masters.contains(&output.recipient) {
             return Err(StateError::BadRewardRecipient(output.recipient));
         }
     }
@@ -1256,6 +1281,7 @@ mod tests {
     };
     use oxydome_crypto::KeyPair;
     use oxydome_rewards::split_fees;
+    use oxydome_treasury::{approve_mint, mint_proposal};
 
     fn setup() -> (
         ChainState,
@@ -1428,6 +1454,114 @@ mod tests {
             state.apply_block(&block, &gov, &params),
             Err(StateError::ExecutionVersionMismatch)
         ));
+    }
+
+    #[test]
+    fn rejects_duplicate_operations() {
+        let (state, _genesis, gov, params, _master, node, _user) = setup();
+        let mint = Operation::Mint(oxydome_core::TreasuryMint {
+            amount: 1_000,
+            recipient: node.public(),
+            nonce: 0,
+            approvals: Vec::new(),
+        });
+        let result = state.build_block(
+            &gov,
+            &params,
+            Vec::new(),
+            vec![mint.clone(), mint],
+            node.public(),
+            1,
+        );
+        assert!(matches!(result, Err(StateError::DuplicateOperation)));
+    }
+
+    #[test]
+    fn rejects_block_rewards_to_non_governance_recipients() {
+        let (state, _genesis, gov, params, _master, node, user) = setup();
+        let reward = Operation::BlockRewards(oxydome_core::BlockRewardDistribution {
+            // `user` is neither a current server node nor a master, so the minted reward must
+            // be rejected.
+            server_outputs: vec![TxOutput::locked_reward(1_000, user.public())],
+            master_outputs: Vec::new(),
+        });
+        let result = state.build_block(
+            &gov,
+            &params,
+            Vec::new(),
+            vec![reward],
+            node.public(),
+            1,
+        );
+        assert!(matches!(
+            result,
+            Err(StateError::BadRewardRecipient(recipient)) if recipient == user.public()
+        ));
+    }
+
+    #[test]
+    fn rejects_a_self_declared_epoch_change() {
+        let (state, _genesis, gov, params, _master, node, _user) = setup();
+        let mut block = state
+            .build_block(&gov, &params, Vec::new(), Vec::new(), node.public(), 1)
+            .unwrap();
+        block.header.epoch = block.header.epoch + 1;
+        assert!(matches!(
+            state.apply_block(&block, &gov, &params),
+            Err(StateError::EpochChange(0, 1))
+        ));
+    }
+
+    #[test]
+    fn mint_replay_is_rejected_and_nonce_distinguishes_proposals() {
+        let (state, _genesis, gov, params, master, node, user) = setup();
+        let mut mint = mint_proposal(1_000, user.public(), 0);
+        approve_mint(&mut mint, &master);
+
+        let block1 = state
+            .build_block(
+                &gov,
+                &params,
+                Vec::new(),
+                vec![Operation::Mint(mint.clone())],
+                node.public(),
+                1,
+            )
+            .unwrap();
+        let state1 = state.apply_block(&block1, &gov, &params).unwrap();
+        assert_eq!(state1.supply, params.genesis_supply + 1_000);
+        assert_eq!(state1.epoch_minted, 1_000);
+        assert_eq!(state1.utxo.total(), state1.supply);
+
+        // Replaying the exact same proposal (same id, therefore same outpoint) must be rejected
+        // instead of minting the 1_000 again against a single UTXO entry.
+        let replay = state1.build_block(
+            &gov,
+            &params,
+            Vec::new(),
+            vec![Operation::Mint(mint)],
+            node.public(),
+            2,
+        );
+        assert!(matches!(replay, Err(StateError::AlreadyMinted)));
+
+        // A fresh nonce produces a distinct proposal id/outpoint and mints once more.
+        let mut mint2 = mint_proposal(1_000, user.public(), 1);
+        approve_mint(&mut mint2, &master);
+        let block2 = state1
+            .build_block(
+                &gov,
+                &params,
+                Vec::new(),
+                vec![Operation::Mint(mint2)],
+                node.public(),
+                2,
+            )
+            .unwrap();
+        let state2 = state1.apply_block(&block2, &gov, &params).unwrap();
+        assert_eq!(state2.supply, params.genesis_supply + 2_000);
+        assert_eq!(state2.epoch_minted, 2_000);
+        assert_eq!(state2.utxo.total(), state2.supply);
     }
 
     #[test]
@@ -1727,6 +1861,7 @@ mod tests {
         let mint = oxydome_core::TreasuryMint {
             amount: 1000,
             recipient: user.public(),
+            nonce: 0,
             approvals: Vec::new(),
         };
         let err = state.build_block(

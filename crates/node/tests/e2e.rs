@@ -254,7 +254,7 @@ fn end_to_end_blocks_and_governance() {
 
     // ---- Block 2: governed mint. ----
     let mint_amount = 5_000u128;
-    let mut mint = mint_proposal(mint_amount, w.user.public());
+    let mut mint = mint_proposal(mint_amount, w.user.public(), 0);
     for k in w.master_keys.iter().take(3) {
         approve_mint(&mut mint, k);
     }
