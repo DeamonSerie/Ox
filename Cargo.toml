@@ -17,11 +17,9 @@ members = [
     "crates/wallet",
     "crates/wallet-rpc",
     "crates/wallet-rpc-client",
-    "bins/oxydome-master",
-    "bins/oxydome-node",
-    "bins/oxydome-walletd",
     "crates/solid",
     "crates/ovm",
+    "crates/bridge",
 ]
 
 [workspace.package]
@@ -38,7 +36,7 @@ oxydome-state = { path = "crates/state" }
 oxydome-ohm = { path = "crates/ohm" }
 oxydome-gas = { path = "crates/gas" }
 oxydome-treasury = { path = "crates/treasury" }
-oxydome-rewards = { path = "crates/rewards" }
+oxydorewards = { path = "crates/rewards" }
 oxydome-audit = { path = "crates/audit" }
 oxydome-net = { path = "crates/net" }
 oxydome-consensus = { path = "crates/consensus" }
@@ -48,7 +46,6 @@ oxydome-wallet = { path = "crates/wallet" }
 oxydome-wallet-rpc = { path = "crates/wallet-rpc" }
 oxydome-wallet-rpc-client = { path = "crates/wallet-rpc-client" }
 oxydome-ovm = { path = "crates/ovm" }
-
 bech32 = "0.9"
 sha3 = "0.10"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }

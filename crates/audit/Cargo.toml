@@ -9,6 +9,5 @@ oxydome-core.workspace = true
 oxydome-crypto.workspace = true
 oxydome-state.workspace = true
 oxydome-currency.workspace = true
-oxydome-rewards.workspace = true
 serde.workspace = true
 thiserror.workspace = true

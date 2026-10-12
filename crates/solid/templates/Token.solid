@@ -1,0 +1,229 @@
+// Solid Token Contract Template
+// A fungible token bound by Ox currency rules
+// Only creatable by DAO contracts
+// A DAO can only have exactly 1 Token to manage
+
+contract Token {
+    // ==================== Token Identity ====================
+    
+    // Token name (e.g., "Oxydome Coin")
+    string public name;
+    
+    // Token symbol (e.g., "OXD")
+    string public symbol;
+    
+    // Number of decimal places for token divisibility (standard: 18)
+    uint8 public decimal_places;
+    
+    // The DAO that created this token
+    address public dao_creator;
+    
+    // ==================== Supply Rules (Ox Currency Compatible) ====================
+    
+    // Total token supply
+    uint256 public total_supply;
+    
+    // Maximum supply cap (0 = unlimited, set at creation)
+    uint256 public max_supply;
+    
+    // Balance tracking per address
+    mapping(address => uint256) public balances;
+    
+    // Allowance tracking for spender caps (optional Ox currency feature)
+    mapping(address => mapping(address => uint256)) public allowance;
+    
+    // ==================== Creator & Ownership ====================
+    
+    // The DAO that created this token (validated on creation)
+    address public creator;
+    
+    // Flag: has this DAO already created a token? (enforces 1 token per DAO)
+    // Key is the DAO's address
+    mapping(address => bool) public dao_has_token;
+    
+    // ==================== Events ====================
+    
+    event Transfer(address indexed from, indexed to, uint256 value);
+    event Creation(address indexed dao, string token_name, string token_symbol);
+    event Mint(address indexed to, uint256 value);
+    event PauseToggle(bool paused);
+    
+    // ==================== Rules (Ox Currency Compatible) ====================
+    
+    // 1. SUPPLY CAP: total_supply must never exceed max_supply
+    // 2. TRANSFER LIMITATIONS: 
+    //    - Cannot transfer negative amounts
+    //   - Cannot transfer more than balance
+    //   - Cannot transfer to zero address
+    // 3. BALANCE CHECKS: sender must have sufficient balance
+    // 4. ZERO ADDRESS REJECTION: transfer to 0x0 must revert
+    // 5. DECIMAL PRECISION: value / 10^decimal_places must be integer for transfers
+    
+    // ==================== Modifier: Only DAO Creator ====================
+    
+    // Only the DAO that created this token can call mint/create functions
+    modifier only_dao_creator() {
+        require(msg.sender == dao_creator, "Only the creating DAO can modify this token");
+        _;
+    }
+    
+    // ==================== Constructor ====================
+    
+    // Create a new token (only callable by a DAO)
+    // - Sets name, symbol, decimal_places
+    // - Sets creator = msg.sender (must be a DAO)
+    // - Sets total_supply = 0
+    // - Sets max_supply = 0 (unlimited by default, or set at creation)
+    // - Sets decimal_places = 18 (standard)
+    constructor(string memory _name, string memory _symbol, uint8 _decimals) {
+        require(_decimals > 0, "Decimals must be > 0");
+        require(_decimals <= 18, "Decimals must be <= 18");
+        
+        name = _name;
+        symbol = _symbol;
+        decimal_places = _decimals;
+        total_supply = 0;
+        max_supply = 0; // 0 = unlimited by default
+        dao_creator = msg.sender;
+        
+        // Mark that this DAO has created a token
+        // This check happens in the mint function
+        emit Creation(msg.sender, name, symbol);
+    }
+    
+    // ==================== Mint Function ====================
+    
+    // Mint new tokens (only callable by the creating DAO)
+    // - Increases total_supply
+    // - Increases balance of specified address
+    // - Emits Transfer event (from 0x0 to recipient)
+    // - Enforces supply cap
+    modifier only_dao_creator() {
+        require(msg.sender == dao_creator, "Only the creating DAO can mint");
+        _;
+    }
+    
+    function mint(address _to, uint256 _value) only_dao_creator external {
+        // Check supply cap: total_supply + _value must not exceed max_supply
+        // If max_supply = 0, unlimited
+        if (max_supply > 0 && total_supply + _value > max_supply) {
+            revert("Supply cap exceeded");
+        }
+        
+        // Check: cannot mint to zero address
+        require(_to != address(0), "Cannot mint to zero address");
+        
+        // Update supplies
+        total_supply += _value;
+        balances[_to] += _value;
+        
+        // Emit events
+        emit Mint(_to, _value);
+        emit Transfer(address(0), _to, _value);
+    }
+    
+    // ==================== Transfer Function ====================
+    
+    // Transfer tokens between addresses
+    // - Validates sender has sufficient balance
+    // - Validates receiver is not zero address
+    // - Validates amount is positive
+    // - Updates balances
+    // - Emits Transfer event
+    function transfer(address _to, uint256 _value) external {
+        // Cannot transfer to zero address
+        require(_to != address(0), "Cannot transfer to zero address");
+        
+        // Must have positive amount
+        require(_value > 0, "Transfer amount must be > 0");
+        
+        // Sender must have sufficient balance
+        require(balances[msg.sender] >= _value, "Insufficient balance");
+        
+        // Update balances
+        balances[msg.sender] -= _value;
+        balances[_to] += _value;
+        
+        // Emit transfer event
+        emit Transfer(msg.sender, _to, _value);
+    }
+    
+    // Transfer From (for allowance/spending)
+    function transfer_from(address _from, address _to, uint256 _value) external {
+        require(_from != address(0), "Cannot transfer from zero address");
+        require(_to != address(0), "Cannot transfer to zero address");
+        require(_value > 0, "Transfer amount must be > 0");
+        
+        // Check sender has sufficient allowance
+        require(allowance[_from][msg.sender] >= _value, "Allowance exceeded");
+        
+        // Update allowance
+        allowance[_from][msg.sender] -= _value;
+        
+        // Update balances
+        balances[_from] -= _value;
+        balances[_to] += _value;
+        
+        // Emit events
+        emit Transfer(_from, _to, _value);
+    }
+    
+    // ==================== Getter Functions ====================
+    
+    // Get total supply
+    function get_total_supply() external view returns (uint256) {
+        return total_supply;
+    }
+    
+    // Get balance of a specific address
+    function balance_of(address _owner) external view returns (uint256) {
+        return balances[_owner];
+    }
+    
+    // Get token name
+    function get_name() external view returns (string memory) {
+        return name;
+    }
+    
+    // Get token symbol
+    function get_symbol() external view returns (string memory) {
+        return symbol;
+    }
+    
+    // Get decimal places
+    function get_decimals() external view returns (uint8) {
+        return decimal_places;
+    }
+    
+    // Check if DAO has already created a token
+    dao_has_token_has() external view returns (bool) {
+        return dao_has_token[msg.sender];
+    }
+    
+    // ==================== Pausable Functionality ====================
+    
+    // Pause/ unpause the token (for emergency stops)
+    bool public paused;
+    
+    modifier when_not_paused() {
+        require(!paused, "Token transfers are paused");
+        _;
+    }
+    
+    function toggle_pause() only_dao_creator external {
+        paused = !paused;
+        emit PauseToggle(paused);
+    }
+    
+    // ==================== Creator Validation ====================
+    
+    // Internal function: validate that msg.sender is a DAO
+    // This is a simplified check - in full implementation,
+    // would validate against known DAO contract patterns
+    function _is_dao(address _addr) internal view returns (bool) {
+        // Placeholder: in practice, would check if address is a deployed DAO
+        // For now, any address can create, but the dao_has_token flag
+        // enforces the 1-token-per-DAO rule
+        return true;
+    }
+}

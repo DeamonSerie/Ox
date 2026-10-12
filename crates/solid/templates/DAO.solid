@@ -1,0 +1,189 @@
+// Solid DAO Contract Template
+// Enables developers to launch Decentralized Authoritative Organisations with their own wallet address
+
+contract DAO {
+    // ==================== DAO Identity ====================
+    
+    // The DAO's own address on Oxydome - acts as its wallet identity
+    address public dao_address;
+    
+    // Constructor sets the DAO address
+    constructor() {
+        dao_address = address(this);
+    }
+    
+    // ==================== Member Roles ====================
+    
+    enum Role { Admin, Member, Observer }
+    
+    // Mapping: address -> Role
+    mapping(address => Role) public members;
+    
+    // Events for member changes
+    event MemberAdded(address indexed member, Role role);
+    event MemberRemoved(address indexed member);
+    
+    // ==================== Proposal System ====================
+    
+    struct Proposal {
+        bytes32 description;
+        uint256 start_time;
+        uint256 end_time;
+        uint256 yes_votes;
+        uint256 no_votes;
+        bool executed;
+        address proposer;
+    }
+    
+    Proposal[] public proposals;
+    
+    // Voting tracking: voter_id -> bool (voted)
+    mapping(bytes32 => mapping(address => bool)) public voted;
+    
+    // Voting parameters
+    uint256 public quorum_percentage = 50;
+    uint256 public voting_period = 86400; // voting period in seconds
+    
+    // Events for proposals
+    event ProposalCreated(uint256 indexed proposal_id, address indexed proposer, string description);
+    event VoteCast(uint256 indexed proposal_id, indexed voter, bool support);
+    event ProposalExecuted(uint256 indexed proposal_id);
+    
+    // ==================== Treasury Functions ====================
+    
+    // Treasury address - in a full implementation, this could be a separate multisig
+    address public treasury;
+    
+    // Event for treasury changes
+    event PaymentExecuted(uint256 indexed proposal_id, indexed to, uint256 amount);
+    
+    // Deposit funds into DAO treasury (payable function)
+    function deposit() external payable {
+        // In a full implementation, track contributions per address
+        // For now, just record the deposit
+    }
+    
+    // Withdraw funds from treasury (admin only)
+    function withdraw(uint256 _amount) external {
+        require(msg.sender == get_admin(), "Only admin can withdraw");
+        // In a full implementation, transfer from treasury to msg.sender
+        // This is a simplified template
+    }
+    
+    // Get treasury balance
+    function get_balance() external view returns (uint256) {
+        return address(this).balance;
+    }
+    
+    // Propose a payment from treasury
+    function propose_payment(address _to, uint256 _amount, bytes32 _description) external {
+        require(msg.sender != address(0), "Sender cannot be zero");
+        // Create a proposal for the payment
+        // In a full implementation, this would add to proposals array
+    }
+    
+    // ==================== Helper Functions ====================
+    
+    // Get the admin address (the first member with Admin role)
+    function get_admin() external view returns (address) {
+        // Iterate through members to find admin
+        // Simplified: return the caller if they have admin role
+        require(get_role(msg.sender) == Role.Admin, "Only admin");
+        return msg.sender;
+    }
+    
+    // Get the role of a member
+    function get_role(address _member) external view returns (Role) {
+        if (members[_member] == Role.Admin || members[_member] == Role.Member || members[_member] == Role.Observer) {
+            return members[_member];
+        }
+        return Role.Observer; // Default
+    }
+    
+    // Get quorum requirement
+    function get_quorum() external view returns (uint256) {
+        // Calculate based on total proposals or return configured percentage
+        return quorum_percentage;
+    }
+    
+    // ==================== Role Management ====================
+    
+    // Add a new member with a specific role (admin only)
+    function add_member(address _new_member, Role _role) external {
+        require(msg.sender == get_admin(), "Only admin can add members");
+        members[_new_member] = _role;
+        emit MemberAdded(_new_member, _role);
+    }
+    
+    // Remove a member (admin only)
+    function remove_member(address _old_member) external {
+        require(msg.sender == get_admin(), "Only admin can remove members");
+        delete members[_old_member];
+        emit MemberRemoved(_old_member);
+    }
+    
+    // ==================== Proposal Voting System ====================
+    
+    // Create a new proposal
+    function propose(uint256 _type, bytes32 _description) external {
+        require(msg.sender != address(0), "Sender cannot be zero address");
+        
+        Proposal memory new_proposal = Proposal({
+            description: _description,
+            start_time: block.timestamp,
+            end_time: block.timestamp + voting_period,
+            yes_votes: 0,
+            no_votes: 0,
+            executed: false,
+            proposer: msg.sender
+        });
+        proposals.push(new_proposal);
+        emit ProposalCreated(proposals.length - 1, msg.sender, _description);
+    }
+    
+    // Vote on a proposal
+    function vote(uint256 _proposal_id, bool _support) external {
+        require(msg.sender != address(0), "Sender cannot be zero address");
+        require(_proposal_id < proposals.length, "Invalid proposal number");
+        require(!proposals[_proposal_id].executed, "Proposal already executed");
+        require(block.timestamp <= proposals[_proposal_id].end_time, "Voting period has expired");
+        require(!voted[msg.sender + "_" + _proposal_id.toString()], "Already voted on this proposal");
+        
+        voted[msg.sender + "_" + _proposal_id.toString()] = true;
+        
+        if (_support) {
+            proposals[_proposal_id].yes_votes++;
+        } else {
+            proposals[_proposal_id].no_votes++;
+        }
+    }
+    
+    // Execute a proposal (admin only after voting period ends)
+    function execute(uint256 _proposal_id) external {
+        require(msg.sender == get_admin(), "Only admin can execute proposals");
+        require(_proposal_id < proposals.length, "Invalid proposal number");
+        require(!proposals[_proposal_id].executed, "Proposal already executed");
+        require(block.timestamp >= proposals[_proposal_id].end_time, "Voting period must end first");
+        
+        // Check quorum and majority
+        uint256 total_votes = proposals[_proposal_id].yes_votes + proposals[_proposal_id].no_votes;
+        require(total_votes >= get_quorum(), "Quorum not reached - need more participants");
+        require(proposals[_proposal_id].yes_votes > proposals[_proposal_id].no_votes, "Failed - majority against");
+        
+        // Execute the proposal
+        proposals[_proposal_id].executed = true;
+        emit ProposalExecuted(_proposal_id);
+    }
+    
+    // ==================== Events ====================
+    
+    event MemberAdded(address indexed member, Role role);
+    event MemberRemoved(address indexed member);
+    event ProposalCreated(uint256 indexed proposal_id, address indexed proposer, string description);
+    event VoteCast(uint256 indexed proposal_id, indexed voter, bool support);
+    event ProposalExecuted(uint256 indexed proposal_id);
+    event PaymentExecuted(uint256 indexed proposal_id, indexed to, uint256 amount);
+}
+
+// Helper enum type (needs to be at contract level or in separate type definition)
+enum Role { Admin, Member, Observer }

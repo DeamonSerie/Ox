@@ -1,0 +1,54 @@
+// Bridge Manager Contract
+// Handles bridge transaction validation and micro token gate logic
+
+contract BridgeManager {
+    // ==================== Bridge Validation ====================
+    
+    // Track bridge completion status
+    mapping(address => mapping(address => bool)) public bridge_completed; 
+    // bridge_completed[origin_chain][destination_chain] = true when bridge is finalized
+    
+    // Bridge transaction metadata
+    struct BridgeMetadata {
+        uint256 bridge_id;
+        uint256 amount;
+        uint256 timestamp;
+        bool validated; // Whether bridge validation is complete
+    }
+    
+    mapping(address => BridgeMetadata) public bridge_metadata;
+    
+    // ==================== Events ====================
+    
+    event BridgeValidated(uint256 bridge_id, address origin_chain, address destination_chain, uint256 amount);
+    event BridgeFailed(uint256 bridge_id, address origin_chain, string reason);
+    
+    // ==================== Functions ====================
+    
+    // Validate a bridge transaction
+    function validate_bridge(uint256 _bridge_id, address _origin_chain, address _destination_chain, uint256 _amount) external {
+        require(!bridge_metadata[_origin_chain].validated, "Bridge already validated");
+        
+        bridge_metadata[_origin_chain] = BridgeMetadata({
+            bridge_id: _bridge_id,
+            amount: _amount,
+            timestamp: block.timestamp,
+            validated: true
+        });
+        
+        emit BridgeValidated(_bridge_id, _origin_chain, _destination_chain, _amount);
+    }
+    
+    // Fail a bridge transaction
+    function fail_bridge(uint256 _bridge_id, string memory _reason) external {
+        require(bridge_metadata[msg.sender].validated, "Bridge not yet validated");
+        
+        bridge_metadata[msg.sender].validated = false;
+        emit BridgeFailed(_bridge_id, msg.sender, _reason);
+    }
+    
+    // Check if bridge is completed
+    function is_bridge_completed(address _origin_chain, address _destination_chain) external view returns (bool) {
+        return bridge_completed[_origin_chain][_destination_chain];
+    }
+}

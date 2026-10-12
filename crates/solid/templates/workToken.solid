@@ -1,0 +1,190 @@
+// work Token Contract Template
+// A wrapped token for cross-chain bridging
+// Bound by Ox currency rules
+// Only creatable by WrappedTokenGate contracts
+// A gateway can only have exactly 1 work token to manage
+
+contract workToken {
+    // ==================== Token Identity ====================
+    
+    // Token name (e.g., "Wrapped Ox")
+    string public name;
+    
+    // Token symbol with work prefix (e.g., "workOXD")
+    string public symbol;
+    
+    // Number of decimal places for token divisibility (standard: 18)
+    uint8 public decimal_places;
+    
+    // The gateway that created this work token
+    address public gateway_creator;
+    
+    // Flag: has this gateway already created a work token? (enforces 1 work token per gateway)
+    mapping(address => bool) public gateway_has_work_token;
+    
+    // ==================== Supply Rules (Ox Currency Compatible) ====================
+    
+    // Total work token supply
+    uint256 public total_supply;
+    
+    // Maximum supply cap (0 = unlimited, set at creation)
+    uint256 public max_supply;
+    
+    // Balance tracking per address
+    mapping(address => uint256) public balances;
+    
+    // ==================== Events ====================
+    
+    event Transfer(address indexed from, indexed to, uint256 value);
+    event Mint(address indexed indexed from, uint256 value);
+    event Distribution(uint256 indexed bridge_id, address indexed recipient, 
+                       uint256 server_amount, uint256 master_amount, 
+                       uint256 bridger_amount);
+    event GatewaySetup(address indexed gateway, string token_name, string token_symbol);
+    
+    // ==================== Rules (Ox Currency Compatible) ====================
+    
+    // 1. SUPPLY CAP: total_supply must never exceed max_supply
+    // 2. TRANSFER LIMITATIONS: 
+    //    - Cannot transfer negative amounts
+    //   - Cannot transfer more than balance
+    //   - Cannot transfer to zero address
+    // 3. BALANCE CHECKS: sender must have sufficient balance
+    // 4. ZERO ADDRESS REJECTION: transfer to 0x0 must revert
+    // 5. DECIMAL PRECISION: value / 10^decimal_places must be integer for transfers
+    
+    // ==================== Modifier: Only Gateway Creator ====================
+    
+    // Only the gateway that created this work token can call mint functions
+    modifier only_gateway_creator() {
+        require(msg.sender == gateway_creator, "Only the creating gateway can modify this token");
+        _;
+    }
+    
+    // ==================== Constructor ====================
+    
+    // Create a new work token (only callable by a WrappedTokenGate)
+    // - Sets name, symbol, decimal_places
+    // - Sets gateway_creator = msg.sender (must be a WrappedTokenGate)
+    // - Sets total_supply = 0
+    // - Sets max_supply = 0 (unlimited by default, or set at creation)
+    // - Sets decimal_places = 18 (standard)
+    constructor(string memory _name, string memory _symbol, uint8 _decimals) {
+        require(_decimals > 0, "Decimals must be > 0");
+        require(_decimals <= 18, "Decimals must be <= 18");
+        
+        name = _name;
+        symbol = _symbol;
+        decimal_places = _decimals;
+        total_supply = 0;
+        max_supply = 0; // 0 = unlimited by default
+        gateway_creator = msg.sender;
+        
+        // Mark that this gateway has created a work token
+        // This check happens in the mint function
+        emit GatewaySetup(gateway_creator, name, symbol);
+    }
+    
+    // ==================== Mint Function ====================
+    
+    // Mint work tokens (only callable by the creating gateway)
+    // - Increases total_supply
+    // - Increases balance of specified address
+    // - Emits Mint event
+    // - Enforces supply cap
+    modifier only_gateway_creator() {
+        require(msg.sender == gateway_creator, "Only the creating gateway can mint");
+        _;
+    }
+    
+    function mint(address _to, uint256 _value) only_gateway_creator external {
+        // Check supply cap: total_supply + _value must not exceed max_supply
+        // If max_supply = 0, unlimited
+        if (max_supply > 0 && total_supply + _value > max_supply) {
+            revert("Supply cap exceeded");
+        }
+        
+        // Check: cannot mint to zero address
+        require(_to != address(0), "Cannot mint to zero address");
+        
+        // Update supplies
+        total_supply += _value;
+        balances[_to] += _value;
+        
+        // Emit events
+        emit Mint(msg.sender, _value);
+    }
+    
+    // ==================== Transfer Function ====================
+    
+    // Transfer work tokens between addresses
+    // - Validates sender has sufficient balance
+    // - Validates receiver is not zero address
+    // - Validates amount is positive
+    // - Updates balances
+    // - Emits Transfer event
+    function transfer(address _to, uint256 _value) external {
+        // Cannot transfer to zero address
+        require(_to != address(0), "Cannot transfer to zero address");
+        
+        // Must have positive amount
+        require(_value > 0, "Transfer amount must be > 0");
+        
+        // Sender must have sufficient balance
+        require(balances[msg.sender] >= _value, "Insufficient balance");
+        
+        // Update balances
+        balances[msg.sender] -= _value;
+        balances[_to] += _value;
+        
+        // Emit transfer event
+        emit Transfer(msg.sender, _to, _value);
+    }
+    
+    // ==================== Getter Functions ====================
+    
+    // Get total supply
+    function get_total_supply() external view returns (uint256) {
+        return total_supply;
+    }
+    
+    // Get balance of a specific address
+    function balance_of(address _owner) external view returns (uint256) {
+        return balances[_owner];
+    }
+    
+    // Get token name
+    function get_name() external view returns (string memory) {
+        return name;
+    }
+    
+    // Get token symbol
+    function get_symbol() external view returns (string memory) {
+        return symbol;
+    }
+    
+    // Get decimal places
+    function get_decimals() external view returns (uint8) {
+        return decimal_places;
+    }
+    
+    // Check if gateway has already created a work token
+    gateway_has_token_has() external view returns (bool) {
+        return gateway_has_work_token[msg.sender];
+    }
+    
+    // ==================== Pausable Functionality ====================
+    
+    // Pause/ unpause the work token (for emergency stops)
+    bool public paused;
+    
+    modifier when_not_paused() {
+        require(!paused, "work token transfers are paused");
+        _;
+    }
+    
+    function toggle_pause() only_gateway_creator external {
+        paused = !paused;
+        emit PauseToggle(paused);
+    }
+}

@@ -1,0 +1,138 @@
+// Wrapped Token Gate Contract
+// Enables cross-chain token bridging between OVMs and OHMs
+// Creates micro tokens (work-tokens) with controlled release
+
+contract WrappedTokenGate {
+    // ==================== Bridge State ====================
+    
+    // Track bridge transactions
+    struct BridgeState {
+        address origin_dao;      // DAO/origin chain address
+        address destination_dao; // DAO/destination chain address
+        address token_address;   // Original token contract
+        uint256 amount;          // Amount being bridged
+        bool completed;          // Whether bridge is finalized
+        uint256 bridge_id;       // Unique bridge identifier
+        uint256 created_at;      // Timestamp of bridge creation
+    }
+    
+    // Mapping of bridge states
+    mapping(uint256 => BridgeState) public bridges;
+    uint256 public bridge_counter; // Auto-incrementing bridge ID
+    
+    // ==================== Micro Token Configuration ====================
+    
+    // Symbol prefix for wrapped tokens (work-token format)
+    string public work_token_prefix; // "work"
+    
+    // Distribution percentages
+    uint256 public percentage_server;    // 30%
+    uint256 percentage_master;           // 30%
+    uint256 percentage_bridger;          // 40% (was 20% burn + 20% bridger)
+    
+    // ==================== Events ====================
+    
+    event BridgeCreated(uint256 indexed bridge_id, address indexed origin_dao, 
+                        address indexed destination_dao, address indexed token_address, 
+                        uint256 amount, bool completed);
+    
+    event MicroTokenMinted(uint256 indexed bridge_id, address indexed recipient, 
+                           uint256 server_amount, uint256 master_amount, 
+                           uint256 bridger_amount);
+    
+    event BridgeTransferredAndMicroMinted(
+        uint256 indexed bridge_id, 
+        address indexed bridger, 
+        uint256 amount_transferred,    // Full original TokenA/OHM amount
+        uint256 micro_supply_total,  // Total micro-tokens minted (1:1 with amount)
+        uint256 bridger_micro_amount // Bridger's 40% share
+    );
+    
+    event BridgeCompleted(uint256 indexed bridge_id, address indexed destination_dao);
+    
+    // ==================== Functions ====================
+    
+    // Create a new bridge transaction
+    function create_bridge(address _origin_dao, address _destination_dao, 
+                           address _token_address, uint256 _amount) external {
+        require(msg.sender == _origin_dao, "Only origin DAO can create bridge");
+        
+        bridge_counter++;
+        uint256 new_bridge_id = bridge_counter;
+        
+        bridges[new_bridge_id] = BridgeState({
+            origin_dao: _origin_dao,
+            destination_dao: _destination_dao,
+            token_address: _token_address,
+            amount: _amount,
+            completed: false,
+            bridge_id: new_bridge_id,
+            created_at: block.timestamp
+        });
+        
+        emit BridgeCreated(new_bridge_id, _origin_dao, _destination_dao, _token_address, _amount, false);
+    }
+    
+    // Complete a bridge transaction
+    // Only callable by destination DAO after validation
+    function complete_bridge(uint256 _bridge_id) external {
+        require(msg.sender == bridges[_bridge_id].destination_dao, "Only destination DAO");
+        require(!bridges[_bridge_id].completed, "Bridge already completed");
+        
+        bridges[_bridge_id].completed = true;
+        emit BridgeTransferredAndMicroMinted(
+            _bridge_id, msg.sender, 
+            bridges[_bridge_id].amount,       // amount_transferred
+            bridges[_bridge_id].amount,       // micro_supply_total (1:1)
+            bridges[_bridge_id].amount * 40 / 100  // bridger_micro_amount (40%)
+        );
+        emit BridgeCompleted(_bridge_id, msg.sender);
+    }
+    
+    // Mint work-tokens for a completed bridge
+    // Distribution: 30% server, 30% master, 0% burn, 40% bridger
+    function mint_work_tokens(uint256 _bridge_id) external {
+        BridgeState memory bridge = bridges[_bridge_id];
+        require(bridge.completed, "Bridge must be completed first");
+        require(msg.sender == bridge.destination_dao, "Only destination DAO");
+        
+        uint256 total_amount = bridge.amount;
+        uint256 server_amount = total_amount * percentage_server / 100;
+        uint256 master_amount = total_amount * percentage_master / 100;
+        // BURN REMOVED - 20% previously burned now goes to bridger
+        uint256 bridger_amount = total_amount * percentage_bridger / 100;  // 40%
+        
+        // Transfer original tokens to destination (full amount)
+        _transfer_original_tokens(bridge.amount, bridge.destination_dao);
+        
+        // Mint server portion
+        _mint_work_tokens(bridge.destination_dao, "work_server", server_amount);
+        
+        // Mint master portion
+        _mint_work_tokens(bridge.destination_dao, "work_master", master_amount);
+        
+        // Mint bridger portion to the original user (40% of total)
+        _mint_work_tokens(msg.sender, "work_bridger", bridger_amount);
+        
+        emit MicroTokenMinted(bridge.bridge_id, msg.sender, server_amount, master_amount, bridger_amount);
+    }
+    
+    // ==================== Internal Functions ====================
+    
+    // Mint work tokens to a recipient with specified category
+    function _mint_work_tokens(address _recipient, string memory _category, uint256 _amount) internal {
+        // In a full implementation, would mint to specific work-token contract
+        // For now, track balances mapping
+        // _recipient works for: server, master, bridger categories
+    }
+    
+    // Transfer original tokens to destination address
+    // Custom transfer for non-Ethereum-standard tokens
+    function _transfer_original_tokens(uint256 _amount, address _to) internal {
+        // Custom token transfer logic for non-standard tokens
+        // Direct balance adjustment since no ERC-20 standard
+        // balances[msg.sender] -= _amount;
+        // balances[_to] += _amount;
+        // In production, implement according to custom token specification
+    }
+}
