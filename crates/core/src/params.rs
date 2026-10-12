@@ -141,6 +141,22 @@ pub airdrop_base_bps: u32,
     /// Whether minted block rewards are active.
     #[serde(default = "default_block_rewards_enabled")]
     pub block_rewards_enabled: bool,
+
+    // ---- OVM data stack ----
+    /// Bytes of data stack available per 1 gas unit.
+    #[serde(default = "default_ovm_stack_bytes_per_gas")]
+    pub ovm_stack_bytes_per_gas: u64,
+    /// Maximum data stack bytes for a single OVM transaction.
+    #[serde(default = "default_max_ovm_data_stack_bytes")]
+    pub max_ovm_data_stack_bytes: u64,
+
+    // ---- network storage labeling ----
+    #[serde(default = "default_u64_zero")]
+    pub expected_network_storage: u64,
+    #[serde(default = "default_storage_label_max_deviation_bps")]
+    pub storage_label_max_deviation_bps: u32,
+    #[serde(default = "default_u64_zero")]
+    pub storage_audit_interval_blocks: u64,
 }
 
 fn default_chain_name() -> String {
@@ -223,6 +239,22 @@ fn default_block_rewards_enabled() -> bool {
     true
 }
 
+fn default_ovm_stack_bytes_per_gas() -> u64 {
+    6
+}
+
+fn default_max_ovm_data_stack_bytes() -> u64 {
+    2u64 * 1024 * 1024 * 1024
+}
+
+fn default_u64_zero() -> u64 {
+    0
+}
+
+fn default_storage_label_max_deviation_bps() -> u32 {
+    100
+}
+
 impl ChainParams {
     pub fn execution_version_at(&self, height: u64) -> u32 {
         if height >= self.smart_contract_activation_height {
@@ -284,7 +316,12 @@ initial_value_index: 1_000_000_000_000,
         server_reward_cap_bps: 2_000,
         master_reward_cap_bps: 1_000,
         min_price_update_interval: 10,
-        block_rewards_enabled: true,
+            block_rewards_enabled: true,
+            ovm_stack_bytes_per_gas: default_ovm_stack_bytes_per_gas(),
+            max_ovm_data_stack_bytes: default_max_ovm_data_stack_bytes(),
+            expected_network_storage: 0,
+            storage_label_max_deviation_bps: default_storage_label_max_deviation_bps(),
+            storage_audit_interval_blocks: 0,
         }
     }
 }

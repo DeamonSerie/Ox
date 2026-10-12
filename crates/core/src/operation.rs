@@ -188,6 +188,34 @@ enum SignableOperation {
     PriceChange {
         new_price: Amount,
     },
+    StorageLabel {
+        node: PublicKey,
+        height: u64,
+        capacity_bytes: u64,
+        used_bytes: u64,
+        available_bytes: u64,
+        timestamp: u64,
+    },
+    StorageAudit {
+        epoch: u64,
+        network_available: u64,
+        expected_network_storage: u64,
+        compliant: bool,
+    },
+}
+
+/// A proposal to set a node's storage label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageLabelOperation {
+    pub label: crate::storage::StorageLabel,
+    pub approvals: Vec<NodeApproval>,
+}
+
+/// An epoch storage audit result recorded on-chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageAuditOperation {
+    pub result: crate::storage::StorageAuditResult,
+    pub approvals: Vec<MasterApproval>,
 }
 
 /// A block operation.
@@ -202,6 +230,8 @@ pub enum Operation {
     Gas(GasOperation),
     PriceChange(TreasuryPriceChange),
     BlockRewards(BlockRewardDistribution),
+    StorageLabel(StorageLabelOperation),
+    StorageAudit(StorageAuditOperation),
 }
 
 impl Operation {
@@ -247,6 +277,20 @@ impl Operation {
                 server_outputs: b.server_outputs.clone(),
                 master_outputs: b.master_outputs.clone(),
             },
+            Operation::StorageLabel(op) => SignableOperation::StorageLabel {
+                node: op.label.node,
+                height: op.label.height,
+                capacity_bytes: op.label.capacity_bytes,
+                used_bytes: op.label.used_bytes,
+                available_bytes: op.label.available_bytes,
+                timestamp: op.label.timestamp,
+            },
+            Operation::StorageAudit(op) => SignableOperation::StorageAudit {
+                epoch: op.result.epoch,
+                network_available: op.result.network_available,
+                expected_network_storage: op.result.expected_network_storage,
+                compliant: op.result.compliant,
+            },
         };
         hash_value(&signable)
     }
@@ -257,7 +301,8 @@ impl Operation {
             Operation::Burn(b) => &b.approvals,
             Operation::Gas(g) => &g.approvals,
             Operation::PriceChange(p) => &p.approvals,
-            Operation::BlockRewards(_) => &[],
+            Operation::StorageAudit(a) => &a.approvals,
+            Operation::BlockRewards(_) | Operation::StorageLabel(_) => &[],
             _ => &[],
         }
     }
@@ -265,6 +310,7 @@ impl Operation {
     pub fn node_approvals(&self) -> &[NodeApproval] {
         match self {
             Operation::Withdraw(w) => &w.approvals,
+            Operation::StorageLabel(l) => &l.approvals,
             _ => &[],
         }
     }
@@ -298,6 +344,8 @@ impl Operation {
                 | Operation::Dao(_)
                 | Operation::Ohm(_)
                 | Operation::Gas(_)
+                | Operation::StorageLabel(_)
+                | Operation::StorageAudit(_)
         )
     }
 

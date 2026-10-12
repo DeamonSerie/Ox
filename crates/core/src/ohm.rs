@@ -1092,7 +1092,7 @@ mod tests {
         OvmAction::Call {
             contract_id: Hash::zero(),
             arguments: Vec::new(),
-            gas_limit: 100,
+            stack_bytes: 100,
         }
     }
 
@@ -1311,7 +1311,7 @@ mod tests {
                 target_contract: Hash::from([3u8; 64]),
                 entry_selector: 42,
                 arguments: vec![],
-                gas_limit: 100,
+            gas_limit: 1024,
                 want_reply: false,
                 reply_contract: None,
                 reply_entry_selector: None,

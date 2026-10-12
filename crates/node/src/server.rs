@@ -479,6 +479,18 @@ async fn handle_connection(
                 }
                 None
             }
+            Message::StorageLabelRequest { nonce: _ } => {
+                let guard = node.lock().unwrap();
+                if let Some(labeler) = guard.storage_labeler() {
+                    if let Some(label) = labeler.last_label() {
+                        Some(Message::StorageLabelResponse { label })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         };
         if let Some(reply) = reply {
@@ -665,7 +677,9 @@ mod tests {
                 }
                 .encode()
                 .unwrap();
-                let fee = 1 + u128::from(1_000u64);
+                let stack_bytes = 1_000u64;
+                let stack_gas = (stack_bytes + 5) / 6;
+                let fee = 1 + u128::from(stack_gas);
                 let mut deployment = Transaction::new_unsigned(
                     vec![(outpoint, node.public())],
                     vec![TxOutput::spendable(amount - fee, node.public())],
@@ -673,7 +687,7 @@ mod tests {
                 );
                 deployment.ovm_action = Some(OvmAction::DeployContract {
                     artifact,
-                    gas_limit: 1_000,
+                    stack_bytes,
                 });
                 deployment.sign_input(0, &node.key);
                 node.submit_transaction(deployment).unwrap();

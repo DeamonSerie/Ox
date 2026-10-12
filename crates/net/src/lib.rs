@@ -333,6 +333,14 @@ pub enum Message {
         tip_height: u64,
         error: Option<String>,
     },
+    /// Request for a node's storage label.
+    StorageLabelRequest {
+        nonce: u64,
+    },
+    /// Response containing a node's storage label.
+    StorageLabelResponse {
+        label: oxydome_core::StorageLabel,
+    },
 }
 
 /// Evidence accompanying a finalized block. Recipients must verify every quorum and

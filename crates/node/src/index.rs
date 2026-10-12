@@ -211,7 +211,7 @@ mod tests {
         tx.ovm_action = Some(OvmAction::Call {
             contract_id: Hash::zero(),
             arguments: Vec::new(),
-            gas_limit: 5,
+            stack_bytes: 6,
         });
         tx.sign_input(0, &alice_key);
         let mut block = Block::build_header(
@@ -231,9 +231,11 @@ mod tests {
             vec![tx.clone()],
             vec![],
         );
+        // In the new reservation model, gas_used = stack_gas = ceil(stack_bytes / 6) = 1.
+        // No gas refund: the full reservation is burned.
         block.ovm_receipts = vec![OvmReceipt {
             txid: tx.txid(),
-            gas_used: 3,
+            gas_used: 1,
             failure: None,
             return_data: Vec::new(),
             logs: Vec::new(),
@@ -241,7 +243,8 @@ mod tests {
 
         let mut index = WalletIndex::new();
         index.record_block(&block, &pre_utxo);
-        assert_eq!(index.by_addr[&alice][&(1, 0)].in_amount, 2);
+        // No gas refund in the new model; alice spent 100, bob received 94, 6 fee.
+        assert_eq!(index.by_addr[&alice][&(1, 0)].in_amount, 0);
         assert_eq!(index.by_addr[&bob][&(1, 0)].in_amount, 94);
     }
 }

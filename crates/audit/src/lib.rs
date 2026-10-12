@@ -449,6 +449,23 @@ pub fn header_audit(
             }
             Operation::Gas(gas_operation) => {}
             Operation::PriceChange(_) => {}
+            Operation::StorageLabel(label_op) => {
+                if !label_op.label.is_valid() {
+                    return Err(AuditError::Guardrail(
+                        "storage label signature or encoding is invalid".into(),
+                    ));
+                }
+            }
+            Operation::StorageAudit(audit_op) => {
+                if !audit_op.result.compliant
+                    && audit_op.result.expected_network_storage > 0
+                    && audit_op.result.network_available < audit_op.result.expected_network_storage
+                {
+                    return Err(AuditError::Guardrail(
+                        "storage audit records network storage below expectation".into(),
+                    ));
+                }
+            }
         }
     }
 

@@ -152,33 +152,46 @@ pub struct Transaction {
 pub enum OvmAction {
     Deploy {
         code: Vec<u8>,
-        gas_limit: u64,
+        stack_bytes: u64,
     },
     Call {
         contract_id: Hash,
         arguments: Vec<u64>,
-        gas_limit: u64,
+        stack_bytes: u64,
     },
     DeployContract {
         artifact: Vec<u8>,
-        gas_limit: u64,
+        stack_bytes: u64,
     },
     CallContract {
         contract_id: Hash,
         entry_point: String,
         arguments: Vec<u64>,
         authority_input: u32,
-        gas_limit: u64,
+        stack_bytes: u64,
     },
 }
 
 impl OvmAction {
-    pub fn gas_limit(&self) -> u64 {
+    pub fn stack_bytes(&self) -> u64 {
         match self {
-            Self::Deploy { gas_limit, .. }
-            | Self::Call { gas_limit, .. }
-            | Self::DeployContract { gas_limit, .. }
-            | Self::CallContract { gas_limit, .. } => *gas_limit,
+            Self::Deploy { stack_bytes, .. }
+            | Self::Call { stack_bytes, .. }
+            | Self::DeployContract { stack_bytes, .. }
+            | Self::CallContract { stack_bytes, .. } => *stack_bytes,
+        }
+    }
+
+    pub fn gas_limit(&self) -> u64 {
+        self.required_stack_gas(6)
+    }
+
+    pub fn required_stack_gas(&self, bytes_per_gas: u64) -> u64 {
+        let bytes = self.stack_bytes();
+        if bytes == 0 {
+            0
+        } else {
+            (bytes + bytes_per_gas - 1) / bytes_per_gas
         }
     }
 
@@ -258,7 +271,7 @@ pub enum TxError {
     ExitAndReboundMix,
     #[error("serialization error: {0}")]
     Serialization(String),
-    #[error("invalid OVM action or gas limit")]
+    #[error("invalid OVM action or stack size")]
     InvalidOvmAction,
 }
 
@@ -266,11 +279,12 @@ pub enum TxError {
 pub const MAX_TX_BYTES: usize = 256 * 1024;
 /// Maximum number of inputs or outputs in one transaction.
 pub const MAX_TX_ITEMS: usize = 4096;
-/// Consensus upper bound on OVM execution fuel for one transaction.
-pub const MAX_OVM_GAS_LIMIT: u64 = 1_000_000;
 pub const MAX_OVM_ARGUMENTS: usize = 64;
-/// Maximum sum of declared OVM gas limits accepted in one block.
+/// Maximum sum of declared OVM stack gas accepted in one block.
 pub const MAX_OVM_BLOCK_GAS_LIMIT: u64 = 10_000_000;
+/// Consensus upper bound on OVM stack reservation (gas) for one transaction:
+/// `max_ovm_data_stack_bytes / STACK_BYTES_PER_GAS` (2 GiB / 6).
+pub const MAX_OVM_GAS_LIMIT: u64 = (2u64 * 1024 * 1024 * 1024) / 6;
 pub const TRANSFER_FEE_NUMERATOR: Amount = 12;
 pub const TRANSFER_FEE_DENOMINATOR: Amount = 1_000_000;
 pub const MIN_TRANSFER_FEE: Amount = 1;
@@ -382,37 +396,34 @@ impl Transaction {
             return Err(TxError::ZeroFee);
         }
         if let Some(action) = &self.ovm_action {
-            let (gas_limit, valid) = match action {
-                OvmAction::Deploy { code, gas_limit } => (*gas_limit, !code.is_empty()),
+            let (stack_bytes, valid) = match action {
+                OvmAction::Deploy { code, stack_bytes } => (*stack_bytes, !code.is_empty()),
                 OvmAction::DeployContract {
                     artifact,
-                    gas_limit,
+                    stack_bytes,
                 } => (
-                    *gas_limit,
+                    *stack_bytes,
                     !artifact.is_empty()
                         && artifact.len() <= oxydome_ovm::MAX_CONTRACT_ARTIFACT_BYTES,
                 ),
                 OvmAction::Call {
                     arguments,
-                    gas_limit,
+                    stack_bytes,
                     ..
-                } => (*gas_limit, arguments.len() <= MAX_OVM_ARGUMENTS),
+                } => (*stack_bytes, arguments.len() <= MAX_OVM_ARGUMENTS),
                 OvmAction::CallContract {
                     entry_point,
                     arguments,
-                    authority_input,
-                    gas_limit,
+                    stack_bytes,
                     ..
                 } => (
-                    *gas_limit,
+                    *stack_bytes,
                     !entry_point.is_empty()
                         && entry_point.len() <= oxydome_ovm::MAX_FUNCTION_NAME_BYTES
-                        && (*authority_input as usize) < self.inputs.len()
-                        && arguments.len() + oxydome_ovm::AUTHORITY_WORD_COUNT
-                            <= oxydome_ovm::MAX_ARGUMENTS,
+                        && arguments.len() <= MAX_OVM_ARGUMENTS,
                 ),
             };
-            if !valid || gas_limit == 0 || gas_limit > MAX_OVM_GAS_LIMIT {
+            if !valid || stack_bytes == 0 {
                 return Err(TxError::InvalidOvmAction);
             }
         }

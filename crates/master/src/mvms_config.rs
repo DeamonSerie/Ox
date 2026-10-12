@@ -100,6 +100,21 @@ pub struct MvmsConfig {
     pub min_price_update_interval: u64,
     /// Whether minted block rewards are active
     pub block_rewards_enabled: bool,
+    /// Bytes of OVM data stack reserved per 1 GAS
+    #[serde(default = "default_six")]
+    pub ovm_stack_bytes_per_gas: u64,
+    /// Maximum data stack bytes for a single OVM transaction
+    #[serde(default = "default_two_gib")]
+    pub max_ovm_data_stack_bytes: u64,
+    /// Expected total network storage in bytes
+    #[serde(default)]
+    pub expected_network_storage: u64,
+    /// Max deviation (basis points) between a node label and auditor measurement
+    #[serde(default = "default_deviation_bps")]
+    pub storage_label_max_deviation_bps: u32,
+    /// Blocks between storage audits (0 disables)
+    #[serde(default)]
+    pub storage_audit_interval_blocks: u64,
 }
 
 impl fmt::Display for MvmsConfig {
@@ -112,19 +127,28 @@ impl fmt::Display for MvmsConfig {
     }
 }
 
+fn default_six() -> u64 {
+    6
+}
+
+fn default_two_gib() -> u64 {
+    2u64 * 1024 * 1024 * 1024
+}
+
+fn default_deviation_bps() -> u32 {
+    100
+}
+
 fn serialize_u128_compat<S>(val: &u128, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
     if serializer.is_human_readable() {
         if let Ok(as_u64) = u64::try_from(*val) {
-            serializer.serialize_u64(as_u64)
-        } else {
-            serializer.serialize_str(&val.to_string())
+            return serializer.serialize_u64(as_u64);
         }
-    } else {
-        serializer.serialize_u128(*val)
     }
+    serializer.serialize_u128(*val)
 }
 
 fn deserialize_u128_compat<'de, D>(deserializer: D) -> Result<u128, D::Error>
@@ -214,6 +238,11 @@ impl Default for MvmsConfig {
             master_reward_cap_bps: 1000,
             min_price_update_interval: 10,
             block_rewards_enabled: true,
+            ovm_stack_bytes_per_gas: 6,
+            max_ovm_data_stack_bytes: 2u64 * 1024 * 1024 * 1024,
+            expected_network_storage: 0,
+            storage_label_max_deviation_bps: 100,
+            storage_audit_interval_blocks: 0,
         }
     }
 }
@@ -337,6 +366,11 @@ impl MvmsConfig {
             master_reward_cap_bps: self.master_reward_cap_bps,
             min_price_update_interval: self.min_price_update_interval,
             block_rewards_enabled: self.block_rewards_enabled,
+            ovm_stack_bytes_per_gas: 6,
+            max_ovm_data_stack_bytes: 2u64 * 1024 * 1024 * 1024,
+            expected_network_storage: 0,
+            storage_label_max_deviation_bps: 100,
+            storage_audit_interval_blocks: 0,
         }
     }
 

@@ -42,6 +42,8 @@ pub struct AppConfig {
     /// Approved `CodeManifest` roots (hex).
     #[serde(default)]
     pub approved_manifests: Vec<String>,
+    #[serde(default)]
+    pub node_capacity_bytes: Option<u64>,
 }
 
 /// Configuration errors.

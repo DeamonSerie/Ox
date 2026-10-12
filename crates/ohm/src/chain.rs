@@ -101,6 +101,7 @@ fn failure_code(error: oxydome_ovm::VmError) -> OvmFailureCode {
         VmError::StackUnderflow => OvmFailureCode::StackUnderflow,
         VmError::StackOverflow => OvmFailureCode::StackOverflow,
         VmError::InvalidLocal => OvmFailureCode::InvalidLocal,
+        VmError::DataStackOverflow => OvmFailureCode::StackOverflow,
         VmError::InvalidBytecode | VmError::ProgramTooLarge | VmError::InvalidProgram => {
             OvmFailureCode::InvalidProgram
         }
@@ -1285,7 +1286,8 @@ impl OhmLedger {
         outbox_seq: &mut u64,
     ) -> Result<(), OhmError> {
         match action {
-            OvmAction::Deploy { code, gas_limit } => {
+            OvmAction::Deploy { code, stack_bytes } => {
+                let gas_limit = *stack_bytes;
                 oxydome_ovm::Program::decode(code)
                     .map_err(|error| OhmError::Ovm(error.to_string()))?;
                 let contract_id = oxydome_ovm::contract_id(txid);
@@ -1297,7 +1299,7 @@ impl OhmLedger {
                 }
                 let required = oxydome_ovm::ACTION_INTRINSIC_GAS
                     .saturating_add(u64::try_from(code.len()).unwrap_or(u64::MAX));
-                if required > *gas_limit {
+                if required > gas_limit {
                     return Ok(());
                 }
                 contracts.insert(
@@ -1309,7 +1311,8 @@ impl OhmLedger {
                 );
                 Ok(())
             }
-            OvmAction::DeployContract { artifact, gas_limit } => {
+            OvmAction::DeployContract { artifact, stack_bytes } => {
+                let gas_limit = *stack_bytes;
                 oxydome_ovm::ContractArtifact::decode(artifact)
                     .map_err(|error| OhmError::Ovm(error.to_string()))?;
                 let contract_id = oxydome_ovm::contract_id(txid);
@@ -1321,7 +1324,7 @@ impl OhmLedger {
                 }
                 let required = oxydome_ovm::ACTION_INTRINSIC_GAS
                     .saturating_add(u64::try_from(artifact.len()).unwrap_or(u64::MAX));
-                if required > *gas_limit {
+                if required > gas_limit {
                     return Ok(());
                 }
                 contracts.insert(
@@ -1336,9 +1339,10 @@ impl OhmLedger {
             OvmAction::Call {
                 contract_id,
                 arguments,
-                gas_limit,
+                stack_bytes,
             } => {
-                if *gas_limit < oxydome_ovm::ACTION_INTRINSIC_GAS {
+                let gas_limit = *stack_bytes;
+                if gas_limit < oxydome_ovm::ACTION_INTRINSIC_GAS {
                     return Ok(());
                 }
                 let Some(contract) = contracts.get(contract_id) else {
@@ -1351,7 +1355,7 @@ impl OhmLedger {
                     contract_id,
                     &program,
                     arguments,
-                    *gas_limit,
+                    gas_limit,
                     oxydome_ovm::ACTION_INTRINSIC_GAS,
                     tx.inputs[0].owner,
                     origin_ohm,
@@ -1369,11 +1373,12 @@ impl OhmLedger {
                 entry_point,
                 arguments,
                 authority_input,
-                gas_limit,
+                stack_bytes,
             } => {
+                let gas_limit = *stack_bytes;
                 let intrinsic_gas =
                     oxydome_ovm::ACTION_INTRINSIC_GAS + oxydome_ovm::CONTRACT_DISPATCH_GAS;
-                if *gas_limit < intrinsic_gas {
+                if gas_limit < intrinsic_gas {
                     return Ok(());
                 }
                 let Some(contract) = contracts.get(contract_id) else {
@@ -1408,7 +1413,7 @@ impl OhmLedger {
                     contract_id,
                     &program,
                     &execution_arguments,
-                    *gas_limit,
+                    gas_limit,
                     intrinsic_gas,
                     caller,
                     origin_ohm,
@@ -1665,7 +1670,7 @@ mod tests {
             100,
             Some(OvmAction::Deploy {
                 code: increment_program(),
-                gas_limit: 1_000,
+                stack_bytes: 1_000,
             }),
             &key(),
         );
@@ -1681,7 +1686,7 @@ mod tests {
             Some(OvmAction::Call {
                 contract_id,
                 arguments: vec![5],
-                gas_limit: 100,
+                stack_bytes: 100,
             }),
             &key(),
         );
@@ -1718,7 +1723,7 @@ mod tests {
             100,
             Some(OvmAction::Deploy {
                 code: vec![0xff, 0xff, 0xff],
-                gas_limit: 1_000,
+                stack_bytes: 1_000,
             }),
             &key(),
         );
@@ -1769,7 +1774,7 @@ mod tests {
             100,
             Some(OvmAction::DeployContract {
                 artifact,
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -1918,7 +1923,7 @@ mod tests {
             100,
             Some(OvmAction::DeployContract {
                 artifact: echo_artifact(1),
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -1939,7 +1944,7 @@ mod tests {
             100,
             Some(OvmAction::DeployContract {
                 artifact: on_reply_artifact(),
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -2098,7 +2103,7 @@ mod tests {
             100,
             Some(OvmAction::DeployContract {
                 artifact: echo_artifact(1),
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -2162,7 +2167,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             100,
             Some(OvmAction::DeployContract {
                 artifact: echo_artifact(1),
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -2311,7 +2316,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             100,
             Some(OvmAction::DeployContract {
                 artifact: xcall_launcher_artifact(b.ohm_id, target_contract),
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -2329,7 +2334,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
                 entry_point: "fire".into(),
                 arguments: vec![],
                 authority_input: 0,
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -2413,7 +2418,7 @@ let deploy = b.build_ovm_transaction(
             50,
             Some(OvmAction::DeployContract {
                 artifact,
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -2431,7 +2436,7 @@ let deploy = b.build_ovm_transaction(
                 entry_point: "check".into(),
                 arguments: vec![],
                 authority_input: 0,
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -2461,7 +2466,7 @@ let deploy = b.build_ovm_transaction(
             50,
             Some(OvmAction::DeployContract {
                 artifact: xcall_launcher_artifact(source.ohm_id, target_contract),
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -2556,7 +2561,7 @@ let deploy = b.build_ovm_transaction(
             100,
             Some(OvmAction::DeployContract {
                 artifact: xcall_launcher_artifact(a.ohm_id, Hash::from([7u8; 64])),
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );
@@ -2574,7 +2579,7 @@ let deploy = b.build_ovm_transaction(
                 entry_point: "fire".into(),
                 arguments: vec![],
                 authority_input: 0,
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &key(),
         );

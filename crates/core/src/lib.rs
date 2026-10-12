@@ -12,6 +12,7 @@ pub mod governance;
 pub mod ohm;
 pub mod operation;
 pub mod params;
+pub mod storage;
 pub mod tx;
 
 pub use block::{
@@ -44,11 +45,13 @@ pub use ohm::{
     MAX_OHM_REASON_BYTES, MAX_OHM_TX_ITEMS, OHM_POLICY_MAGIC, OHM_POLICY_VERSION,
     OHM_SERVER_FEE_BPS,
 };
+pub use operation::{StorageAuditOperation, StorageLabelOperation};
 pub use oxydome_crypto::{Hash, PublicKey, Sig};
 pub use params::ChainParams;
+pub use storage::{label_commitment, StorageAuditResult, StorageLabel};
 pub use tx::{
     transfer_fee, transfer_fee_for_amount, OutPoint, OutputKind, OvmAction, OvmFailureCode, OvmLog,
-    OvmReceipt, Transaction, TxError, TxInput, TxOutput, MAX_OVM_ARGUMENTS,
+    OvmReceipt, Transaction,     TxError, TxInput, TxOutput, MAX_OVM_ARGUMENTS,
     MAX_OVM_BLOCK_GAS_LIMIT, MAX_OVM_GAS_LIMIT,
 };
 

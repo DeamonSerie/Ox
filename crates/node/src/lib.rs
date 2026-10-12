@@ -5,9 +5,12 @@
 pub mod content_store;
 pub mod index;
 pub mod server;
+pub mod storage;
 
 use crate::content_store::ContentStore;
 use crate::index::{IndexStore, WalletIndex};
+use crate::storage::{Labeler, LabelerConfig};
+use oxydome_core::StorageLabel;
 use oxydome_audit::{attestation_quorum, AuditAttestation, AuditPackage, InputProof};
 use oxydome_consensus::{AdmissionCertificate, MasterCheck, QuorumCertificate, Vote, VoteKind};
 use oxydome_core::{
@@ -102,6 +105,8 @@ pub struct Node {
     pub mempool_inputs: BTreeSet<OutPoint>,
     /// Broadcast sink for wallet-facing events.
     pub events: broadcast::Sender<NodeEvent>,
+    /// Storage labeler for network capacity reporting.
+    labeler: Labeler,
 }
 
 impl Node {
@@ -117,7 +122,7 @@ impl Node {
             .map(|c| c.manifest_root)
             .unwrap_or_else(Hash::zero);
         let node = Node {
-            key,
+            key: key.clone(),
             gov,
             params: config.params.clone(),
             state,
@@ -140,8 +145,35 @@ impl Node {
             rejected_order: VecDeque::new(),
             mempool_inputs: BTreeSet::new(),
             events: broadcast::channel(2048).0,
+            labeler: Labeler::new(LabelerConfig {
+                node_keypair: key.clone(),
+                node_public: key.public(),
+                capacity_bytes: 0,
+                data_dir: std::path::PathBuf::new(),
+                content_store_root: std::path::PathBuf::new(),
+                index_store_path: std::path::PathBuf::new(),
+            }),
         };
         Ok((node, genesis))
+    }
+
+    /// Configures the storage labeler with a declared capacity and data paths.
+    pub fn with_storage_capacity(
+        mut self,
+        capacity_bytes: u64,
+        data_dir: std::path::PathBuf,
+        content_store_root: std::path::PathBuf,
+        index_store_path: std::path::PathBuf,
+    ) -> Self {
+        self.labeler = Labeler::new(LabelerConfig {
+            node_keypair: self.key.clone(),
+            node_public: self.key.public(),
+            capacity_bytes,
+            data_dir,
+            content_store_root,
+            index_store_path,
+        });
+        self
     }
 
     /// Attaches a durable ledger store to the node.
@@ -161,6 +193,22 @@ impl Node {
         self.content_store =
             ContentStore::open(path).map_err(|error| NodeError::Ledger(error.to_string()))?;
         Ok(self)
+    }
+
+    /// Returns the storage labeler used to publish this node's available capacity.
+    pub fn storage_labeler(&self) -> Option<&Labeler> {
+        if self.labeler.capacity() == 0 {
+            None
+        } else {
+            Some(&self.labeler)
+        }
+    }
+
+    /// Generates and records a fresh storage label at the given height.
+    pub fn refresh_storage_label(&self, height: u64, timestamp: u64) -> StorageLabel {
+        let label = self.labeler.generate_label(height, timestamp);
+        self.labeler.update_last_label(height, timestamp, &label);
+        label
     }
 
     fn verify_finality_evidence(
@@ -531,12 +579,12 @@ impl Node {
         // The wallet-makers API fee rule is exact: reject any fee that deviates from it.
         let base_fee =
             oxydome_core::transfer_fee(&tx.outputs).map_err(|e| NodeError::Tx(e.to_string()))?;
+        let stack_gas_val = tx
+            .ovm_action
+            .as_ref()
+            .map_or(0u64, |a| a.required_stack_gas(self.params.ovm_stack_bytes_per_gas));
         let legacy_fee = base_fee
-            .checked_add(
-                tx.ovm_action
-                    .as_ref()
-                    .map_or(0, |action| u128::from(action.gas_limit())),
-            )
+            .checked_add(u128::from(stack_gas_val))
             .ok_or_else(|| NodeError::Tx("required fee overflows".into()))?;
         let expected_fee = if next_height >= self.params.gas_activation_height {
             base_fee
@@ -552,7 +600,8 @@ impl Node {
         if next_height >= self.params.gas_activation_height && tx.fee == base_fee {
             if let Some(action) = &tx.ovm_action {
                 if let Some(caller) = tx.inputs.first().map(|i| &i.owner) {
-                    if self.state.gas_balance(caller) < u128::from(action.gas_limit()) {
+                    let sg = action.required_stack_gas(self.params.ovm_stack_bytes_per_gas);
+                    if self.state.gas_balance(caller) < u128::from(sg) {
                         return Err(NodeError::Tx("insufficient GAS balance for OVM execution".into()));
                     }
                 }
@@ -571,10 +620,16 @@ impl Node {
             .mempool
             .iter()
             .filter_map(|pending| pending.ovm_action.as_ref())
-            .try_fold(0u64, |total, action| total.checked_add(action.gas_limit()))
+            .try_fold(0u64, |total, action| {
+                total.checked_add(action.required_stack_gas(self.params.ovm_stack_bytes_per_gas))
+            })
             .ok_or_else(|| NodeError::Tx("mempool OVM gas total overflows".into()))?;
         let total_gas = pending_gas
-            .checked_add(tx.ovm_action.as_ref().map_or(0, OvmAction::gas_limit))
+            .checked_add(
+                tx.ovm_action
+                    .as_ref()
+                    .map_or(0, |a| a.required_stack_gas(self.params.ovm_stack_bytes_per_gas)),
+            )
             .ok_or_else(|| NodeError::Tx("mempool OVM gas total overflows".into()))?;
         if total_gas > oxydome_core::MAX_OVM_BLOCK_GAS_LIMIT {
             return Err(NodeError::Tx(
@@ -853,7 +908,7 @@ impl Node {
             return Err(NodeError::NotLeader);
         }
         let transactions: Vec<Transaction> = self.mempool.clone();
-        let total_fees = self.state.settled_fee_total(&transactions)?;
+        let total_fees = self.state.settled_fee_total(&transactions, &self.params)?;
         let mut operations = self.pending_ops.clone();
         if total_fees > 0 {
             operations.push(self.reward_operation(total_fees, &self.public()));
@@ -1399,6 +1454,7 @@ pub fn default_config(masters: usize, nodes: usize, supply: Amount) -> oxydome_c
         masters: master_eps,
         nodes: node_eps,
         approved_manifests: vec![reference_manifest().root().to_hex()],
+        node_capacity_bytes: None,
     }
 }
 
@@ -1452,8 +1508,9 @@ mod recovery_tests {
         }
         .encode()
         .unwrap();
-        let gas_limit = 1_000;
-        let fee = 1 + u128::from(gas_limit);
+        let stack_bytes = 1_000;
+        let stack_gas = (stack_bytes + 5) / 6; // ceil(1000/6) = 167
+        let fee = 1 + u128::from(stack_gas);
         let mut deployment = Transaction::new_unsigned(
             vec![(input, node.public())],
             vec![TxOutput::spendable(amount - fee, node.public())],
@@ -1461,11 +1518,14 @@ mod recovery_tests {
         );
         deployment.ovm_action = Some(OvmAction::DeployContract {
             artifact,
-            gas_limit,
+            stack_bytes,
         });
         deployment.sign_input(0, &key);
         let contract_id = oxydome_ovm::contract_id(deployment.txid());
-        let fees = node.state.settled_fee_total(&[deployment.clone()]).unwrap();
+        let fees = node
+            .state
+            .settled_fee_total(&[deployment.clone()], &node.params)
+            .unwrap();
         let rewards = split_fees(fees, &node.params, &node.gov.masters, &[(node.public(), 1)]);
         let block = node
             .state
@@ -1859,7 +1919,7 @@ mod recovery_tests {
             100,
             Some(OvmAction::DeployContract {
                 artifact,
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &maintainer,
         );
@@ -1877,7 +1937,7 @@ mod recovery_tests {
                 entry_point: "increment".into(),
                 arguments: vec![5],
                 authority_input: 0,
-                gas_limit: 100,
+                stack_bytes: 100,
             }),
             &maintainer,
         );
@@ -2143,7 +2203,7 @@ mod recovery_tests {
             100,
             Some(OvmAction::DeployContract {
                 artifact: echo_artifact(1),
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &maintainer_b,
         );
@@ -2169,7 +2229,7 @@ mod recovery_tests {
             100,
             Some(OvmAction::DeployContract {
                 artifact: on_reply_artifact(),
-                gas_limit: 2_000,
+                stack_bytes: 2_000,
             }),
             &maintainer_a,
         );

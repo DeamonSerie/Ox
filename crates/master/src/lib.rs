@@ -8,6 +8,7 @@
 
 pub mod mvms;
 pub mod mvms_config;
+pub mod storage_audit;
 pub mod server;
 
 pub use mvms::{compute_chain_id, MvmsMaster};
@@ -164,7 +165,9 @@ impl HeaderChain {
                 oxydome_core::Operation::Rewards(_)
                 | oxydome_core::Operation::Dao(_)
                 | oxydome_core::Operation::Ohm(_)
-                | oxydome_core::Operation::PriceChange(_) => {}
+                |                 oxydome_core::Operation::PriceChange(_) => {}
+                oxydome_core::Operation::StorageLabel(_) => {}
+                oxydome_core::Operation::StorageAudit(_) => {}
             }
         }
         self.supply = block.header.supply;
