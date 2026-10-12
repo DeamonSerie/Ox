@@ -31,6 +31,8 @@ pub const CONTRACT_DISPATCH_GAS: u64 = 5;
 pub const MAX_CROSS_ARGUMENTS: usize = 64;
 /// Fixed base cost charged for staging a cross-OHM message (`XCall`) or reading a receipt.
 pub const CROSS_HOST_GAS: u64 = 20;
+/// Number of bytes of data stack that a single GAS unit reserves.
+pub const STACK_BYTES_PER_GAS: u64 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Instruction {
@@ -64,6 +66,12 @@ pub enum Instruction {
     ReadReply,
     Return,
     Revert,
+    /// Pushes the byte length of the pre-reserved data stack onto the operand stack.
+    DataSize,
+    /// Pushes the little-endian `u64` stored at byte `offset` in the data stack.
+    LoadData(u64),
+    /// Pops a `u64` and writes it little-endian at byte `offset` in the data stack.
+    StoreData(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,6 +528,8 @@ pub enum VmError {
     MissingReturn,
     #[error("OVM contract storage slot limit exceeded")]
     StorageLimitExceeded,
+    #[error("OVM data stack access exceeds the reserved stack")]
+    DataStackOverflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -593,19 +603,23 @@ pub fn execute(
     program: &Program,
     arguments: &[u64],
     initial_storage: &BTreeMap<u64, u64>,
-    gas_limit: u64,
+    stack_bytes: u64,
 ) -> Result<Execution, ExecutionFailure> {
-    execute_with_host(program, arguments, initial_storage, gas_limit, None)
+    execute_with_host(program, arguments, initial_storage, stack_bytes, None)
 }
 
 /// Executes `program` with an optional [`CrossHost`]. Without a host, the cross-OHM
 /// instructions (`XCall`, `ReadReply`) fail deterministically with
 /// [`VmError::InvalidProgram`].
+///
+/// The data stack is pre-reserved to `stack_bytes` bytes and zero-initialized. Execution is
+/// metered only by this reservation: a program that stays within its reserved stack runs to
+/// completion, and an access beyond it fails with [`VmError::DataStackOverflow`].
 pub fn execute_with_host(
     program: &Program,
     arguments: &[u64],
     initial_storage: &BTreeMap<u64, u64>,
-    gas_limit: u64,
+    stack_bytes: u64,
     host: Option<&CrossHost>,
 ) -> Result<Execution, ExecutionFailure> {
     verify(program).map_err(|error| ExecutionFailure { error, gas_used: 0 })?;
@@ -621,35 +635,10 @@ pub fn execute_with_host(
     let mut logs = Vec::new();
     let mut staged_calls = Vec::new();
     let mut pc = 0usize;
-    let mut gas_used = 0u64;
     let mut token_base: u64 = 0;
+    let mut data: Vec<u8> = vec![0u8; stack_bytes as usize];
 
     while let Some(instruction) = program.instructions.get(pc) {
-        let cost = match instruction {
-            Instruction::LoadStorage(_) | Instruction::StoreStorage(_) => 5,
-            Instruction::Emit(_) => 3,
-            Instruction::XCall { .. } | Instruction::ReadReply => CROSS_HOST_GAS,
-            Instruction::Push(_)
-            | Instruction::LoadArg(_)
-            | Instruction::LoadLocal(_)
-            | Instruction::StoreLocal(_) => 2,
-            _ => 1,
-        };
-        gas_used = match gas_used.checked_add(cost) {
-            Some(total) => total,
-            None => {
-                return Err(ExecutionFailure {
-                    error: VmError::OutOfGas,
-                    gas_used: gas_limit,
-                });
-            }
-        };
-        if gas_used > gas_limit {
-            return Err(ExecutionFailure {
-                error: VmError::OutOfGas,
-                gas_used: gas_limit,
-            });
-        }
         pc += 1;
         let result = match instruction {
             Instruction::Push(value) => push(&mut stack, *value),
@@ -720,26 +709,26 @@ pub fn execute_with_host(
                 if host.is_none() {
                     return Err(ExecutionFailure {
                         error: VmError::InvalidProgram,
-                        gas_used,
+                        gas_used: stack_bytes,
                     });
                 }
                 let arg_count = *arg_count as usize;
                 if arg_count > MAX_CROSS_ARGUMENTS {
                     return Err(ExecutionFailure {
                         error: VmError::InvalidProgram,
-                        gas_used,
+                        gas_used: stack_bytes,
                     });
                 }
                 let gas_limit = match pop(&mut stack) {
                     Ok(value) => value,
                     Err(error) => {
-                        return Err(ExecutionFailure { error, gas_used })
+                        return Err(ExecutionFailure { error, gas_used: stack_bytes })
                     }
                 };
                 let entry_selector = match pop(&mut stack) {
                     Ok(value) => value,
                     Err(error) => {
-                        return Err(ExecutionFailure { error, gas_used })
+                        return Err(ExecutionFailure { error, gas_used: stack_bytes })
                     }
                 };
                 let mut contract_words = [0u64; 8];
@@ -747,7 +736,7 @@ pub fn execute_with_host(
                     *word = match pop(&mut stack) {
                         Ok(value) => value,
                         Err(error) => {
-                            return Err(ExecutionFailure { error, gas_used })
+                            return Err(ExecutionFailure { error, gas_used: stack_bytes })
                         }
                     };
                 }
@@ -757,7 +746,7 @@ pub fn execute_with_host(
                     *word = match pop(&mut stack) {
                         Ok(value) => value,
                         Err(error) => {
-                            return Err(ExecutionFailure { error, gas_used })
+                            return Err(ExecutionFailure { error, gas_used: stack_bytes })
                         }
                     };
                 }
@@ -767,7 +756,7 @@ pub fn execute_with_host(
                     arguments.push(match pop(&mut stack) {
                         Ok(value) => value,
                         Err(error) => {
-                            return Err(ExecutionFailure { error, gas_used })
+                            return Err(ExecutionFailure { error, gas_used: stack_bytes })
                         }
                     });
                 }
@@ -789,7 +778,7 @@ pub fn execute_with_host(
                     None => {
                         return Err(ExecutionFailure {
                             error: VmError::InvalidProgram,
-                            gas_used,
+                            gas_used: stack_bytes,
                         })
                     }
                 };
@@ -798,7 +787,7 @@ pub fn execute_with_host(
                     *word = match pop(&mut stack) {
                         Ok(value) => value,
                         Err(error) => {
-                            return Err(ExecutionFailure { error, gas_used })
+                            return Err(ExecutionFailure { error, gas_used: stack_bytes })
                         }
                     };
                 }
@@ -815,6 +804,21 @@ pub fn execute_with_host(
                     push(&mut stack, view.value)
                 })
             }
+            Instruction::DataSize => push(&mut stack, stack_bytes),
+            Instruction::LoadData(offset) => {
+                let value = read_data_u64(&data, *offset).map_err(|error| ExecutionFailure {
+                    error,
+                    gas_used: stack_bytes,
+                })?;
+                push(&mut stack, value)
+            }
+            Instruction::StoreData(offset) => {
+                let value = pop(&mut stack).map_err(|error| ExecutionFailure {
+                    error,
+                    gas_used: stack_bytes,
+                })?;
+                write_data_u64(&mut data, *offset, value)
+            }
             Instruction::Return => {
                 let return_value = if stack.is_empty() {
                     None
@@ -822,13 +826,13 @@ pub fn execute_with_host(
                     match pop(&mut stack) {
                         Ok(value) => Some(value),
                         Err(error) => {
-                            return Err(ExecutionFailure { error, gas_used });
+                            return Err(ExecutionFailure { error, gas_used: stack_bytes });
                         }
                     }
                 };
                 return Ok(Execution {
                     return_value,
-                    gas_used,
+                    gas_used: stack_bytes,
                     logs,
                     storage,
                     staged_calls,
@@ -837,17 +841,17 @@ pub fn execute_with_host(
             Instruction::Revert => {
                 return Err(ExecutionFailure {
                     error: VmError::Reverted,
-                    gas_used,
+                    gas_used: stack_bytes,
                 });
             }
         };
         if let Err(error) = result {
-            return Err(ExecutionFailure { error, gas_used });
+            return Err(ExecutionFailure { error, gas_used: stack_bytes });
         }
     }
     Err(ExecutionFailure {
         error: VmError::MissingReturn,
-        gas_used,
+        gas_used: stack_bytes,
     })
 }
 
@@ -856,6 +860,26 @@ fn push(stack: &mut Vec<u64>, value: u64) -> Result<(), VmError> {
         return Err(VmError::StackOverflow);
     }
     stack.push(value);
+    Ok(())
+}
+
+fn read_data_u64(data: &[u8], offset: u64) -> Result<u64, VmError> {
+    let start = offset as usize;
+    let end = start.checked_add(8).ok_or(VmError::DataStackOverflow)?;
+    if end > data.len() {
+        return Err(VmError::DataStackOverflow);
+    }
+    let bytes: [u8; 8] = data[start..end].try_into().expect("checked range above");
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn write_data_u64(data: &mut [u8], offset: u64, value: u64) -> Result<(), VmError> {
+    let start = offset as usize;
+    let end = start.checked_add(8).ok_or(VmError::DataStackOverflow)?;
+    if end > data.len() {
+        return Err(VmError::DataStackOverflow);
+    }
+    data[start..end].copy_from_slice(&value.to_le_bytes());
     Ok(())
 }
 
@@ -944,6 +968,15 @@ fn encode_instruction(instruction: &Instruction, output: &mut Vec<u8>) {
         Instruction::ReadReply => output.push(0x41),
         Instruction::Return => output.push(0xf0),
         Instruction::Revert => output.push(0xf1),
+        Instruction::DataSize => output.push(0x50),
+        Instruction::LoadData(offset) => {
+            output.push(0x51);
+            output.extend_from_slice(&offset.to_le_bytes());
+        }
+        Instruction::StoreData(offset) => {
+            output.push(0x52);
+            output.extend_from_slice(&offset.to_le_bytes());
+        }
     }
 }
 
@@ -990,6 +1023,9 @@ fn decode_instruction(bytes: &[u8], cursor: &mut usize) -> Result<Instruction, V
         0x41 => Instruction::ReadReply,
         0xf0 => Instruction::Return,
         0xf1 => Instruction::Revert,
+        0x50 => Instruction::DataSize,
+        0x51 => Instruction::LoadData(u64::from_le_bytes(take(bytes, cursor)?)),
+        0x52 => Instruction::StoreData(u64::from_le_bytes(take(bytes, cursor)?)),
         _ => return Err(VmError::InvalidBytecode),
     })
 }
@@ -1022,7 +1058,7 @@ mod tests {
     }
 
     #[test]
-    fn traps_overflow_division_by_zero_and_out_of_gas() {
+    fn traps_overflow_division_by_zero_and_data_stack_overflow() {
         let program = Program {
             argument_count: 0,
             local_count: 0,
@@ -1035,14 +1071,42 @@ mod tests {
         };
         let overflow = execute(&program, &[], &BTreeMap::new(), 100).unwrap_err();
         assert_eq!(overflow.error, VmError::ArithmeticOverflow);
-        assert_eq!(overflow.gas_used, 5);
-        let out_of_gas = execute(&program, &[], &BTreeMap::new(), 1).unwrap_err();
-        assert_eq!(out_of_gas.error, VmError::OutOfGas);
-        assert_eq!(out_of_gas.gas_used, 1);
+        assert_eq!(overflow.gas_used, 100);
+// Accessing the data stack beyond the reserved size fails with DataStackOverflow,
+    // not a mid-run fuel stop: the reservation itself bounds the stack.
+    let oob = Program {
+        argument_count: 0,
+        local_count: 0,
+        instructions: vec![Instruction::LoadData(100), Instruction::Return],
+    };
+    let failure = execute(&oob, &[], &BTreeMap::new(), 100).unwrap_err();
+    assert_eq!(failure.error, VmError::DataStackOverflow);
+    assert_eq!(failure.gas_used, 100);
     }
 
     #[test]
-    fn revert_reports_gas_and_storage_limit_is_bounded() {
+    fn data_stack_round_trips_and_size_is_reported() {
+        let program = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![
+                Instruction::DataSize,
+                Instruction::StoreData(8),
+                Instruction::LoadData(8),
+                Instruction::Return,
+            ],
+        };
+        let execution = execute(&program, &[], &BTreeMap::new(), 1024).unwrap();
+        assert_eq!(execution.return_value, Some(1024));
+        assert_eq!(execution.gas_used, 1024);
+        // The data stack encodes: [size, value] -> value pushed last is what Return pops.
+        let decode = Program::decode(&program.encode().unwrap()).unwrap();
+        let execution = execute(&decode, &[], &BTreeMap::new(), 1024).unwrap();
+        assert_eq!(execution.return_value, Some(1024));
+    }
+
+    #[test]
+    fn revert_reports_and_storage_limit_is_bounded() {
         let program = Program {
             argument_count: 0,
             local_count: 0,
@@ -1054,7 +1118,7 @@ mod tests {
         };
         let failure = execute(&program, &[], &BTreeMap::new(), 100).unwrap_err();
         assert_eq!(failure.error, VmError::Reverted);
-        assert_eq!(failure.gas_used, 8);
+        assert_eq!(failure.gas_used, 100);
 
         let mut storage = BTreeMap::new();
         storage.extend((0..MAX_STORAGE_SLOTS as u64).map(|slot| (slot, 1)));
@@ -1069,7 +1133,7 @@ mod tests {
         };
         let failure = execute(&overflow, &[], &storage, 100).unwrap_err();
         assert_eq!(failure.error, VmError::StorageLimitExceeded);
-        assert_eq!(failure.gas_used, 7);
+        assert_eq!(failure.gas_used, 100);
     }
 
     #[test]

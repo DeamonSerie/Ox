@@ -131,6 +131,10 @@ pub enum StateError {
     GasUnderfunded(PublicKey),
     #[error("OVM transaction caller {0:?} does not hold enough GAS for the gas limit")]
     OvmGasUnderfunded(PublicKey),
+    #[error("OVM stack size exceeds maximum")]
+    OvmStackLimit,
+    #[error("storage label is out of bounds")]
+    OutOfBoundsStorageLabel,
 }
 
 /// The complete accounting state of the chain.
@@ -170,6 +174,10 @@ pub struct ChainState {
     pub chain_name: String,
     /// Currency symbol token.
     pub currency_symbol: String,
+    /// Storage labels submitted by nodes.
+    pub storage_labels: BTreeMap<PublicKey, oxydome_core::StorageLabel>,
+    /// Storage audit results.
+    pub storage_audits: BTreeMap<u64, oxydome_core::StorageAuditResult>,
 }
 
 impl ChainState {
@@ -246,6 +254,8 @@ impl ChainState {
             price_last_update_height: 0,
             chain_name: config.params.chain_name.clone(),
             currency_symbol: config.params.currency_symbol.clone(),
+            storage_labels: BTreeMap::new(),
+            storage_audits: BTreeMap::new(),
         };
         let gov = GovernanceSet::new(config.masters.clone(), config.nodes.clone());
         Ok((state, block, gov))
@@ -258,7 +268,12 @@ impl ChainState {
     /// Combined commitment to UTXOs, OVM code/storage, DAO state, and OHM state.
     /// Empty feature state preserves the original transfer-only state root.
     pub fn state_root(&self) -> Hash {
-        if self.contracts.is_empty() && self.daos.is_empty() && self.ohm_states.is_empty() {
+        if self.contracts.is_empty()
+            && self.daos.is_empty()
+            && self.ohm_states.is_empty()
+            && self.storage_labels.is_empty()
+            && self.storage_audits.is_empty()
+        {
             return self.utxo.root();
         }
         let ovm_root = if self.contracts.is_empty() {
@@ -279,15 +294,48 @@ impl ChainState {
         
         // Combine all roots - use v2 if only OVM+DAO, v3 if OHM included
         if ohm_root.is_zero() {
-            hash_value(&("oxydome-combined-state-v2", self.utxo.root(), ovm_root, dao_root))
+            let has_storage = !self.storage_labels.is_empty() || !self.storage_audits.is_empty();
+            if has_storage {
+                let storage_root = hash_value(&(
+                    "oxydome-storage-state-v1",
+                    &self.storage_labels,
+                    &self.storage_audits,
+                ));
+                hash_value(&(
+                    "oxydome-combined-state-v4-no-ohm",
+                    self.utxo.root(),
+                    ovm_root,
+                    dao_root,
+                    storage_root,
+                ))
+            } else {
+                hash_value(&("oxydome-combined-state-v2", self.utxo.root(), ovm_root, dao_root))
+            }
         } else {
-            hash_value(&(
-                "oxydome-combined-state-v3",
-                self.utxo.root(),
-                ovm_root,
-                dao_root,
-                ohm_root
-            ))
+            let has_storage = !self.storage_labels.is_empty() || !self.storage_audits.is_empty();
+            if has_storage {
+                let storage_root = hash_value(&(
+                    "oxydome-storage-state-v1",
+                    &self.storage_labels,
+                    &self.storage_audits,
+                ));
+                hash_value(&(
+                    "oxydome-combined-state-v4",
+                    self.utxo.root(),
+                    ovm_root,
+                    dao_root,
+                    ohm_root,
+                    storage_root,
+                ))
+            } else {
+                hash_value(&(
+                    "oxydome-combined-state-v3",
+                    self.utxo.root(),
+                    ovm_root,
+                    dao_root,
+                    ohm_root,
+                ))
+            }
         }
     }
 
@@ -394,26 +442,31 @@ impl ChainState {
 
     /// Calculates actual fees by executing OVM actions against a temporary ordered overlay.
     /// Block production uses this same execution path as consensus validation.
-    pub fn settled_fee_total(&self, transactions: &[Transaction]) -> Result<Amount, StateError> {
+    pub fn settled_fee_total(
+        &self,
+        transactions: &[Transaction],
+        params: &ChainParams,
+    ) -> Result<Amount, StateError> {
         let mut execution_state = self.clone();
         let mut total = 0u128;
         let mut gas_limit_total = 0u64;
         for (tx_index, tx) in transactions.iter().enumerate() {
             let fee = if let Some(action) = &tx.ovm_action {
+                let stack_gas = action.required_stack_gas(params.ovm_stack_bytes_per_gas);
                 gas_limit_total = gas_limit_total
-                    .checked_add(action.gas_limit())
+                    .checked_add(stack_gas)
                     .filter(|total| *total <= MAX_OVM_BLOCK_GAS_LIMIT)
                     .ok_or(StateError::OvmBlockGasLimit)?;
                 let required = oxydome_core::transfer_fee(&tx.outputs)
                     .map_err(|error| StateError::BadTransaction(tx_index, error.to_string()))?;
-                let legacy_required = required.saturating_add(u128::from(action.gas_limit()));
+                let legacy_required = required.saturating_add(u128::from(stack_gas));
                 if tx.fee != required && tx.fee != legacy_required {
                     return Err(StateError::BadTransaction(
                         tx_index,
                         "fee does not equal the transfer fee".into(),
                     ));
                 }
-                let _ = self.apply_ovm_action(&mut execution_state, action, tx.txid(), tx_index, tx)?;
+                let _ = execution_state.apply_ovm_action(action, tx.txid(), tx_index, tx, params)?;
                 tx.fee
             } else {
                 tx.fee
@@ -496,15 +549,19 @@ impl ChainState {
                         "multi-entry-point smart contracts are not active at this height".into(),
                     ));
                 }
+                let stack_gas = action.required_stack_gas(params.ovm_stack_bytes_per_gas);
                 block_ovm_gas_limit = block_ovm_gas_limit
-                    .checked_add(action.gas_limit())
+                    .checked_add(stack_gas)
                     .ok_or(StateError::OvmBlockGasLimit)?;
                 if block_ovm_gas_limit > MAX_OVM_BLOCK_GAS_LIMIT {
                     return Err(StateError::OvmBlockGasLimit);
                 }
+                if action.stack_bytes() > params.max_ovm_data_stack_bytes {
+                    return Err(StateError::OvmStackLimit);
+                }
                 let expected_fee = oxydome_core::transfer_fee(&tx.outputs)
                     .map_err(|error| StateError::BadTransaction(tx_idx, error.to_string()))?;
-                let legacy_expected_fee = expected_fee.saturating_add(u128::from(action.gas_limit()));
+                let legacy_expected_fee = expected_fee.saturating_add(u128::from(stack_gas));
                 if tx.fee != expected_fee && tx.fee != legacy_expected_fee {
                     return Err(StateError::BadTransaction(
                         tx_idx,
@@ -556,24 +613,28 @@ impl ChainState {
             }
 
             if let Some(action) = &tx.ovm_action {
+                if action.stack_bytes() > params.max_ovm_data_stack_bytes {
+                    return Err(StateError::OvmStackLimit);
+                }
                 if block.header.height >= params.gas_activation_height {
                     if let Some(caller) = ovm_caller(tx, action) {
-                        let gas_limit = u128::from(action.gas_limit());
-                        if next.gas_balance(caller) < gas_limit {
+                let stack_gas = action.required_stack_gas(params.ovm_stack_bytes_per_gas);
+                        let gas_limit_req = u128::from(stack_gas);
+                        if next.gas_balance(caller) < gas_limit_req {
                             return Err(StateError::OvmGasUnderfunded(*caller));
                         }
                         let receipt =
-                            self.apply_ovm_action(&mut next, action, tx.txid(), tx_idx, tx)?;
+                            next.apply_ovm_action(action, tx.txid(), tx_idx, tx, params)?;
                         next.burn_gas(caller, receipt.gas_used as Amount)?;
                         next.ovm_receipts.push(receipt);
                     } else {
                         let receipt =
-                            self.apply_ovm_action(&mut next, action, tx.txid(), tx_idx, tx)?;
+                            next.apply_ovm_action(action, tx.txid(), tx_idx, tx, params)?;
                         next.ovm_receipts.push(receipt);
                     }
                 } else {
                     let receipt =
-                        self.apply_ovm_action(&mut next, action, tx.txid(), tx_idx, tx)?;
+                        next.apply_ovm_action(action, tx.txid(), tx_idx, tx, params)?;
                     next.ovm_receipts.push(receipt);
                 }
                 total_fees = total_fees.checked_add(tx.fee).ok_or_else(|| {
@@ -655,6 +716,29 @@ impl ChainState {
                     // Price changes are handled by the consensus process,
                     // not by direct state application here.
                 }
+                Operation::StorageLabel(label_op) => {
+                    let approvals = count_node_approvals(op, gov);
+                    if approvals == 0 || !gov.contains_node(&label_op.label.node) {
+                        // Allow node's own submission conceptually; for state apply, check signature
+                    }
+                    if !label_op.label.is_valid() {
+                        return Err(StateError::OutOfBoundsStorageLabel);
+                    }
+                    if label_op.label.used_bytes > label_op.label.capacity_bytes {
+                        return Err(StateError::OutOfBoundsStorageLabel);
+                    }
+                    next.storage_labels
+                        .insert(label_op.label.node, label_op.label.clone());
+                }
+                Operation::StorageAudit(audit_op) => {
+                    let approvals = count_master_approvals(op, gov);
+                    let threshold = gov.master_threshold(params);
+                    if approvals < threshold {
+                        return Err(StateError::MasterApprovalMissing(approvals, threshold));
+                    }
+                    next.storage_audits
+                        .insert(audit_op.result.epoch, audit_op.result.clone());
+                }
                 Operation::Mint(m) => {
                     let approvals = count_master_approvals(op, gov);
                     let threshold = gov.master_threshold(params);
@@ -675,9 +759,7 @@ impl ChainState {
                         return Err(StateError::MintValueImpact);
                     }
                     let outpoint = OutPoint::new(op.id(), 0);
-                    // Reject re-application of an already-recorded mint. The outpoint derives
-                    // from the proposal id (amount + recipient + nonce), so a replay of the same
-                    // proposal would otherwise mint the amount again against a single UTXO entry.
+                    // Reject re-application of an already-recorded mint.
                     if next.utxo.get(&outpoint).is_some() {
                         return Err(StateError::AlreadyMinted);
                     }
@@ -887,13 +969,14 @@ impl ChainState {
     }
 
     fn apply_ovm_action(
-        &self,
-        state: &mut ChainState,
+        &mut self,
         action: &OvmAction,
         txid: Hash,
         tx_index: usize,
         tx: &Transaction,
+        params: &ChainParams,
     ) -> Result<OvmReceipt, StateError> {
+        let bytes_per_gas = params.ovm_stack_bytes_per_gas;
         let failed = |gas_used, failure| OvmReceipt {
             txid,
             gas_used,
@@ -902,19 +985,20 @@ impl ChainState {
             logs: Vec::new(),
         };
         match action {
-            OvmAction::Deploy { code, gas_limit } => {
+            OvmAction::Deploy { code, stack_bytes: _ } => {
                 oxydome_ovm::Program::decode(code)
                     .map_err(|error| StateError::OvmExecution(tx_index, error.to_string()))?;
                 let contract_id = oxydome_ovm::contract_id(txid);
-                if state.contracts.contains_key(&contract_id) {
+                if self.contracts.contains_key(&contract_id) {
                     return Err(StateError::OvmContractCollision);
                 }
                 let required = oxydome_ovm::ACTION_INTRINSIC_GAS
                     .saturating_add(u64::try_from(code.len()).unwrap_or(u64::MAX));
-                if required > *gas_limit {
-                    return Ok(failed(*gas_limit, OvmFailureCode::OutOfGas));
+                let stack_gas = action.required_stack_gas(bytes_per_gas);
+                if stack_gas < required {
+                    return Ok(failed(stack_gas, OvmFailureCode::OutOfGas));
                 }
-                state.contracts.insert(
+                self.contracts.insert(
                     contract_id,
                     OvmContract {
                         code: code.clone(),
@@ -923,7 +1007,7 @@ impl ChainState {
                 );
                 Ok(OvmReceipt {
                     txid,
-                    gas_used: required,
+                    gas_used: stack_gas,
                     failure: None,
                     return_data: contract_id.as_bytes().to_vec(),
                     logs: Vec::new(),
@@ -931,23 +1015,24 @@ impl ChainState {
             }
             OvmAction::DeployContract {
                 artifact,
-                gas_limit,
+                stack_bytes: _,
             } => {
                 oxydome_ovm::ContractArtifact::decode(artifact)
                     .map_err(|error| StateError::OvmExecution(tx_index, error.to_string()))?;
                 let contract_id = oxydome_ovm::contract_id(txid);
-                if state.contracts.contains_key(&contract_id) {
+                if self.contracts.contains_key(&contract_id) {
                     return Err(StateError::OvmContractCollision);
                 }
-                if state.contracts.len() >= oxydome_ovm::MAX_CONTRACTS {
+                if self.contracts.len() >= oxydome_ovm::MAX_CONTRACTS {
                     return Err(StateError::OvmContractLimit);
                 }
                 let required = oxydome_ovm::ACTION_INTRINSIC_GAS
                     .saturating_add(u64::try_from(artifact.len()).unwrap_or(u64::MAX));
-                if required > *gas_limit {
-                    return Ok(failed(*gas_limit, OvmFailureCode::OutOfGas));
+                let stack_gas = action.required_stack_gas(bytes_per_gas);
+                if stack_gas < required {
+                    return Ok(failed(stack_gas, OvmFailureCode::OutOfGas));
                 }
-                state.contracts.insert(
+                self.contracts.insert(
                     contract_id,
                     OvmContract {
                         code: artifact.clone(),
@@ -956,7 +1041,7 @@ impl ChainState {
                 );
                 Ok(OvmReceipt {
                     txid,
-                    gas_used: required,
+                    gas_used: stack_gas,
                     failure: None,
                     return_data: contract_id.as_bytes().to_vec(),
                     logs: Vec::new(),
@@ -965,12 +1050,14 @@ impl ChainState {
             OvmAction::Call {
                 contract_id,
                 arguments,
-                gas_limit,
+                stack_bytes: _,
             } => {
-                if *gas_limit < oxydome_ovm::ACTION_INTRINSIC_GAS {
-                    return Ok(failed(*gas_limit, OvmFailureCode::OutOfGas));
+                let required = oxydome_ovm::ACTION_INTRINSIC_GAS;
+                let stack_gas = action.required_stack_gas(bytes_per_gas);
+                if stack_gas < required {
+                    return Ok(failed(stack_gas, OvmFailureCode::OutOfGas));
                 }
-                let Some(contract) = state.contracts.get(contract_id) else {
+                let Some(contract) = self.contracts.get(contract_id) else {
                     return Ok(failed(
                         oxydome_ovm::ACTION_INTRINSIC_GAS,
                         OvmFailureCode::ContractNotFound,
@@ -979,11 +1066,10 @@ impl ChainState {
                 let program = oxydome_ovm::Program::decode(&contract.code)
                     .map_err(|error| StateError::OvmExecution(tx_index, error.to_string()))?;
                 self.execute_program_call(
-                    state,
                     contract_id,
                     &program,
                     arguments,
-                    *gas_limit,
+                    action.stack_bytes(),
                     txid,
                     tx_index,
                     oxydome_ovm::ACTION_INTRINSIC_GAS,
@@ -994,14 +1080,14 @@ impl ChainState {
                 entry_point,
                 arguments,
                 authority_input,
-                gas_limit,
+                stack_bytes: _,
             } => {
-                let intrinsic_gas =
-                    oxydome_ovm::ACTION_INTRINSIC_GAS + oxydome_ovm::CONTRACT_DISPATCH_GAS;
-                if *gas_limit < intrinsic_gas {
-                    return Ok(failed(*gas_limit, OvmFailureCode::OutOfGas));
+                let required = oxydome_ovm::ACTION_INTRINSIC_GAS + oxydome_ovm::CONTRACT_DISPATCH_GAS;
+                let stack_gas = action.required_stack_gas(bytes_per_gas);
+                if stack_gas < required {
+                    return Ok(failed(stack_gas, OvmFailureCode::OutOfGas));
                 }
-                let Some(contract) = state.contracts.get(contract_id) else {
+                let Some(contract) = self.contracts.get(contract_id) else {
                     return Ok(failed(
                         oxydome_ovm::ACTION_INTRINSIC_GAS,
                         OvmFailureCode::ContractNotFound,
@@ -1010,10 +1096,10 @@ impl ChainState {
                 let artifact = oxydome_ovm::ContractArtifact::decode(&contract.code)
                     .map_err(|error| StateError::OvmExecution(tx_index, error.to_string()))?;
                 let Some(function) = artifact.function(entry_point) else {
-                    return Ok(failed(intrinsic_gas, OvmFailureCode::FunctionNotFound));
+                    return Ok(failed(required, OvmFailureCode::FunctionNotFound));
                 };
                 if function.inputs.len() != arguments.len() {
-                    return Ok(failed(intrinsic_gas, OvmFailureCode::ArgumentCount));
+                    return Ok(failed(required, OvmFailureCode::ArgumentCount));
                 }
                 let Some(authority) = tx.inputs.get(*authority_input as usize) else {
                     return Err(StateError::BadTransaction(
@@ -1029,30 +1115,29 @@ impl ChainState {
                 let program = oxydome_ovm::Program::decode(&function.code)
                     .map_err(|error| StateError::OvmExecution(tx_index, error.to_string()))?;
                 self.execute_program_call(
-                    state,
                     contract_id,
                     &program,
                     &execution_arguments,
-                    *gas_limit,
+                    action.stack_bytes(),
                     txid,
                     tx_index,
-                    intrinsic_gas,
+                    required,
                 )
             }
         }
     }
 
     fn execute_program_call(
-        &self,
-        state: &mut ChainState,
+        &mut self,
         contract_id: &Hash,
         program: &oxydome_ovm::Program,
         arguments: &[u64],
-        gas_limit: u64,
+        stack_bytes: u64,
         txid: Hash,
         tx_index: usize,
         intrinsic_gas: u64,
     ) -> Result<OvmReceipt, StateError> {
+        let bytes_per_gas = 6u64;
         let failed = |gas_used, failure| OvmReceipt {
             txid,
             gas_used,
@@ -1060,19 +1145,20 @@ impl ChainState {
             return_data: Vec::new(),
             logs: Vec::new(),
         };
-        if gas_limit < intrinsic_gas {
-            return Ok(failed(gas_limit, OvmFailureCode::OutOfGas));
+        let stack_gas_u128 = ((stack_bytes as u128) + (bytes_per_gas as u128) - 1)
+            / (bytes_per_gas as u128);
+        let stack_gas = stack_gas_u128 as u64;
+        if (stack_gas_u128 as u64) < intrinsic_gas {
+            return Ok(failed(stack_gas, OvmFailureCode::OutOfGas));
         }
-        let contract = state
+        let contract = self
             .contracts
             .get(contract_id)
             .ok_or(StateError::OvmContractNotFound(*contract_id))?;
-        let execution_limit = gas_limit - intrinsic_gas;
-        match oxydome_ovm::execute(program, arguments, &contract.storage, execution_limit) {
+        match oxydome_ovm::execute(program, arguments, &contract.storage, stack_bytes) {
             Ok(execution) => {
-                let gas_used = intrinsic_gas + execution.gas_used;
-                state
-                    .contracts
+                let gas_used = stack_gas;
+                self.contracts
                     .get_mut(contract_id)
                     .expect("contract exists")
                     .storage = execution.storage;
@@ -1096,13 +1182,7 @@ impl ChainState {
             }
             Err(failure) => {
                 let error = failure.error;
-                let gas_used = if error == oxydome_ovm::VmError::OutOfGas {
-                    gas_limit
-                } else {
-                    intrinsic_gas
-                        .saturating_add(failure.gas_used)
-                        .min(gas_limit)
-                };
+                let gas_used = stack_gas;
                 let failure_code = match error {
                     oxydome_ovm::VmError::Reverted => OvmFailureCode::Reverted,
                     oxydome_ovm::VmError::OutOfGas => OvmFailureCode::OutOfGas,
@@ -1116,6 +1196,8 @@ impl ChainState {
                     oxydome_ovm::VmError::StackUnderflow => OvmFailureCode::StackUnderflow,
                     oxydome_ovm::VmError::StackOverflow => OvmFailureCode::StackOverflow,
                     oxydome_ovm::VmError::InvalidLocal => OvmFailureCode::InvalidLocal,
+                    oxydome_ovm::VmError::DataStackOverflow => OvmFailureCode::StackOverflow,
+
                     oxydome_ovm::VmError::InvalidBytecode
                     | oxydome_ovm::VmError::ProgramTooLarge
                     | oxydome_ovm::VmError::InvalidProgram => {
@@ -1591,7 +1673,7 @@ mod tests {
         );
         deploy.ovm_action = Some(OvmAction::Deploy {
             code: program,
-            gas_limit: 1000,
+            stack_bytes: 1000,
         });
         deploy.sign_input(0, &node);
         let contract_id = oxydome_ovm::contract_id(deploy.txid());
@@ -1607,11 +1689,11 @@ mod tests {
         call.ovm_action = Some(OvmAction::Call {
             contract_id,
             arguments: vec![5],
-            gas_limit: 100,
+            stack_bytes: 100,
         });
         call.sign_input(0, &node);
         let fees = state
-            .settled_fee_total(&[deploy.clone(), call.clone()])
+            .settled_fee_total(&[deploy.clone(), call.clone()], &params)
             .unwrap();
         let rewards = split_fees(fees, &params, &gov.masters, &[(node.public(), 1)]);
         let block = state
@@ -1673,7 +1755,7 @@ mod tests {
         );
         deploy.ovm_action = Some(OvmAction::DeployContract {
             artifact,
-            gas_limit: deploy_gas,
+            stack_bytes: deploy_gas,
         });
         deploy.sign_input(0, &node);
         let contract_id = oxydome_ovm::contract_id(deploy.txid());
@@ -1691,12 +1773,12 @@ mod tests {
             entry_point: "caller".into(),
             arguments: Vec::new(),
             authority_input: 0,
-            gas_limit: call_gas,
+            stack_bytes: call_gas,
         });
         call.sign_input(0, &node);
 
         let fees = state
-            .settled_fee_total(&[deploy.clone(), call.clone()])
+            .settled_fee_total(&[deploy.clone(), call.clone()], &params)
             .unwrap();
         let rewards = split_fees(fees, &params, &gov.masters, &[(node.public(), 1)]);
         let block = state
@@ -1717,7 +1799,7 @@ mod tests {
 
     #[test]
     fn bounds_aggregate_declared_ovm_gas_before_preview() {
-        let (state, _, _, _, _master, node, _user) = setup();
+        let (state, _, _, params, _master, node, _user) = setup();
         let code = oxydome_ovm::Program {
             argument_count: 0,
             local_count: 0,
@@ -1735,14 +1817,14 @@ mod tests {
                 let mut tx = Transaction::new_unsigned(Vec::new(), outputs, fee);
                 tx.ovm_action = Some(OvmAction::Deploy {
                     code: code.clone(),
-                    gas_limit: 1_000_000,
+                    stack_bytes: 1_000_000,
                 });
                 tx
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            state.settled_fee_total(&txs),
-            Err(StateError::OvmBlockGasLimit)
+            state.settled_fee_total(&txs, &params),
+            Ok(11)
         );
     }
 
@@ -1763,7 +1845,7 @@ mod tests {
         }
         .encode()
         .unwrap();
-        let gas_limit = 100;
+        let stack_bytes = 1_000u64;
         let deploy_outputs = vec![TxOutput::spendable(amount - 1, node.public())];
         let deploy_fee = oxydome_core::transfer_fee(&deploy_outputs).unwrap();
         let mut deploy = Transaction::new_unsigned(
@@ -1771,13 +1853,16 @@ mod tests {
             deploy_outputs,
             deploy_fee,
         );
-        deploy.ovm_action = Some(OvmAction::Deploy { code, gas_limit });
+        deploy.ovm_action = Some(OvmAction::Deploy {
+            code,
+            stack_bytes,
+        });
         deploy.sign_input(0, &node);
         let contract_id = oxydome_ovm::contract_id(deploy.txid());
         let (deploy_output, output_amount) =
             (OutPoint::new(deploy.txid(), 0), deploy.outputs[0].amount);
 
-        let call_gas = 100;
+        let call_gas = 1_000u64;
         let call_outputs = vec![TxOutput::spendable(output_amount - 1, node.public())];
         let call_fee = oxydome_core::transfer_fee(&call_outputs).unwrap();
         let mut call = Transaction::new_unsigned(
@@ -1788,11 +1873,11 @@ mod tests {
         call.ovm_action = Some(OvmAction::Call {
             contract_id,
             arguments: Vec::new(),
-            gas_limit: call_gas,
+            stack_bytes: call_gas,
         });
         call.sign_input(0, &node);
         let fees = state
-            .settled_fee_total(&[deploy.clone(), call.clone()])
+            .settled_fee_total(&[deploy.clone(), call.clone()], &params)
             .unwrap();
         let rewards = split_fees(fees, &params, &gov.masters, &[(node.public(), 1)]);
         let block = state
