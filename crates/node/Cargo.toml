@@ -13,6 +13,7 @@ oxydome-ohm.workspace = true
 oxydome-ovm.workspace = true
 oxydome-consensus.workspace = true
 oxydome-audit.workspace = true
+oxydome-rewards.workspace = true
 oxydome-net.workspace = true
 oxydome-wallet.workspace = true
 sled.workspace = true

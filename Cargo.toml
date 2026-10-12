@@ -36,7 +36,7 @@ oxydome-state = { path = "crates/state" }
 oxydome-ohm = { path = "crates/ohm" }
 oxydome-gas = { path = "crates/gas" }
 oxydome-treasury = { path = "crates/treasury" }
-oxydorewards = { path = "crates/rewards" }
+oxydome-rewards = { path = "crates/rewards" }
 oxydome-audit = { path = "crates/audit" }
 oxydome-net = { path = "crates/net" }
 oxydome-consensus = { path = "crates/consensus" }
