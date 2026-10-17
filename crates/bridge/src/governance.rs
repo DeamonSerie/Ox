@@ -2,8 +2,8 @@
 // 1-token-1-vote governance for micro token holders
 // Enables mint/burn proposals and execution
 
-use serde::{Deserialize, Serialize};
 use crate::state::BridgeError;
+use serde::{Deserialize, Serialize};
 
 /// Proposal type for micro token governance
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -109,9 +109,17 @@ impl MicroTokenGovernance {
     }
 
     /// Cast a vote on a proposal
-    pub fn cast_vote(&mut self, voter: String, proposal_id: u64, support: bool) -> Result<(), BridgeError> {
+    pub fn cast_vote(
+        &mut self,
+        voter: String,
+        proposal_id: u64,
+        support: bool,
+    ) -> Result<(), BridgeError> {
         // Check if proposal exists
-        let proposal = self.proposals.get(&proposal_id).ok_or(BridgeError::NotFound)?;
+        let proposal = self
+            .proposals
+            .get(&proposal_id)
+            .ok_or(BridgeError::NotFound)?;
 
         // Check if proposal is active
         if !proposal.active {
@@ -142,7 +150,10 @@ impl MicroTokenGovernance {
         let quorum_threshold = (total_supply * proposal.quorum_percentage) / 100;
         // In production, would calculate actual votes cast vs total supply
         // For now, return true if any votes exist
-        self.proposals.get(&proposal_id).map(|p| p.yes_votes + p.no_votes > 0).unwrap_or(false)
+        self.proposals
+            .get(&proposal_id)
+            .map(|p| p.yes_votes + p.no_votes > 0)
+            .unwrap_or(false)
     }
 
     /// Check if proposal has reached supermajority
@@ -155,8 +166,15 @@ impl MicroTokenGovernance {
     }
 
     /// Execute a proposal if conditions are met
-    pub fn execute_proposal(&mut self, proposal_id: u64, total_supply: u64) -> Result<(), BridgeError> {
-        let proposal = self.proposals.get(&proposal_id).ok_or(BridgeError::NotFound)?;
+    pub fn execute_proposal(
+        &mut self,
+        proposal_id: u64,
+        total_supply: u64,
+    ) -> Result<(), BridgeError> {
+        let proposal = self
+            .proposals
+            .get(&proposal_id)
+            .ok_or(BridgeError::NotFound)?;
 
         // Check if already executed
         if proposal.executed {
@@ -176,10 +194,12 @@ impl MicroTokenGovernance {
         // Execute the proposal
         let mut proposal = self.proposals.get_mut(&proposal_id).unwrap();
         proposal.executed = true;
-        proposal.executed_at = Some(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs());
+        proposal.executed_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
 
         // Execute based on proposal type
         match proposal.proposal_type {

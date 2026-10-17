@@ -76,6 +76,69 @@ pub struct BlockHeader {
     pub tx_count: u64,
     /// Ox deposited into the Exit/Reserve sink this block.
     pub exit_amount: Amount,
+    /// Optional per-block verification key. Legacy headers omit these fields during migration.
+    #[serde(default)]
+    pub ephemeral_public_key: Option<PublicKey>,
+    #[serde(default)]
+    pub previous_verification_commitment: Option<Hash>,
+    #[serde(default)]
+    pub verification_state_commitment: Option<Hash>,
+    /// Total Speedometer minted from per-transaction stabilization this block.
+    #[serde(default)]
+    pub speedometer_minted: Amount,
+    /// Airdrop amount distributed this block (if a Speedometer airdrop occurred).
+    #[serde(default)]
+    pub speedometer_airdrop_amount: Amount,
+    /// Gas price used for OVM execution in this block (derived from pegged bounds).
+    #[serde(default)]
+    pub gas_price: Amount,
+    /// Total GAS fees collected from OVM execution in this block.
+    #[serde(default)]
+    pub total_gas_fees: Amount,
+}
+
+impl BlockHeader {
+    pub fn set_ephemeral_verification_key(
+        &mut self,
+        key: &oxydome_crypto::evk::EphemeralVerificationKey,
+    ) {
+        self.ephemeral_public_key = Some(key.public_key);
+        self.previous_verification_commitment = Some(key.previous_commitment);
+        // The state commitment is derived during validation and is intentionally not
+        // persisted; this keeps the EVK header delta at 32 + 64 = 96 bytes.
+        self.verification_state_commitment = None;
+    }
+    /// Validates the EVK extension while preserving legacy-header compatibility in migration mode.
+    pub fn validate_ephemeral_keys(&self, migration_mode: bool) -> Result<(), String> {
+        let present = self.ephemeral_public_key.is_some();
+        if !migration_mode && !present {
+            return Err("missing ephemeral verification key".into());
+        }
+        if !present {
+            return Ok(());
+        }
+        let previous = self
+            .previous_verification_commitment
+            .ok_or("missing previous verification commitment")?;
+        let expected = oxydome_crypto::hash_many(&[
+            b"EVK_STATE",
+            self.ephemeral_public_key.unwrap().as_bytes(),
+            previous.as_bytes(),
+            &self.height.to_le_bytes(),
+            &self.timestamp.to_le_bytes(),
+        ]);
+        if let Some(actual) = self.verification_state_commitment {
+            if actual != expected {
+                return Err("invalid verification state commitment".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn ephemeral_storage_bytes(&self) -> usize {
+        usize::from(self.ephemeral_public_key.is_some()) * 32
+            + usize::from(self.previous_verification_commitment.is_some()) * 64
+    }
 }
 
 /// A full block: header plus the transactions and operations it contains.
@@ -88,6 +151,14 @@ pub struct Block {
 }
 
 impl Block {
+    /// Builds a normal header and attaches the public portion of an EVK session.
+    pub fn build_header_with_ephemeral_key(
+        mut block: Block,
+        key: &oxydome_crypto::evk::EphemeralVerificationKey,
+    ) -> Block {
+        block.header.set_ephemeral_verification_key(key);
+        block
+    }
     pub fn hash(&self) -> Hash {
         hash_value(&self.header)
     }
@@ -185,10 +256,79 @@ impl Block {
                 volume,
                 tx_count,
                 exit_amount,
+                ephemeral_public_key: None,
+                previous_verification_commitment: None,
+                verification_state_commitment: None,
+                speedometer_minted: 0,
+                speedometer_airdrop_amount: 0,
+                gas_price: 0,
+                total_gas_fees: 0,
             },
             transactions,
             operations,
             ovm_receipts: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxydome_crypto::evk::{EphemeralKeyManager, EvkConfig, IEphemeralKeyManager};
+
+    #[test]
+    fn evk_headers_support_migration_and_production_validation() {
+        let manager = EphemeralKeyManager::new(EvkConfig::default());
+        let key = manager
+            .generate_ephemeral_key(1, Hash::zero(), Hash::zero(), 10)
+            .unwrap();
+        let mut header = Block::build_header(
+            1,
+            1,
+            0,
+            0,
+            Hash::zero(),
+            Hash::zero(),
+            Hash::zero(),
+            0,
+            0,
+            0,
+            ValueIndex::from_raw(0),
+            PublicKey([0; 32]),
+            10,
+            Vec::new(),
+            Vec::new(),
+        )
+        .header;
+        assert!(header.validate_ephemeral_keys(true).is_ok());
+        assert!(header.validate_ephemeral_keys(false).is_err());
+        header.set_ephemeral_verification_key(&key);
+        assert!(header.validate_ephemeral_keys(false).is_ok());
+        assert_eq!(header.ephemeral_storage_bytes(), 96);
+    }
+
+    #[test]
+    fn evk_optional_fields_round_trip_through_bincode() {
+        let header = Block::build_header(
+            1,
+            1,
+            0,
+            0,
+            Hash::zero(),
+            Hash::zero(),
+            Hash::zero(),
+            0,
+            0,
+            0,
+            ValueIndex::from_raw(0),
+            PublicKey([0; 32]),
+            10,
+            Vec::new(),
+            Vec::new(),
+        )
+        .header;
+        let encoded = bincode::serialize(&header).unwrap();
+        let decoded: BlockHeader = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(header, decoded);
     }
 }

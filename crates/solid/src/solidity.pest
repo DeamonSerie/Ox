@@ -21,6 +21,12 @@ dao_peg_some = {
     "some" ~ "(" ~ string_literal ~ "," ~ "numerator" ~ ":" ~ number_literal ~
     "," ~ "denominator" ~ ":" ~ number_literal ~ ")"
 }
+liquidity_pool_definition = {
+    "liquidity_pool" ~ "{" ~ liquidity_pool_currencies ~ "}"
+}
+liquidity_pool_currencies = {
+    "currencies" ~ ":" ~ "[" ~ (string_literal ~ ("," ~ string_literal)*)? ~ "]" ~ ";"
+}
 contract_kind = { "contract" | "interface" | "library" }
 inheritance = { "is" ~ inheritance_item ~ ("," ~ inheritance_item)* }
 inheritance_item = { identifier ~ ("(" ~ argument_list? ~ ")")? }
@@ -28,6 +34,7 @@ contract_item = {
     function_definition | constructor_definition | fallback_definition |
     receive_definition | modifier_definition | event_definition |
     error_definition | struct_definition | enum_definition | dao_definition |
+    liquidity_pool_definition |
     state_variable | ";"
 }
 

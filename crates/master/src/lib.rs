@@ -6,10 +6,11 @@
 //! governance set, and audit each proposed block through Merkle proofs supplied by the
 //! proposer.
 
+pub mod async_audit;
 pub mod mvms;
 pub mod mvms_config;
-pub mod storage_audit;
 pub mod server;
+pub mod storage_audit;
 
 pub use mvms::{compute_chain_id, MvmsMaster};
 pub use mvms_config::{MvmsBuilder, MvmsConfig, MvmsError, MvmsResult};
@@ -132,6 +133,8 @@ impl HeaderChain {
             volume: block.header.volume,
             tx_count: block.header.tx_count,
             exit_amount: block.header.exit_amount,
+            highest_tx_value: 0,
+            express_flow: 0,
         });
         let w = params.block_window.max(1) as usize;
         while self.stats.len() > w {
@@ -165,9 +168,19 @@ impl HeaderChain {
                 oxydome_core::Operation::Rewards(_)
                 | oxydome_core::Operation::Dao(_)
                 | oxydome_core::Operation::Ohm(_)
-                |                 oxydome_core::Operation::PriceChange(_) => {}
+                | oxydome_core::Operation::PriceChange(_) => {}
                 oxydome_core::Operation::StorageLabel(_) => {}
                 oxydome_core::Operation::StorageAudit(_) => {}
+                oxydome_core::Operation::Timer(_) => {}
+                oxydome_core::Operation::FileStore(_) => {}
+                oxydome_core::Operation::FileAccess(_) => {}
+                oxydome_core::Operation::FileDelete(_) => {}
+                oxydome_core::Operation::LiquidityPool(_) => {}
+                oxydome_core::Operation::Speedometer(_) => {}
+                oxydome_core::Operation::NodeLeave(_) => {}
+                oxydome_core::Operation::DepartureEarnings(_) => {}
+                oxydome_core::Operation::ExpressBusDeposit(_) => {}
+                oxydome_core::Operation::ExpressBusWithdraw(_) => {}
             }
         }
         self.supply = block.header.supply;
@@ -179,7 +192,7 @@ impl HeaderChain {
 }
 
 /// A running master node.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MasterNode {
     pub key: KeyPair,
     pub gov: GovernanceSet,
@@ -398,12 +411,10 @@ mod tests {
     fn master_tracks_previous_server_reward_from_block_rewards() {
         let (mut master, state, gov, params, _master_key, node_key) = reward_config();
 
-        let reward = oxydome_core::Operation::BlockRewards(
-            oxydome_core::BlockRewardDistribution {
-                server_outputs: vec![TxOutput::locked_reward(42, node_key.public())],
-                master_outputs: Vec::new(),
-            },
-        );
+        let reward = oxydome_core::Operation::BlockRewards(oxydome_core::BlockRewardDistribution {
+            server_outputs: vec![TxOutput::locked_reward(42, node_key.public())],
+            master_outputs: Vec::new(),
+        });
         let block = state
             .build_block(
                 &gov,
@@ -420,12 +431,11 @@ mod tests {
         // The baseline rolls forward to the next reward-bearing block so `header_audit` can
         // derive the same master-reward total as the proposer.
         let state1 = state.apply_block(&block, &gov, &params).unwrap();
-        let reward2 = oxydome_core::Operation::BlockRewards(
-            oxydome_core::BlockRewardDistribution {
+        let reward2 =
+            oxydome_core::Operation::BlockRewards(oxydome_core::BlockRewardDistribution {
                 server_outputs: vec![TxOutput::locked_reward(88, node_key.public())],
                 master_outputs: Vec::new(),
-            },
-        );
+            });
         let block2 = state1
             .build_block(
                 &gov,

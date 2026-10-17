@@ -55,9 +55,7 @@ impl OhmContext {
     /// not a valid anchor context, so `ohm_height` must be positive and the committed root and
     /// previous hash must be non-zero.
     pub fn is_valid(&self) -> bool {
-        self.ohm_height > 0
-            && !self.ohm_prev_hash.is_zero()
-            && !self.ohm_state_root.is_zero()
+        self.ohm_height > 0 && !self.ohm_prev_hash.is_zero() && !self.ohm_state_root.is_zero()
     }
 }
 
@@ -492,16 +490,24 @@ impl OhmTransaction {
             }
         }
         if self.ovm_action.is_some() && self.cross_send.is_some() {
-            return Err("OHM transaction cannot combine an OVM action with a cross-chain send".into());
+            return Err(
+                "OHM transaction cannot combine an OVM action with a cross-chain send".into(),
+            );
         }
         if self.ovm_action.is_some() && self.cross_recv.is_some() {
-            return Err("OHM transaction cannot combine an OVM action with a cross-chain recv".into());
+            return Err(
+                "OHM transaction cannot combine an OVM action with a cross-chain recv".into(),
+            );
         }
         if self.ovm_action.is_some() && self.cross_transfer.is_some() {
-            return Err("OHM transaction cannot combine an OVM action with a cross-chain transfer".into());
+            return Err(
+                "OHM transaction cannot combine an OVM action with a cross-chain transfer".into(),
+            );
         }
         if self.ovm_action.is_some() && self.cross_burn.is_some() {
-            return Err("OHM transaction cannot combine an OVM action with a cross-chain burn".into());
+            return Err(
+                "OHM transaction cannot combine an OVM action with a cross-chain burn".into(),
+            );
         }
         if self.cross_send.is_some() && self.cross_recv.is_some() {
             return Err(
@@ -544,7 +550,8 @@ impl OhmTransaction {
                 return Err("OHM OVM action has a zero gas limit".into());
             }
             match action {
-                OvmAction::Deploy { code, .. } | OvmAction::DeployContract { artifact: code, .. } => {
+                OvmAction::Deploy { code, .. }
+                | OvmAction::DeployContract { artifact: code, .. } => {
                     if code.len() > oxydome_ovm::MAX_CONTRACT_ARTIFACT_BYTES {
                         return Err("OHM OVM deploy exceeds the code size limit".into());
                     }
@@ -585,12 +592,14 @@ impl OhmTransaction {
             }
             if call.want_reply {
                 let Some(reply_contract) = call.reply_contract else {
-                    return Err("OHM cross-chain send requests a reply without a reply contract"
-                        .into());
+                    return Err(
+                        "OHM cross-chain send requests a reply without a reply contract".into(),
+                    );
                 };
                 let Some(reply_entry) = &call.reply_entry_point else {
-                    return Err("OHM cross-chain send requests a reply without a reply entry"
-                        .into());
+                    return Err(
+                        "OHM cross-chain send requests a reply without a reply entry".into(),
+                    );
                 };
                 if reply_contract.is_zero()
                     || !oxydome_ovm::valid_function_name(reply_entry)
@@ -738,7 +747,11 @@ impl OhmBlock {
 
     /// Verifies the maintainer signature over the header.
     pub fn is_maintainer_signed(&self) -> bool {
-        verify(&self.header.maintainer, &self.header.hash().0, &self.signature)
+        verify(
+            &self.header.maintainer,
+            &self.header.hash().0,
+            &self.signature,
+        )
     }
 
     /// The continuity context for this block.
@@ -923,11 +936,7 @@ pub fn ohm_state_root(
     utxos: &BTreeMap<Hash, OhmUtxoEntry>,
     contracts: &BTreeMap<Hash, OhmContract>,
 ) -> Hash {
-    hash_value(&(
-        "oxydome-ohm-state-root-v1",
-        ohm_utxo_root(utxos),
-        contracts,
-    ))
+    hash_value(&("oxydome-ohm-state-root-v1", ohm_utxo_root(utxos), contracts))
 }
 
 /// Deterministic commitment to an OHM's private outbox (cross-OHM messages it has enqueued).
@@ -1311,7 +1320,7 @@ mod tests {
                 target_contract: Hash::from([3u8; 64]),
                 entry_selector: 42,
                 arguments: vec![],
-            gas_limit: 1024,
+                gas_limit: 1024,
                 want_reply: false,
                 reply_contract: None,
                 reply_entry_selector: None,

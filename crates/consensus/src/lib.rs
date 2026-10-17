@@ -7,6 +7,6 @@ pub mod governance;
 pub mod votes;
 
 pub use admission::AdmissionCertificate;
-pub use engine::{ConsensusEngine, ConsensusError, Step};
+pub use engine::{ConsensusEngine, ConsensusError, CrossChainVerificationOutcome, Step};
 pub use governance::{majority, EpochTransition, MasterProposal};
 pub use votes::{masters_root, MasterCheck, QuorumCertificate, Vote, VoteKind};

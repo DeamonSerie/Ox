@@ -5,11 +5,13 @@
 //! deterministic replay of the block, the lineage invariant `sum(live UTXO) == supply`, and
 //! periodic literal deep replay.
 
+pub mod async_audit;
+
 use oxydome_core::{
-    conversion_split_with_bps, Amount, Block, BlockRewardDistribution, ChainParams,
-    GovernanceSet, Operation, OutPoint, PublicKey, Sig, ValueIndex,
+    conversion_split_with_bps, Amount, Block, BlockRewardDistribution, ChainParams, GovernanceSet,
+    Operation, OutPoint, PublicKey, Sig, ValueIndex,
 };
-use oxydome_crypto::{hash_value, Hash, SparseProof};
+use oxydome_crypto::{hash_value, verify, Hash, SparseProof};
 use oxydome_currency::{
     compute_value, rebound_utxo_spendable, supply_change_cap, withdraw_cap, WindowStats,
 };
@@ -331,6 +333,21 @@ pub fn header_audit(
         return Err(AuditError::StatsMismatch);
     }
 
+    // 2b. Verify gas price and total gas fees from OVM receipts.
+    if block.header.height >= ctx.params.gas_activation_height {
+        let expected_gas_fees: Amount = block
+            .ovm_receipts
+            .iter()
+            .map(|r| u128::from(r.gas_used).saturating_mul(block.header.gas_price))
+            .fold(0u128, |a, b| a.saturating_add(b));
+        if block.header.total_gas_fees != expected_gas_fees {
+            return Err(AuditError::Guardrail(format!(
+                "block total gas fees {} does not match computed {}",
+                block.header.total_gas_fees, expected_gas_fees
+            )));
+        }
+    }
+
     // 3. Recompute supply from the explicit operation amounts and enforce guardrails.
     let mut supply = ctx.prev_supply;
     let mut epoch_minted = ctx.epoch_minted;
@@ -448,6 +465,13 @@ pub fn header_audit(
                 }
             }
             Operation::Gas(gas_operation) => {}
+            Operation::Speedometer(speedometer_operation) => {
+                if !speedometer_operation.is_valid() {
+                    return Err(AuditError::Guardrail(
+                        "Speedometer operation signature or encoding is invalid".into(),
+                    ));
+                }
+            }
             Operation::PriceChange(_) => {}
             Operation::StorageLabel(label_op) => {
                 if !label_op.label.is_valid() {
@@ -466,6 +490,66 @@ pub fn header_audit(
                     ));
                 }
             }
+            Operation::Timer(timer_operation) => {
+                if !timer_operation.is_valid() {
+                    return Err(AuditError::Guardrail(
+                        "timer operation signature or encoding is invalid".into(),
+                    ));
+                }
+            }
+            Operation::FileStore(file_op) => {
+                if !file_op.file_label.is_valid() {
+                    return Err(AuditError::Guardrail(
+                        "file label signature or encoding is invalid".into(),
+                    ));
+                }
+            }
+            Operation::FileAccess(access_op) => {
+                if !verify(
+                    &access_op.accessor,
+                    &op.proposal_id().0,
+                    &access_op.signature,
+                ) {
+                    return Err(AuditError::Guardrail(
+                        "file access signature is invalid".into(),
+                    ));
+                }
+            }
+            Operation::FileDelete(delete_op) => {
+                if !verify(
+                    &delete_op.deleter,
+                    &op.proposal_id().0,
+                    &delete_op.signature,
+                ) {
+                    return Err(AuditError::Guardrail(
+                        "file delete signature is invalid".into(),
+                    ));
+                }
+            }
+            Operation::LiquidityPool(lp_op) => {
+                if !verify(&lp_op.actor, &op.proposal_id().0, &lp_op.signature) {
+                    return Err(AuditError::Guardrail(
+                        "liquidity pool signature is invalid".into(),
+                    ));
+                }
+            }
+            Operation::NodeLeave(leave_op) => {
+                if !verify(&leave_op.node, &op.proposal_id().0, &leave_op.node_signature) {
+                    return Err(AuditError::Guardrail(
+                        "node leave signature is invalid".into(),
+                    ));
+                }
+            }
+            Operation::DepartureEarnings(_) => {
+                // Earnings redistribution is supply-neutral (re-locked rewards), so no
+                // supply-side guardrails apply here; the state machine enforces balance.
+            }
+            Operation::ExpressBusDeposit(_) => {
+                // Master-approved; state machine enforces thresholds and signatures.
+            }
+            Operation::ExpressBusWithdraw(_) => {
+                // Node-approved; state machine enforces thresholds and owner identity.
+            }
         }
     }
 
@@ -473,7 +557,8 @@ pub fn header_audit(
     // is burned and an equal amount of GAS is minted (see `apply_rewards` in the state machine).
     // This shrinks the Ox supply exactly like `next.supply` did before the header was committed,
     // so the header-only audit mirrors it here.
-    if block.header.height >= ctx.params.gas_activation_height && ctx.params.gas_server_fee_bps > 0 {
+    if block.header.height >= ctx.params.gas_activation_height && ctx.params.gas_server_fee_bps > 0
+    {
         let gas_minted: Amount = block
             .operations
             .iter()
@@ -482,7 +567,8 @@ pub fn header_audit(
                     r.node_outputs
                         .iter()
                         .map(|output| {
-                            conversion_split_with_bps(output.amount, ctx.params.gas_server_fee_bps).1
+                            conversion_split_with_bps(output.amount, ctx.params.gas_server_fee_bps)
+                                .1
                         })
                         .fold(0u128, |a, b| a.saturating_add(b)),
                 ),

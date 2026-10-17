@@ -6,13 +6,17 @@
 pub mod block;
 pub mod config;
 pub mod dao;
+pub mod express_bus;
 pub mod gas;
 pub mod genesis;
 pub mod governance;
 pub mod ohm;
 pub mod operation;
 pub mod params;
+pub mod pricing;
+pub mod speedometer;
 pub mod storage;
+pub mod timer;
 pub mod tx;
 
 pub use block::{
@@ -31,10 +35,6 @@ pub use gas::{
 };
 pub use genesis::{GenesisAllocation, GenesisConfig};
 pub use governance::GovernanceSet;
-pub use operation::{
-    BlockRewardDistribution, MasterApproval, NodeApproval, Operation, RewardDistribution,
-    TreasuryBurn, TreasuryMint, WithdrawRequest,
-};
 pub use ohm::{
     build_ohm_server_outputs, compute_ohm_fee_split, hash_words, ohm_cross_msg_id,
     ohm_genesis_hash, ohm_inbox_root, ohm_outbox_root, ohm_state_root, ohm_state_root_full,
@@ -45,13 +45,42 @@ pub use ohm::{
     MAX_OHM_REASON_BYTES, MAX_OHM_TX_ITEMS, OHM_POLICY_MAGIC, OHM_POLICY_VERSION,
     OHM_SERVER_FEE_BPS,
 };
+pub use operation::{
+    BlockRewardDistribution, DepartureEarningsDistribution, DepartureType, MasterApproval,
+    NodeApproval, NodeKind, NodeLeaveRequest, Operation, RewardDistribution, TokenAmount,
+    TreasuryBurn, TreasuryMint, WithdrawRequest,
+};
+pub use operation::{FileAccessOperation, FileDeleteOperation, FileStoreOperation, LiquidityPoolAction, LiquidityPoolOperation};
 pub use operation::{StorageAuditOperation, StorageLabelOperation};
+pub use oxydome_crypto::evk::{FileEvkLabel, FileKeyChain};
 pub use oxydome_crypto::{Hash, PublicKey, Sig};
 pub use params::ChainParams;
-pub use storage::{label_commitment, StorageAuditResult, StorageLabel};
+pub use pricing::{
+    compute_gas_price, compute_gas_price_premium, compute_price_bounds,
+    default_liquidity_pool_activation_height, default_liquidity_pool_fee_bps,
+    default_max_liquidity_pools, default_pegged_currency_activation_height,
+    default_pegged_spread_bps, default_pegged_window_blocks, is_in_upper_half, pack_pool_state,
+    pegged_convert, pool_swap, scale_to_u64, LiquidityPoolConfig, LiquidityPoolState,
+    PeggedCurrencyConfig, PeggedCurrencyState, PoolKParams, PoolStatePacked, PriceAsset,
+    PriceBounds, PriceSample, LIQUIDITY_POOL_SCALE,
+};
+pub use speedometer::{SpeedometerAccount, SpeedometerAction, SpeedometerOperation};
+pub use storage::{
+    evfs_label_commitment_v2, label_commitment, FileAccessRecord, FileEvkLabelError,
+    StorageAuditResult, StorageLabel,
+};
+pub use timer::{
+    accumulated_track, actual_direction, reward_for_bet, timer_burn_outpoint, Timer, TimerAction,
+    TimerAsset, TimerBet, TimerConfig, TimerDirection, TimerOperation, TimerSample, MAX_TIMERS,
+    MAX_TIMER_BETS, MAX_TIMER_BET_DIGITS, MAX_TIMER_DURATION_BLOCKS, MAX_TIMER_REASON_BYTES,
+};
+pub use express_bus::{
+    bus_flow_delta, is_ox_asset, BusSample, ExpressBusDeposit, ExpressBusTracker,
+    ExpressBusWithdraw, FP as EXPRESS_FP, MAX_EXPRESS_BUSES,
+};
 pub use tx::{
     transfer_fee, transfer_fee_for_amount, OutPoint, OutputKind, OvmAction, OvmFailureCode, OvmLog,
-    OvmReceipt, Transaction,     TxError, TxInput, TxOutput, MAX_OVM_ARGUMENTS,
+    OvmReceipt, Transaction, TxError, TxInput, TxOutput, MAX_OVM_ARGUMENTS,
     MAX_OVM_BLOCK_GAS_LIMIT, MAX_OVM_GAS_LIMIT,
 };
 

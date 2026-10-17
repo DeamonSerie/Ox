@@ -6,6 +6,28 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
+hex = "0.4"
+lru = "0.12"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+x25519-dalek = "2"
+sha3 = "0.10"
+async-trait = "0.1"
+rand = "0.8"
+bincode = "1"
+futures-util = { workspace = true }
+tokio = { workspace = true }
 
-[lib]
-name = "oxydome_bridge"
+[dependencies.oxydome-core]
+path = "../core"
+
+[dependencies.oxydome-crypto]
+path = "../crypto"
+
+[dev-dependencies]
+proptest.workspace = true
+
+[[bench]]
+name = "cross_chain"
+harness = false

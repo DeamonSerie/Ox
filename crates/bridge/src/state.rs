@@ -113,11 +113,13 @@ impl BridgeStateStore {
     }
 
     /// Complete a bridge transaction
-    /// 
+    ///
     /// **Change**: Now also marks original tokens as transferred
     pub fn complete_bridge(&mut self, bridge_id: u64) -> BridgeResult<()> {
         let bridge = self.bridges.get(&bridge_id).ok_or(BridgeError::NotFound)?;
-        if bridge.completed { return Err(BridgeError::AlreadyCompleted); };
+        if bridge.completed {
+            return Err(BridgeError::AlreadyCompleted);
+        };
 
         // Update bridge state
         let mut bridge = bridge.clone();
@@ -131,7 +133,9 @@ impl BridgeStateStore {
     /// Validate a bridge transaction
     pub fn validate_bridge(&mut self, bridge_id: u64) -> BridgeResult<()> {
         let bridge = self.bridges.get(&bridge_id).ok_or(BridgeError::NotFound)?;
-        if bridge.completed { return Err(BridgeError::AlreadyCompleted); };
+        if bridge.completed {
+            return Err(BridgeError::AlreadyCompleted);
+        };
         // In production, would add validation logic here
         Ok(())
     }

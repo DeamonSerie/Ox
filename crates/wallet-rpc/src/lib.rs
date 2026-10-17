@@ -154,12 +154,12 @@ pub mod methods {
     pub const GET_OHM_BALANCE: &str = "ox_getOhmBalance";
     pub const SUBMIT_OHM_OPERATION: &str = "ox_submitOhmOperation";
     pub const SUBMIT_OHM_BLOCK: &str = "ox_submitOhmBlock";
-pub const GET_OHM_CONTRACT: &str = "ox_getOhmContract";
-pub const CALL_OHM_CONTRACT: &str = "ox_callOhmContract";
-pub const GET_GAS_BALANCE: &str = "ox_getGasBalance";
-pub const GET_GAS_SUPPLY: &str = "ox_getGasSupply";
-pub const GET_GAS_PRICE: &str = "ox_getGasPrice";
-pub const GET_GAS_AIRDROP_INFO: &str = "ox_airdropInfo";
+    pub const GET_OHM_CONTRACT: &str = "ox_getOhmContract";
+    pub const CALL_OHM_CONTRACT: &str = "ox_callOhmContract";
+    pub const GET_GAS_BALANCE: &str = "ox_getGasBalance";
+    pub const GET_GAS_SUPPLY: &str = "ox_getGasSupply";
+    pub const GET_GAS_PRICE: &str = "ox_getGasPrice";
+    pub const GET_GAS_AIRDROP_INFO: &str = "ox_airdropInfo";
 
     // Vault methods
     pub const VAULT_CREATE: &str = "ox_vaultCreate";
@@ -484,6 +484,7 @@ pub fn tx_to_rpc(
                     oxydome_core::OutputKind::ExitReserve { .. } => "exit_reserve".into(),
                     oxydome_core::OutputKind::DaoTreasury { .. } => "dao_treasury".into(),
                     oxydome_core::OutputKind::OhmTreasury { .. } => "ohm_treasury".into(),
+                    oxydome_core::OutputKind::BusReceipt { .. } => "bus_receipt".into(),
                 },
                 created_height: 0,
                 mature: true,
@@ -565,6 +566,7 @@ pub fn utxo_to_rpc(info: &oxydome_net::UtxoInfo) -> RpcUtxo {
             oxydome_core::OutputKind::ExitReserve { .. } => "exit_reserve".into(),
             oxydome_core::OutputKind::DaoTreasury { .. } => "dao_treasury".into(),
             oxydome_core::OutputKind::OhmTreasury { .. } => "ohm_treasury".into(),
+            oxydome_core::OutputKind::BusReceipt { .. } => "bus_receipt".into(),
         },
         created_height: info.created_height,
         mature: info.mature,
@@ -792,12 +794,7 @@ mod tests {
 
         let ohm_id = Hash([1u8; 64]);
         let contract_id = Hash([2u8; 64]);
-        let contract = ohm_contract_to_rpc(
-            &ohm_id,
-            &contract_id,
-            &[0xde, 0xad],
-            &[(0, 5), (7, 9)],
-        );
+        let contract = ohm_contract_to_rpc(&ohm_id, &contract_id, &[0xde, 0xad], &[(0, 5), (7, 9)]);
         let value = serde_json::to_value(&contract).unwrap();
         assert_eq!(value["code"], "0xdead");
         assert_eq!(value["storage"][0][0], "0");

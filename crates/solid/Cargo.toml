@@ -11,6 +11,8 @@ oxydome-ovm.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 hex.workspace = true
+bincode = "1.3"
 thiserror = "1"
 pest = "2.1"
 pest_derive = "2.1"
+ucd-trie = "0.1"

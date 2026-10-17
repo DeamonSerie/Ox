@@ -8,14 +8,46 @@ use std::collections::BTreeMap;
 pub(crate) enum ValueType {
     U64,
     Bool,
+    Address,
 }
 
 impl ValueType {
-    fn from_solid(ty: &Type) -> Result<Self, CompileError> {
+    pub(crate) fn from_solid(ty: &Type) -> Result<Self, CompileError> {
         match ty {
             Type::U64 => Ok(Self::U64),
             Type::Bool => Ok(Self::Bool),
+            Type::Address => Ok(Self::Address),
             _ => Err(unsupported(format!("type {ty:?}"))),
+        }
+    }
+}
+
+/// How a state variable is represented in storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StateKind {
+    Scalar(ValueType),
+    Struct(String),
+    Mapping { key: ValueType, value: ValueType },
+}
+
+/// Extracted mapping key/value types (returned by helpers to avoid using a variant as a type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MappingInfo {
+    pub key: ValueType,
+    pub value: ValueType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StateVar {
+    pub kind: StateKind,
+    pub mutable: bool,
+}
+
+impl StateVar {
+    pub fn mapping_info(&self) -> Option<MappingInfo> {
+        match self.kind {
+            StateKind::Mapping { key, value } => Some(MappingInfo { key, value }),
+            _ => None,
         }
     }
 }
@@ -80,9 +112,11 @@ pub(crate) fn validate_function_with_context(
         return Err(unsupported("multiple return values"));
     }
 
+    let struct_layouts = build_struct_layouts(contract)?;
+
     let mut state = BTreeMap::new();
     for variable in &contract.variables {
-        let ty = ValueType::from_solid(&variable.ty)?;
+        let kind = state_var_kind(&variable.ty, &struct_layouts)?;
         if variable.constant || variable.immutable {
             return Err(unsupported(format!(
                 "constant or immutable state variable `{}`",
@@ -90,7 +124,13 @@ pub(crate) fn validate_function_with_context(
             )));
         }
         if state
-            .insert(variable.name.clone(), (ty, variable.mutable))
+            .insert(
+                variable.name.clone(),
+                StateVar {
+                    kind,
+                    mutable: variable.mutable,
+                },
+            )
             .is_some()
         {
             return Err(unsupported(format!(
@@ -107,6 +147,7 @@ pub(crate) fn validate_function_with_context(
         .transpose()?;
     let mut checker = Checker {
         state,
+        struct_layouts,
         scopes: vec![BTreeMap::new()],
         output,
         loop_depth: 0,
@@ -127,6 +168,70 @@ pub(crate) fn validate_function_with_context(
     Ok(())
 }
 
+/// Build a lookup from struct name to its field list (name, type).
+/// Only `u64`/`bool`/`address` field types are supported.
+fn build_struct_layouts(
+    contract: &Contract,
+) -> Result<BTreeMap<String, Vec<(String, ValueType)>>, CompileError> {
+    let mut layouts = BTreeMap::new();
+    for struct_def in &contract.structs {
+        let mut fields = Vec::new();
+        let mut seen = BTreeMap::new();
+        for field in &struct_def.fields {
+            let ty = ValueType::from_solid(&field.ty).map_err(|_| {
+                unsupported(format!(
+                    "struct `{}` field `{}` has unsupported type {:?}",
+                    struct_def.name, field.name, field.ty
+                ))
+            })?;
+            if seen.insert(field.name.clone(), ()).is_some() {
+                return Err(unsupported(format!(
+                    "duplicate field `{}` in struct `{}`",
+                    field.name, struct_def.name
+                )));
+            }
+            fields.push((field.name.clone(), ty));
+        }
+        layouts.insert(struct_def.name.clone(), fields);
+    }
+    Ok(layouts)
+}
+
+/// Resolve a `Type` into a `StateKind` for a state variable.
+fn state_var_kind(
+    ty: &Type,
+    struct_layouts: &BTreeMap<String, Vec<(String, ValueType)>>,
+) -> Result<StateKind, CompileError> {
+    match ty {
+        Type::Named(name) => {
+            if struct_layouts.contains_key(name) {
+                Ok(StateKind::Struct(name.clone()))
+            } else {
+                Err(unsupported(format!("unknown named type `{name}`")))
+            }
+        }
+        Type::Mapping { key, value } => {
+            let key_ty = ValueType::from_solid(key)
+                .map_err(|_| unsupported(format!("mapping key type {:?} is not supported", key)))?;
+            // The value type of a mapping can itself be a struct or scalar.
+            let value_kind = state_var_kind(value, struct_layouts)?;
+            match value_kind {
+                StateKind::Scalar(ty) => Ok(StateKind::Mapping {
+                    key: key_ty,
+                    value: ty,
+                }),
+                StateKind::Struct(name) => Err(unsupported(format!(
+                    "mapping value type struct `{name}` is not yet supported"
+                ))),
+                StateKind::Mapping { .. } => Err(unsupported(
+                    "nested mappings as mapping values are not yet supported",
+                )),
+            }
+        }
+        _ => ValueType::from_solid(ty).map(StateKind::Scalar),
+    }
+}
+
 fn always_returns(block: &Block) -> bool {
     block.statements.iter().any(|statement| match statement {
         Statement::Return(_) | Statement::Revert { .. } => true,
@@ -141,7 +246,8 @@ fn always_returns(block: &Block) -> bool {
 }
 
 struct Checker {
-    state: BTreeMap<String, (ValueType, bool)>,
+    state: BTreeMap<String, StateVar>,
+    struct_layouts: BTreeMap<String, Vec<(String, ValueType)>>,
     scopes: Vec<BTreeMap<String, ValueType>>,
     output: Option<ValueType>,
     loop_depth: usize,
@@ -162,7 +268,18 @@ impl Checker {
             .iter()
             .rev()
             .find_map(|scope| scope.get(name).copied())
-            .or_else(|| self.state.get(name).map(|(ty, _)| *ty))
+            .or_else(|| match self.state.get(name) {
+                Some(StateVar {
+                    kind: StateKind::Scalar(ty),
+                    ..
+                }) => Some(*ty),
+                _ => None,
+            })
+    }
+
+    /// Look up a state variable (not a local/arg) and return its `StateKind`.
+    fn lookup_state(&self, name: &str) -> Option<StateKind> {
+        self.state.get(name).map(|var| var.kind.clone())
     }
 
     fn block(&mut self, block: &Block, nested: bool) -> Result<(), CompileError> {
@@ -287,6 +404,7 @@ impl Checker {
         match expr {
             Expr::LitInt(_) | Expr::LitNumber(_) => Ok(ValueType::U64),
             Expr::LitBool(_) => Ok(ValueType::Bool),
+            Expr::Address(_) => Ok(ValueType::Address),
             Expr::Ident(name) => self
                 .lookup(name)
                 .ok_or_else(|| unsupported(format!("unknown identifier `{name}`"))),
@@ -295,10 +413,29 @@ impl Checker {
             | Expr::Mul(lhs, rhs)
             | Expr::Div(lhs, rhs)
             | Expr::Mod(lhs, rhs)
-            | Expr::BitAnd(lhs, rhs)
-            | Expr::BitOr(lhs, rhs) => {
+            | Expr::BitAnd(lhs, rhs) => {
                 Self::expect(self.expr(lhs)?, ValueType::U64, "left arithmetic operand")?;
                 Self::expect(self.expr(rhs)?, ValueType::U64, "right arithmetic operand")?;
+                Ok(ValueType::U64)
+            }
+            Expr::BitOr(lhs, rhs) => {
+                Self::expect(self.expr(lhs)?, ValueType::U64, "left arithmetic operand")?;
+                Self::expect(self.expr(rhs)?, ValueType::U64, "right arithmetic operand")?;
+                Ok(ValueType::U64)
+            }
+            Expr::BitXor(lhs, rhs) => {
+                Self::expect(self.expr(lhs)?, ValueType::U64, "left arithmetic operand")?;
+                Self::expect(self.expr(rhs)?, ValueType::U64, "right arithmetic operand")?;
+                Ok(ValueType::U64)
+            }
+            Expr::Shl(lhs, rhs) => {
+                Self::expect(self.expr(lhs)?, ValueType::U64, "left shift operand")?;
+                Self::expect(self.expr(rhs)?, ValueType::U64, "right shift operand")?;
+                Ok(ValueType::U64)
+            }
+            Expr::Shr(lhs, rhs) => {
+                Self::expect(self.expr(lhs)?, ValueType::U64, "left shift operand")?;
+                Self::expect(self.expr(rhs)?, ValueType::U64, "right shift operand")?;
                 Ok(ValueType::U64)
             }
             Expr::Eq(lhs, rhs) | Expr::Neq(lhs, rhs) => {
@@ -374,54 +511,211 @@ impl Checker {
                     )),
                 }
             }
+            Expr::Call { func, args } if func == "poolSwap" => {
+                if args.len() != 2 {
+                    return Err(unsupported("`poolSwap` requires exactly two arguments"));
+                }
+                let pool_id_ty = self.expr(&args[0])?;
+                let amount_ty = self.expr(&args[1])?;
+                if pool_id_ty != ValueType::U64 || amount_ty != ValueType::U64 {
+                    return Err(unsupported("`poolSwap` arguments must both be u64"));
+                }
+                Ok(ValueType::U64)
+            }
             Expr::Call { func, .. } if func == "require" || func == "assert" => {
                 Err(unsupported(format!("statement-only `{func}`")))
             }
             Expr::Call { func, .. } => Err(unsupported(format!("function call `{func}`"))),
-            Expr::Access { target, field } => Err(unsupported(format!(
-                "member access `{target}.{field}` has no native OVM meaning"
-            ))),
-            Expr::Index { .. } => Err(unsupported("array and mapping indexing")),
-            Expr::UMinus(_) => Err(unsupported("signed arithmetic")),
+            Expr::Access { target, field } => {
+                let struct_name = match self.lookup_state(target) {
+                    Some(StateKind::Struct(name)) => name,
+                    Some(_) => {
+                        return Err(unsupported(format!(
+                            "`{target}` is not a struct; member access requires a struct"
+                        )));
+                    }
+                    None => {
+                        // Could be a local variable that is a struct — but
+                        // structs can only be state variables in OVM.
+                        return Err(unsupported(format!("unknown identifier `{target}`")));
+                    }
+                };
+                self.resolve_struct_field(&struct_name, field)
+            }
+            Expr::Index { target, index } => {
+                let mapping = self.lvalue_index_expr(target)?;
+                let key_ty = self.expr(index)?;
+                Self::expect(key_ty, mapping.key, "mapping key")?;
+                Ok(mapping.value)
+            }
             Expr::LitDecimal(_) => Err(unsupported("decimal literals")),
             Expr::LitString(_) => Err(unsupported("string values")),
-            Expr::Address(_) => Err(unsupported("address values")),
+            Expr::UMinus(_) => Err(unsupported("signed arithmetic")),
             Expr::Pow(_, _) => Err(unsupported("exponentiation")),
-            Expr::BitXor(_, _) => Err(unsupported("bitwise XOR")),
-            Expr::Shl(_, _) | Expr::Shr(_, _) => Err(unsupported("bit shifts")),
         }
     }
 
     fn lvalue(&mut self, target: &LValue, write: bool) -> Result<ValueType, CompileError> {
         match target {
             LValue::Ident(name) => {
-                if let Some(ty) = self
+                let ty = self
                     .scopes
                     .iter()
                     .rev()
-                    .find_map(|scope| scope.get(name).copied())
-                {
+                    .find_map(|scope| scope.get(name).copied());
+                if let Some(ty) = ty {
                     return Ok(ty);
                 }
                 match self.state.get(name) {
-                    Some((ty, mutable)) if !write || *mutable => Ok(*ty),
+                    Some(StateVar {
+                        kind: StateKind::Scalar(ty),
+                        mutable,
+                    }) if !write || *mutable => Ok(*ty),
                     Some(_) => Err(unsupported(format!(
                         "assignment to immutable state `{name}`"
                     ))),
                     None => Err(unsupported(format!("unknown assignment target `{name}`"))),
                 }
             }
-            LValue::Index { .. } => Err(unsupported("array and mapping indexing")),
-            LValue::Member { .. } => Err(unsupported("member assignment")),
+            LValue::Index { base, index } => {
+                let mapping = self.lvalue_mapping_base(base, write)?;
+                let key_ty = self.expr(index)?;
+                Self::expect(key_ty, mapping.key, "mapping key")?;
+                Ok(mapping.value)
+            }
+            LValue::Member { base, field } => {
+                let struct_name = self.lvalue_struct_base(base, write)?;
+                let field_ty = self.resolve_struct_field(&struct_name, field)?;
+                Ok(field_ty)
+            }
+        }
+    }
+
+    /// Resolve an `LValue` base for mapping indexing: must evaluate to a
+    /// `Mapping` state variable.
+    fn lvalue_mapping_base(
+        &mut self,
+        base: &LValue,
+        write: bool,
+    ) -> Result<MappingInfo, CompileError> {
+        match base {
+            LValue::Ident(name) => match self.lookup_state(name) {
+                Some(StateKind::Mapping { key, value }) => {
+                    if write {
+                        if let Some(var) = self.state.get(name) {
+                            if !var.mutable {
+                                return Err(unsupported(format!(
+                                    "assignment to immutable state `{name}`"
+                                )));
+                            }
+                        }
+                    }
+                    Ok(MappingInfo { key, value })
+                }
+                Some(_) => Err(unsupported(format!(
+                    "`{name}` is not a mapping; indexing requires a mapping"
+                ))),
+                None => Err(unsupported(format!("unknown assignment target `{name}`"))),
+            },
+            _ => Err(unsupported("mapping index base must be a named variable")),
+        }
+    }
+
+    /// Resolve an `LValue` base for struct member access: must evaluate to a
+    /// `Struct` state variable, returning its struct name.
+    fn lvalue_struct_base(&mut self, base: &LValue, write: bool) -> Result<String, CompileError> {
+        match base {
+            LValue::Ident(name) => match self.lookup_state(name) {
+                Some(StateKind::Struct(struct_name)) => {
+                    if write {
+                        if let Some(var) = self.state.get(name) {
+                            if !var.mutable {
+                                return Err(unsupported(format!(
+                                    "assignment to immutable state `{name}`"
+                                )));
+                            }
+                        }
+                    }
+                    Ok(struct_name)
+                }
+                Some(_) => Err(unsupported(format!(
+                    "`{name}` is not a struct; member access requires a struct"
+                ))),
+                None => Err(unsupported(format!("unknown assignment target `{name}`"))),
+            },
+            LValue::Member { base: inner, field } => {
+                let parent = self.lvalue_struct_base(inner, write)?;
+                let _ = self.resolve_struct_field(&parent, field)?;
+                // For now, nested struct member access is not supported (field would
+                // need to be a struct type, but ValueType doesn't carry struct names).
+                Err(unsupported(
+                    "nested struct member assignment is not supported",
+                ))
+            }
+            _ => Err(unsupported("struct member base must be a named variable")),
+        }
+    }
+
+    /// Look up a field in a struct layout and return its `ValueType`.
+    fn resolve_struct_field(
+        &self,
+        struct_name: &str,
+        field: &str,
+    ) -> Result<ValueType, CompileError> {
+        match self.struct_layouts.get(struct_name) {
+            Some(fields) => fields
+                .iter()
+                .find(|(fname, _)| fname == field)
+                .map(|(_, ty)| *ty)
+                .ok_or_else(|| {
+                    unsupported(format!("struct `{struct_name}` has no field `{field}`"))
+                }),
+            None => Err(unsupported(format!("unknown struct `{struct_name}`"))),
         }
     }
 
     fn lvalue_expr(&mut self, target: &Expr) -> Result<ValueType, CompileError> {
         match target {
             Expr::Ident(name) => self.lvalue(&LValue::Ident(name.clone()), true),
-            Expr::Index { .. } => Err(unsupported("array and mapping indexing")),
-            Expr::Access { .. } => Err(unsupported("member assignment")),
+            Expr::Index {
+                target: inner,
+                index,
+            } => {
+                let mapping = self.lvalue_index_expr(inner)?;
+                let key_ty = self.expr(index)?;
+                Self::expect(key_ty, mapping.key, "mapping key")?;
+                Ok(mapping.value)
+            }
+            Expr::Access { target, field } => {
+                let struct_name = self.lvalue_access_expr(target)?;
+                self.resolve_struct_field(&struct_name, field)
+            }
             _ => Err(unsupported("non-variable assignment target")),
+        }
+    }
+
+    /// Resolve an `Expr` that is the target of `Expr::Index` (mapping access).
+    fn lvalue_index_expr(&mut self, target: &Expr) -> Result<MappingInfo, CompileError> {
+        match target {
+            Expr::Ident(name) => match self.lookup_state(name) {
+                Some(StateKind::Mapping { key, value }) => Ok(MappingInfo { key, value }),
+                Some(_) => Err(unsupported(format!(
+                    "`{name}` is not a mapping; indexing requires a mapping"
+                ))),
+                None => Err(unsupported(format!("unknown identifier `{name}`"))),
+            },
+            _ => Err(unsupported("mapping index target must be a named variable")),
+        }
+    }
+
+    /// Resolve an `Expr` that is the target of `Expr::Access` (struct member access).
+    fn lvalue_access_expr(&mut self, target: &str) -> Result<String, CompileError> {
+        match self.lookup_state(target) {
+            Some(StateKind::Struct(name)) => Ok(name),
+            Some(_) => Err(unsupported(format!(
+                "`{target}` is not a struct; member access requires a struct"
+            ))),
+            None => Err(unsupported(format!("unknown identifier `{target}`"))),
         }
     }
 

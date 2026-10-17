@@ -31,10 +31,7 @@ pub struct MicroTokenValue {
 }
 
 /// Calculate micro token value from currency price
-pub fn calculate_micro_value(
-    original_amount: u64,
-    price: &CurrencyPrice,
-) -> MicroTokenValue {
+pub fn calculate_micro_value(original_amount: u64, price: &CurrencyPrice) -> MicroTokenValue {
     // Conversion rate: 1 original token = 1 micro token (1:1 parity)
     // Value is derived from the currency's USD price
     let conversion_rate = if price.price_usd > 0 {
@@ -57,10 +54,7 @@ pub fn calculate_micro_value(
 
 /// Get derivative-adjusted supply
 /// The micro token value changes based on the underlying currency's price
-pub fn get_derivative_supply(
-    base_supply: u64,
-    price_change_percentage: u64,
-) -> u64 {
+pub fn get_derivative_supply(base_supply: u64, price_change_percentage: u64) -> u64 {
     // Apply price change percentage to supply
     if price_change_percentage > 100 {
         // Price increased - supply effectively decreases
@@ -92,6 +86,8 @@ fn saturating_add(a: u64, b: u64) -> u64 {
     match result {
         Some(r) => r,
         // Wrap around on overflow - in production, handle error
-        a => { todo!() }
+        a => {
+            todo!()
+        }
     }
 }

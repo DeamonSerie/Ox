@@ -3,22 +3,32 @@
 
 use crate::utxo::{UtxoEntry, UtxoLedger};
 use oxydome_core::{
-    conversion_split_with_bps, Amount, Block, BlockRewardDistribution, ChainParams, DaoAction,
-    DaoOperation, DaoPeg, DaoPolicy, DaoProposal, DaoProposalAction, DaoProposalStatus, DaoState,
-    DaoWindowStats, GasAccount, GasAction, GasOperation, GovernanceSet, OhmAction, OhmOperation,
-    OhmPolicy, OhmState, OhmUtxoEntry, Operation, OutPoint, OvmAction, OvmFailureCode, OvmLog,
-    OvmReceipt, PublicKey, RewardDistribution, Transaction, TxOutput, ValueIndex, MAX_DAO_PROPOSALS,
-    MAX_DAO_PROPOSAL_HEIGHTS, MAX_OVM_BLOCK_GAS_LIMIT,
+    accumulated_track, actual_direction, bus_flow_delta, conversion_split_with_bps, is_ox_asset,
+    pool_swap, reward_for_bet, timer_burn_outpoint, Amount, Block, BlockRewardDistribution,
+    ChainParams, DaoOperation, DaoState, DaoWindowStats, ExpressBusDeposit, ExpressBusTracker,
+    ExpressBusWithdraw, FileAccessOperation, FileAccessRecord, FileDeleteOperation,
+    FileEvkLabel, FileStoreOperation, GasAccount, GasAction, GasOperation, GovernanceSet,
+    LiquidityPoolAction, LiquidityPoolConfig, LiquidityPoolOperation, LiquidityPoolState,
+    OhmAction, OhmOperation, OhmPolicy, OhmState, OhmUtxoEntry, Operation, OutPoint, OvmAction,
+    OvmFailureCode, OvmLog, OvmReceipt, PeggedCurrencyState, PoolKParams, PriceAsset, PublicKey,
+    RewardDistribution, SpeedometerAccount, SpeedometerAction, SpeedometerOperation, Timer,
+    TimerAction, TimerDirection, TimerOperation, TimerSample, TokenAmount, Transaction, TxOutput,
+    ValueIndex,
+    LIQUIDITY_POOL_SCALE, MAX_OVM_BLOCK_GAS_LIMIT,
 };
 use oxydome_core::{
     build_ohm_server_outputs, compute_ohm_fee_split, ohm_genesis_hash, ohm_state_root,
-    ohm_treasury_outpoint,
+    ohm_treasury_outpoint, DepartureEarningsDistribution, DepartureType, NodeKind,
+};
+use oxydome_crypto::{evk::EphemeralKeyManager, hash_value, verify, Hash};
+use oxydome_currency::{
+    compute_pool_k, compute_value, fp_mul, max_withdraw_per_account, rebound_utxo_spendable,
+    supply_change_cap, supply_impact_ok, withdraw_cap, FP, WindowStats,
 };
 use oxydome_gas::{airdrop_amount, distribute_airdrop};
-use oxydome_crypto::{hash_value, verify, Hash};
-use oxydome_currency::{
-    compute_value, max_withdraw_per_account, rebound_utxo_spendable, supply_change_cap,
-    supply_impact_ok, withdraw_cap, WindowStats,
+use oxydome_speedometer::{
+    airdrop_amount as speedometer_airdrop_amount,
+    distribute_airdrop as speedometer_distribute_airdrop, stabilization_mint,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -135,6 +145,84 @@ pub enum StateError {
     OvmStackLimit,
     #[error("storage label is out of bounds")]
     OutOfBoundsStorageLabel,
+    #[error("timer operation invalid: {0}")]
+    Timer(String),
+    #[error("timer operation requires master approval ({0} of {1})")]
+    TimerApprovalMissing(usize, usize),
+    #[error("timer does not exist")]
+    TimerNotFound,
+    #[error("timer has already been resolved")]
+    TimerAlreadyResolved,
+    #[error("timer has not yet expired")]
+    TimerNotExpired,
+    #[error("file system is not active at this height")]
+    FileSystemInactive,
+    #[error("node signature invalid")]
+    BadNodeLeaveSignature,
+    #[error("node leave input {0:?} invalid")]
+    BadNodeLeaveInput(OutPoint),
+    #[error("node leave earnings distribution mismatch")]
+    NodeLeaveEarningsMismatch,
+    #[error("departure earnings distribution is missing or duplicated")]
+    DepartureEarningsMissing,
+    #[error("file label signature is invalid")]
+    BadFileLabelSignature,
+    #[error("file key chain commitment does not match computation")]
+    BadFileChainCommitment,
+    #[error("file label previous_commitment does not match chain tip")]
+    BadFileChainLink,
+    #[error("file size {0} exceeds maximum {1}")]
+    FileTooLarge(u64, u64),
+    #[error("file is already stored")]
+    DuplicateFile,
+    #[error("node is not authorized to store files")]
+    UnauthorizedFileNode,
+    #[error("node file count exceeds maximum {0}")]
+    NodeFileCountExceeded(u64),
+    #[error("file access signature invalid")]
+    BadFileAccessSignature,
+    #[error("file not found: {0}")]
+    FileNotFound(Hash),
+    #[error("file content hash mismatch")]
+    FileHashMismatch,
+    #[error("only the storing node may delete a file")]
+    NotFileOwner,
+    #[error("file delete signature invalid")]
+    BadFileDeleteSignature,
+    #[error("liquidity pool not found: {0}")]
+    PoolNotFound(Hash),
+    #[error("liquidity pool already exists: {0}")]
+    PoolAlreadyExists(Hash),
+    #[error("liquidity pool limit exceeded ({0})")]
+    PoolLimitExceeded(usize),
+    #[error("liquidity pool signature invalid")]
+    BadPoolSignature,
+    #[error("liquidity pool swap output {0} below minimum {1}")]
+    PoolSwapBelowMin(Amount, Amount),
+    #[error("liquidity pool insufficient reserves")]
+    PoolInsufficientReserves,
+    #[error("Speedometer operation invalid: {0}")]
+    Speedometer(String),
+    #[error("Speedometer is not active at this height")]
+    SpeedometerInactive,
+    #[error("Speedometer transfer nonce {0} does not match expected {1}")]
+    SpeedometerNonce(u64, u64),
+    #[error("account {0:?} has insufficient Speedometer")]
+    SpeedometerUnderfunded(PublicKey),
+    #[error("block header gas stats do not match computed: header gas_price={0} fees={1} computed gas_price={2} fees={3}")]
+    GasStatsMismatch(Amount, Amount, Amount, Amount),
+    #[error("express bus is not active at this height")]
+    ExpressBusInactive,
+    #[error("express bus tracker not found: {0}")]
+    ExpressBusNotFound(Hash),
+    #[error("express bus tracker limit exceeded ({0})")]
+    ExpressBusMaxTrackersExceeded(usize),
+    #[error("express bus deposit invalid")]
+    BadExpressBusDeposit,
+    #[error("express bus withdraw invalid")]
+    BadExpressBusWithdraw,
+    #[error("withdrawer is not the bus owner")]
+    ExpressBusNotOwner,
 }
 
 /// The complete accounting state of the chain.
@@ -178,6 +266,44 @@ pub struct ChainState {
     pub storage_labels: BTreeMap<PublicKey, oxydome_core::StorageLabel>,
     /// Storage audit results.
     pub storage_audits: BTreeMap<u64, oxydome_core::StorageAuditResult>,
+    /// Active and resolved timers, keyed by timer id.
+    pub timers: BTreeMap<Hash, Timer>,
+    /// Pegged currency states, keyed by config id. Updated each block with price samples
+    /// and recomputed bounds. Only active when `pegged_currency_activation_height` is reached.
+    pub pegged_currencies: BTreeMap<Hash, PeggedCurrencyState>,
+    /// Liquidity pool states, keyed by config id. K is recomputed each block after pegged
+    /// currency price tracking. Only active when `liquidity_pool_activation_height` is reached.
+    pub liquidity_pools: BTreeMap<Hash, LiquidityPoolState>,
+    /// On-chain file labels, keyed by `key_chain_commitment`.
+    pub file_labels: BTreeMap<Hash, FileEvkLabel>,
+    /// On-chain file access log, keyed by a unique access record id (hash of the record).
+    pub file_access_log: BTreeMap<Hash, FileAccessRecord>,
+    /// Most recent file label's `key_chain_commitment`, or `Hash::zero` when no files exist.
+    pub file_chain_tip: Hash,
+    /// Per-node file counts for the `max_files_per_node` cap.
+    pub file_node_counts: BTreeMap<PublicKey, u64>,
+    /// Speedometer account balances (account-based currency, not committed into `state_root`).
+    pub speedometer: BTreeMap<PublicKey, SpeedometerAccount>,
+    /// Total circulating Speedometer supply.
+    pub speedometer_supply: Amount,
+    /// Height of the most recent Speedometer airdrop.
+    pub last_speedometer_airdrop_height: u64,
+    /// Per-block tracking: total Speedometer minted from per-tx stabilization.
+    /// Reset each block; stored so `build_block` can commit it to the header.
+    pub speedometer_minted: Amount,
+    /// Per-block tracking: airdrop amount distributed this block.
+    pub speedometer_airdrop_amount: Amount,
+    /// Per-block tracking: total GAS fees collected from OVM execution this block.
+    /// Reset each block; stored so `build_block` can commit it to the header.
+    pub block_gas_fees: Amount,
+    /// Per-block tracking: the gas price used for this block (derived from pegged bounds).
+    /// Reset each block; stored so `build_block` can commit it to the header.
+    pub block_gas_price: Amount,
+    /// Records of node departures (graceful or liveness-triggered). On-chain history of
+    /// disconnections and the earnings redistribution that resulted from each.
+    pub departures: Vec<DepartureEarningsDistribution>,
+    /// Active Express Bus trackers, keyed by bus_id.
+    pub express_buses: BTreeMap<Hash, ExpressBusTracker>,
 }
 
 impl ChainState {
@@ -256,6 +382,22 @@ impl ChainState {
             currency_symbol: config.params.currency_symbol.clone(),
             storage_labels: BTreeMap::new(),
             storage_audits: BTreeMap::new(),
+            timers: BTreeMap::new(),
+            pegged_currencies: BTreeMap::new(),
+            liquidity_pools: BTreeMap::new(),
+            file_labels: BTreeMap::new(),
+            file_access_log: BTreeMap::new(),
+            file_chain_tip: Hash::zero(),
+            file_node_counts: BTreeMap::new(),
+            speedometer: BTreeMap::new(),
+            speedometer_supply: 0,
+            last_speedometer_airdrop_height: 0,
+            speedometer_minted: 0,
+            speedometer_airdrop_amount: 0,
+            block_gas_fees: 0,
+            block_gas_price: 0,
+            departures: Vec::new(),
+            express_buses: BTreeMap::new(),
         };
         let gov = GovernanceSet::new(config.masters.clone(), config.nodes.clone());
         Ok((state, block, gov))
@@ -265,14 +407,23 @@ impl ChainState {
         self.utxo.root()
     }
 
-    /// Combined commitment to UTXOs, OVM code/storage, DAO state, and OHM state.
-    /// Empty feature state preserves the original transfer-only state root.
+    /// Combined commitment to UTXOs, OVM code/storage, DAO state, OHM state, storage labels, timers,
+    /// and pegged currency state. Empty feature state preserves the original transfer-only state root.
+    ///
+    /// When `pegged_currencies` is non-empty, a new domain separator family (`v5`/`v6`) is used
+    /// so that pre-pegged chains retain byte-identical roots.
     pub fn state_root(&self) -> Hash {
         if self.contracts.is_empty()
             && self.daos.is_empty()
             && self.ohm_states.is_empty()
             && self.storage_labels.is_empty()
             && self.storage_audits.is_empty()
+            && self.timers.is_empty()
+            && self.pegged_currencies.is_empty()
+            && self.liquidity_pools.is_empty()
+            && self.file_labels.is_empty()
+            && self.file_access_log.is_empty()
+            && self.express_buses.is_empty()
         {
             return self.utxo.root();
         }
@@ -291,57 +442,441 @@ impl ChainState {
         } else {
             hash_value(&("oxydome-ohm-state-v1", &self.ohm_states))
         };
-        
-        // Combine all roots - use v2 if only OVM+DAO, v3 if OHM included
-        if ohm_root.is_zero() {
-            let has_storage = !self.storage_labels.is_empty() || !self.storage_audits.is_empty();
-            if has_storage {
-                let storage_root = hash_value(&(
-                    "oxydome-storage-state-v1",
-                    &self.storage_labels,
-                    &self.storage_audits,
-                ));
-                hash_value(&(
-                    "oxydome-combined-state-v4-no-ohm",
-                    self.utxo.root(),
-                    ovm_root,
-                    dao_root,
-                    storage_root,
-                ))
-            } else {
-                hash_value(&("oxydome-combined-state-v2", self.utxo.root(), ovm_root, dao_root))
-            }
+        let timer_root = if self.timers.is_empty() {
+            Hash::zero()
         } else {
-            let has_storage = !self.storage_labels.is_empty() || !self.storage_audits.is_empty();
-            if has_storage {
-                let storage_root = hash_value(&(
-                    "oxydome-storage-state-v1",
-                    &self.storage_labels,
-                    &self.storage_audits,
-                ));
+            hash_value(&("oxydome-timer-state-v1", &self.timers))
+        };
+        let pegged_root = if self.pegged_currencies.is_empty() {
+            Hash::zero()
+        } else {
+            hash_value(&("oxydome-pegged-state-v1", &self.pegged_currencies))
+        };
+        let pool_root = if self.liquidity_pools.is_empty() {
+            Hash::zero()
+        } else {
+            hash_value(&("oxydome-pool-state-v1", &self.liquidity_pools))
+        };
+        let file_root = if self.file_labels.is_empty() && self.file_access_log.is_empty() {
+            Hash::zero()
+        } else {
+            hash_value(&(
+                "oxydome-evfs-state-v1",
+                &self.file_labels,
+                &self.file_access_log,
+            ))
+        };
+        let has_files = !file_root.is_zero();
+        let has_pools = !pool_root.is_zero();
+        let has_storage = !self.storage_labels.is_empty() || !self.storage_audits.is_empty();
+        let has_express = !self.express_buses.is_empty();
+        let express_root = if has_express {
+            hash_value(&("oxydome-express-bus-state-v1", &self.express_buses))
+        } else {
+            Hash::zero()
+        };
+        let storage_root = if has_storage {
+            hash_value(&(
+                "oxydome-storage-state-v1",
+                &self.storage_labels,
+                &self.storage_audits,
+            ))
+        } else {
+            Hash::zero()
+        };
+
+        // Versioning: when liquidity pools are present, use v9 domain separators that
+        // include pool_root. When pools are absent, all existing v2-v8 paths are
+        // preserved byte-for-byte. When Express Bus trackers are present, the base
+        // root is wrapped with an additional domain separator so existing chains are
+        // unaffected.
+        let base_root = if has_pools {
+            if !has_files {
+                if pegged_root.is_zero() {
+                    if ohm_root.is_zero() {
+                        if has_storage {
+                            hash_value(&(
+                                "oxydome-combined-state-v9-no-pegged-no-ohm",
+                                self.utxo.root(),
+                                ovm_root,
+                                dao_root,
+                                storage_root,
+                                timer_root,
+                                pool_root,
+                            ))
+                        } else {
+                            hash_value(&(
+                                "oxydome-combined-state-v9-no-pegged-no-ohm-no-storage",
+                                self.utxo.root(),
+                                ovm_root,
+                                dao_root,
+                                timer_root,
+                                pool_root,
+                            ))
+                        }
+                    } else {
+                        if has_storage {
+                            hash_value(&(
+                                "oxydome-combined-state-v9-no-pegged",
+                                self.utxo.root(),
+                                ovm_root,
+                                dao_root,
+                                ohm_root,
+                                storage_root,
+                                timer_root,
+                                pool_root,
+                            ))
+                        } else {
+                            hash_value(&(
+                                "oxydome-combined-state-v9-no-pegged-no-storage",
+                                self.utxo.root(),
+                                ovm_root,
+                                dao_root,
+                                ohm_root,
+                                timer_root,
+                                pool_root,
+                            ))
+                        }
+                    }
+                } else {
+                    if ohm_root.is_zero() {
+                        if has_storage {
+                            hash_value(&(
+                                "oxydome-combined-state-v9-no-ohm",
+                                self.utxo.root(),
+                                ovm_root,
+                                dao_root,
+                                storage_root,
+                                timer_root,
+                                pegged_root,
+                                pool_root,
+                            ))
+                        } else {
+                            hash_value(&(
+                                "oxydome-combined-state-v9-no-ohm-no-storage",
+                                self.utxo.root(),
+                                ovm_root,
+                                dao_root,
+                                timer_root,
+                                pegged_root,
+                                pool_root,
+                            ))
+                        }
+                    } else {
+                        if has_storage {
+                            hash_value(&(
+                                "oxydome-combined-state-v9",
+                                self.utxo.root(),
+                                ovm_root,
+                                dao_root,
+                                ohm_root,
+                                storage_root,
+                                timer_root,
+                                pegged_root,
+                                pool_root,
+                            ))
+                        } else {
+                            hash_value(&(
+                                "oxydome-combined-state-v9-no-storage",
+                                self.utxo.root(),
+                                ovm_root,
+                                dao_root,
+                                ohm_root,
+                                timer_root,
+                                pegged_root,
+                                pool_root,
+                            ))
+                        }
+                    }
+                }
+            } else {
+                if pegged_root.is_zero() {
+                    if ohm_root.is_zero() {
+                        hash_value(&(
+                            "oxydome-combined-state-v9-no-pegged-no-ohm-files",
+                            self.utxo.root(),
+                            ovm_root,
+                            dao_root,
+                            storage_root,
+                            timer_root,
+                            pool_root,
+                            file_root,
+                        ))
+                    } else {
+                        hash_value(&(
+                            "oxydome-combined-state-v9-no-pegged-files",
+                            self.utxo.root(),
+                            ovm_root,
+                            dao_root,
+                            ohm_root,
+                            storage_root,
+                            timer_root,
+                            pool_root,
+                            file_root,
+                        ))
+                    }
+                } else if ohm_root.is_zero() {
+                    hash_value(&(
+                        "oxydome-combined-state-v9-no-ohm-files",
+                        self.utxo.root(),
+                        ovm_root,
+                        dao_root,
+                        storage_root,
+                        timer_root,
+                        pegged_root,
+                        pool_root,
+                        file_root,
+                    ))
+                } else {
+                    hash_value(&(
+                        "oxydome-combined-state-v9-files",
+                        self.utxo.root(),
+                        ovm_root,
+                        dao_root,
+                        ohm_root,
+                        storage_root,
+                        timer_root,
+                        pegged_root,
+                        pool_root,
+                        file_root,
+                    ))
+                }
+            }
+        } else if !has_files {
+            if pegged_root.is_zero() {
+                if ohm_root.is_zero() {
+                    if has_storage {
+                        hash_value(&(
+                            "oxydome-combined-state-v4-no-ohm",
+                            self.utxo.root(),
+                            ovm_root,
+                            dao_root,
+                            storage_root,
+                            timer_root,
+                        ))
+                    } else {
+                        hash_value(&(
+                            "oxydome-combined-state-v2",
+                            self.utxo.root(),
+                            ovm_root,
+                            dao_root,
+                            timer_root,
+                        ))
+                    }
+                } else {
+                    if has_storage {
+                        hash_value(&(
+                            "oxydome-combined-state-v4",
+                            self.utxo.root(),
+                            ovm_root,
+                            dao_root,
+                            ohm_root,
+                            storage_root,
+                            timer_root,
+                        ))
+                    } else {
+                        hash_value(&(
+                            "oxydome-combined-state-v3",
+                            self.utxo.root(),
+                            ovm_root,
+                            dao_root,
+                            ohm_root,
+                            timer_root,
+                        ))
+                    }
+                }
+            } else {
+                if ohm_root.is_zero() {
+                    if has_storage {
+                        hash_value(&(
+                            "oxydome-combined-state-v6-no-ohm",
+                            self.utxo.root(),
+                            ovm_root,
+                            dao_root,
+                            storage_root,
+                            timer_root,
+                            pegged_root,
+                        ))
+                    } else {
+                        hash_value(&(
+                            "oxydome-combined-state-v5",
+                            self.utxo.root(),
+                            ovm_root,
+                            dao_root,
+                            timer_root,
+                            pegged_root,
+                        ))
+                    }
+                } else {
+                    if has_storage {
+                        hash_value(&(
+                            "oxydome-combined-state-v7",
+                            self.utxo.root(),
+                            ovm_root,
+                            dao_root,
+                            ohm_root,
+                            storage_root,
+                            timer_root,
+                            pegged_root,
+                        ))
+                    } else {
+                        hash_value(&(
+                            "oxydome-combined-state-v6",
+                            self.utxo.root(),
+                            ovm_root,
+                            dao_root,
+                            ohm_root,
+                            timer_root,
+                            pegged_root,
+                        ))
+                    }
+                }
+            }
+        } else if pegged_root.is_zero() {
+            if ohm_root.is_zero() {
                 hash_value(&(
-                    "oxydome-combined-state-v4",
+                    "oxydome-combined-state-v8-no-pegged-no-ohm",
+                    self.utxo.root(),
+                    ovm_root,
+                    dao_root,
+                    storage_root,
+                    timer_root,
+                    file_root,
+                ))
+            } else {
+                hash_value(&(
+                    "oxydome-combined-state-v8-no-pegged",
                     self.utxo.root(),
                     ovm_root,
                     dao_root,
                     ohm_root,
                     storage_root,
-                ))
-            } else {
-                hash_value(&(
-                    "oxydome-combined-state-v3",
-                    self.utxo.root(),
-                    ovm_root,
-                    dao_root,
-                    ohm_root,
+                    timer_root,
+                    file_root,
                 ))
             }
+        } else if ohm_root.is_zero() {
+            hash_value(&(
+                "oxydome-combined-state-v8-no-ohm",
+                self.utxo.root(),
+                ovm_root,
+                dao_root,
+                storage_root,
+                timer_root,
+                pegged_root,
+                file_root,
+            ))
+        } else {
+            hash_value(&(
+                "oxydome-combined-state-v8",
+                self.utxo.root(),
+                ovm_root,
+                dao_root,
+                ohm_root,
+                storage_root,
+                timer_root,
+                pegged_root,
+                file_root,
+            ))
+        };
+
+        if has_express {
+            hash_value(&(
+                "oxydome-express-bus-wrap-v1",
+                base_root,
+                express_root,
+            ))
+        } else {
+            base_root
         }
     }
 
     /// Returns the GAS balance for `owner`.
     pub fn gas_balance(&self, owner: &PublicKey) -> Amount {
         self.gas.get(owner).map_or(0, |account| account.balance)
+    }
+
+    /// Computes the current GAS price from the pegged currency state for `PriceAsset::Gas`.
+    ///
+    /// If a pegged currency tracks GAS (asset == `PriceAsset::Gas`) and the current
+    /// price is in bounds (>= midpoint), the price premium from the bounds is applied
+    /// to `base_price` (which defaults to `self.ox_price`). When out of bounds or no
+    /// pegged GAS currency exists, falls back to `self.ox_price` as the gas price.
+    pub fn compute_gas_price(&self, params: &ChainParams) -> Amount {
+        let base_price = self.ox_price;
+        for state in self.pegged_currencies.values() {
+            if state.config.asset == oxydome_core::PriceAsset::Gas {
+                let premium = oxydome_core::compute_gas_price_premium(&state.bounds);
+                if premium == 0 {
+                    return base_price;
+                }
+                return base_price
+                    .saturating_mul(premium)
+                    .saturating_div(oxydome_core::VALUE_SCALE);
+            }
+        }
+        base_price
+    }
+
+    /// Builds a `CrossHost` with a price oracle populated from the current pegged currency
+    /// bound states. Returns `None` if there are no pegged currencies (so plain `execute`
+    /// is used instead).
+    pub fn build_price_host(&self) -> Option<oxydome_ovm::CrossHost> {
+        if self.pegged_currencies.is_empty() {
+            return None;
+        }
+        let mut bounds = std::collections::BTreeMap::new();
+        for state in self.pegged_currencies.values() {
+            let key = state.config.asset.oracle_key();
+            bounds.insert(key, state.bounds.pack());
+        }
+        Some(oxydome_ovm::CrossHost {
+            origin_ohm: Hash::zero(),
+            inbox: std::collections::BTreeMap::new(),
+            price_oracle: Some(oxydome_ovm::PriceOracle { bounds }),
+            pool_oracle: None,
+        })
+    }
+
+    /// Builds a `CrossHost` with both price and pool oracles populated.
+    /// Returns `None` if there are no pegged currencies and no liquidity pools.
+    pub fn build_host(&self) -> Option<oxydome_ovm::CrossHost> {
+        if self.pegged_currencies.is_empty() && self.liquidity_pools.is_empty() {
+            return None;
+        }
+        let mut bounds = std::collections::BTreeMap::new();
+        for state in self.pegged_currencies.values() {
+            let key = state.config.asset.oracle_key();
+            bounds.insert(key, state.bounds.pack());
+        }
+        let mut pools = std::collections::BTreeMap::new();
+        for (id, state) in self.liquidity_pools.iter() {
+            let key = id.0[..8].try_into().map(u64::from_le_bytes).unwrap_or(0);
+            let packed = state.pack();
+            pools.insert(
+                key,
+                oxydome_ovm::PoolStatePacked {
+                    reserve_x: packed.reserve_x,
+                    reserve_y: packed.reserve_y,
+                    k: packed.k,
+                    fee_bps: packed.fee_bps,
+                },
+            );
+        }
+        Some(oxydome_ovm::CrossHost {
+            origin_ohm: Hash::zero(),
+            inbox: std::collections::BTreeMap::new(),
+            price_oracle: if bounds.is_empty() {
+                None
+            } else {
+                Some(oxydome_ovm::PriceOracle { bounds })
+            },
+            pool_oracle: if pools.is_empty() {
+                None
+            } else {
+                Some(oxydome_ovm::PoolOracle { pools })
+            },
+        })
     }
 
     /// The nonce expected on the next GAS transfer from `owner`.
@@ -376,14 +911,53 @@ impl ChainState {
         Ok(())
     }
 
+    /// Returns the Speedometer balance for `owner`.
+    pub fn speedometer_balance(&self, owner: &PublicKey) -> Amount {
+        self.speedometer
+            .get(owner)
+            .map_or(0, |account| account.balance)
+    }
+
+    /// The nonce expected on the next Speedometer transfer from `owner`.
+    pub fn speedometer_nonce(&self, owner: &PublicKey) -> u64 {
+        self.speedometer
+            .get(owner)
+            .map_or(0, |account| account.nonce)
+    }
+
+    /// Mints `amount` Speedometer to `owner`, increasing the circulating Speedometer supply.
+    pub fn mint_speedometer(&mut self, owner: PublicKey, amount: Amount) {
+        if amount == 0 {
+            return;
+        }
+        let entry = self.speedometer.entry(owner).or_default();
+        entry.balance = entry.balance.saturating_add(amount);
+        self.speedometer_supply = self.speedometer_supply.saturating_add(amount);
+    }
+
+    /// Burns `amount` Speedometer from `owner`, decreasing the circulating Speedometer supply.
+    fn burn_speedometer(&mut self, owner: &PublicKey, amount: Amount) -> Result<(), StateError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let entry = self
+            .speedometer
+            .get_mut(owner)
+            .ok_or(StateError::SpeedometerUnderfunded(*owner))?;
+        if entry.balance < amount {
+            return Err(StateError::SpeedometerUnderfunded(*owner));
+        }
+        entry.balance -= amount;
+        self.speedometer_supply = self.speedometer_supply.saturating_sub(amount);
+        Ok(())
+    }
+
     /// The summed statistics over the measurement window.
     pub fn window_stats(&self, params: &ChainParams) -> WindowStats {
         let limit = params.block_window.max(1) as usize;
         let mut stats = WindowStats::default();
         for s in self.stats_history.iter().rev().take(limit) {
-            stats.volume = stats.volume.saturating_add(s.volume);
-            stats.tx_count = stats.tx_count.saturating_add(s.tx_count);
-            stats.exit_amount = stats.exit_amount.saturating_add(s.exit_amount);
+            stats.accumulate(s);
         }
         stats
     }
@@ -435,6 +1009,10 @@ impl ChainState {
         block.header.supply = next.supply;
         block.header.value_index = next.value_index;
         block.header.generation = next.generation;
+        block.header.speedometer_minted = next.speedometer_minted;
+        block.header.speedometer_airdrop_amount = next.speedometer_airdrop_amount;
+        block.header.gas_price = next.block_gas_price;
+        block.header.total_gas_fees = next.block_gas_fees;
         // Re-verify against the committed header.
         self.apply_inner(&block, gov, params, true)?;
         Ok(block)
@@ -466,7 +1044,8 @@ impl ChainState {
                         "fee does not equal the transfer fee".into(),
                     ));
                 }
-                let _ = execution_state.apply_ovm_action(action, tx.txid(), tx_index, tx, params)?;
+                let _ =
+                    execution_state.apply_ovm_action(action, tx.txid(), tx_index, tx, params)?;
                 tx.fee
             } else {
                 tx.fee
@@ -531,6 +1110,10 @@ impl ChainState {
         let mut total_fees: Amount = 0;
         let mut block_ovm_gas_limit = 0u64;
         let mut block_stats = WindowStats::default();
+        next.speedometer_minted = 0;
+        next.speedometer_airdrop_amount = 0;
+        next.block_gas_fees = 0;
+        next.block_gas_price = self.compute_gas_price(params);
         for (tx_idx, tx) in block.transactions.iter().enumerate() {
             tx.validate_structure()
                 .map_err(|e| StateError::BadTransaction(tx_idx, e.to_string()))?;
@@ -602,6 +1185,7 @@ impl ChainState {
             }
             block_stats.volume = block_stats.volume.saturating_add(output_total);
             block_stats.tx_count = block_stats.tx_count.saturating_add(1);
+            block_stats.highest_tx_value = block_stats.highest_tx_value.max(output_total);
             for (out_idx, output) in tx.outputs.iter().enumerate() {
                 if output.kind.is_exit() {
                     block_stats.exit_amount = block_stats.exit_amount.saturating_add(output.amount);
@@ -618,14 +1202,38 @@ impl ChainState {
                 }
                 if block.header.height >= params.gas_activation_height {
                     if let Some(caller) = ovm_caller(tx, action) {
-                let stack_gas = action.required_stack_gas(params.ovm_stack_bytes_per_gas);
-                        let gas_limit_req = u128::from(stack_gas);
+                        let stack_gas = action.required_stack_gas(params.ovm_stack_bytes_per_gas);
+                        let gas_limit_req =
+                            u128::from(stack_gas).saturating_mul(next.block_gas_price);
                         if next.gas_balance(caller) < gas_limit_req {
                             return Err(StateError::OvmGasUnderfunded(*caller));
                         }
                         let receipt =
                             next.apply_ovm_action(action, tx.txid(), tx_idx, tx, params)?;
-                        next.burn_gas(caller, receipt.gas_used as Amount)?;
+                        let gas_cost =
+                            u128::from(receipt.gas_used).saturating_mul(next.block_gas_price);
+                        let master_gas_share =
+                            gas_cost.saturating_mul(params.gas_fee_master_bps as u128) / 10_000;
+                        next.burn_gas(caller, gas_cost)?;
+                        if master_gas_share > 0 {
+                            let per_master = if gov.masters.is_empty() {
+                                0
+                            } else {
+                                master_gas_share / gov.masters.len() as u128
+                            };
+                            let remainder = master_gas_share.saturating_sub(
+                                per_master.saturating_mul(gov.masters.len() as u128),
+                            );
+                            for master in &gov.masters {
+                                next.mint_gas(*master, per_master);
+                            }
+                            if remainder > 0 {
+                                if let Some(master) = gov.masters.first() {
+                                    next.mint_gas(*master, remainder);
+                                }
+                            }
+                        }
+                        next.block_gas_fees = next.block_gas_fees.saturating_add(gas_cost);
                         next.ovm_receipts.push(receipt);
                     } else {
                         let receipt =
@@ -633,8 +1241,7 @@ impl ChainState {
                         next.ovm_receipts.push(receipt);
                     }
                 } else {
-                    let receipt =
-                        next.apply_ovm_action(action, tx.txid(), tx_idx, tx, params)?;
+                    let receipt = next.apply_ovm_action(action, tx.txid(), tx_idx, tx, params)?;
                     next.ovm_receipts.push(receipt);
                 }
                 total_fees = total_fees.checked_add(tx.fee).ok_or_else(|| {
@@ -644,6 +1251,21 @@ impl ChainState {
                 total_fees = total_fees.checked_add(tx.fee).ok_or_else(|| {
                     StateError::BadTransaction(tx_idx, "block fee total overflows".into())
                 })?;
+            }
+
+            // Per-transaction Speedometer stabilization: mint a small fraction of the tx value
+            // and distribute to active liquidity pool owners proportionally to their pool's share
+            // of total LP value. If no pools exist, the stabilization goes to the block producer.
+            if new_height >= params.speedometer_activation_height && output_total > 0 {
+                let minted = stabilization_mint(output_total, params.speedometer_stabilization_bps);
+                if minted > 0 {
+                    if next.liquidity_pools.is_empty() {
+                        next.mint_speedometer(block.header.producer, minted);
+                    } else {
+                        distribute_stabilization_to_pools(&mut next, minted);
+                    }
+                    next.speedometer_minted = next.speedometer_minted.saturating_add(minted);
+                }
             }
         }
         if enforce_header && next.ovm_receipts != block.ovm_receipts {
@@ -658,12 +1280,24 @@ impl ChainState {
             return Err(StateError::StatsMismatch);
         }
 
+        if enforce_header
+            && (block.header.gas_price != next.block_gas_price
+                || block.header.total_gas_fees != next.block_gas_fees)
+        {
+            return Err(StateError::GasStatsMismatch(
+                block.header.gas_price,
+                block.header.total_gas_fees,
+                next.block_gas_price,
+                next.block_gas_fees,
+            ));
+        }
+
         // Record this block's window statistics.
         next.stats_history.push_back(block_stats);
         while next.stats_history.len() > params.block_window.max(1) as usize {
             next.stats_history.pop_front();
         }
-        let window = next.window_stats(params);
+        let mut window = next.window_stats(params);
 
         // ---- 2. Reward distribution ----
         let reward_ops: Vec<&Operation> = block
@@ -738,6 +1372,9 @@ impl ChainState {
                     }
                     next.storage_audits
                         .insert(audit_op.result.epoch, audit_op.result.clone());
+                }
+                Operation::Timer(timer_operation) => {
+                    apply_timer_operation(&mut next, timer_operation, op, new_height, params, gov)?;
                 }
                 Operation::Mint(m) => {
                     let approvals = count_master_approvals(op, gov);
@@ -883,7 +1520,56 @@ impl ChainState {
                     }
                     next.epoch_withdrawn = next.epoch_withdrawn.saturating_add(w.amount);
                 }
+                Operation::FileStore(file_op) => {
+                    apply_file_store(&mut next, file_op, op, new_height, params, gov)?;
+                }
+                Operation::FileAccess(access_op) => {
+                    apply_file_access(&mut next, access_op, op, new_height, params, gov)?;
+                }
+                Operation::FileDelete(delete_op) => {
+                    apply_file_delete(&mut next, delete_op, op, new_height, params, gov)?;
+                }
+                Operation::LiquidityPool(lp_op) => {
+                    apply_liquidity_pool_operation(&mut next, lp_op, op, new_height, params, gov)?;
+                }
+                Operation::Speedometer(speedometer_op) => {
+                    apply_speedometer_operation(&mut next, speedometer_op, op, new_height, params)?;
+                }
+                Operation::NodeLeave(leave_op) => {
+                    apply_node_leave(&mut next, leave_op, op, new_height, params, gov)?;
+                }
+                Operation::DepartureEarnings(dist) => {
+                    apply_departure_earnings(&mut next, dist, op, new_height)?;
+                }
+                Operation::ExpressBusDeposit(dep) => {
+                    apply_express_bus_deposit(&mut next, dep, op, new_height, params, gov)?;
+                }
+                Operation::ExpressBusWithdraw(wd) => {
+                    apply_express_bus_withdraw(&mut next, wd, op, new_height, params, gov)?;
+                }
             }
+        }
+
+        // ---- 3a. Express Bus tracker sampling ----
+        // After processing operations, sample each Express Bus tracker and compute
+        // the aggregate express flow that feeds into the value index.
+        let has_express = !next.express_buses.is_empty();
+        if has_express {
+            let mut total_express_flow: i128 = 0;
+            for tracker in next.express_buses.values_mut() {
+                // Record a block sample via the tracker's sampling method.
+                tracker.sample(new_height);
+                // Compute signal = fp_mul(net, weight) using tracked volumes.
+                let signal = tracker.signal();
+                total_express_flow = total_express_flow.saturating_add(signal);
+
+                // Settle window: if the window has expired, settle and reset.
+                let since_sample = new_height.saturating_sub(tracker.last_sample_height);
+                if since_sample >= params.express_bus_window_blocks {
+                    tracker.settle();
+                }
+            }
+            window.express_flow = total_express_flow;
         }
 
         update_dao_value_indices(&mut next.daos, &dao_block_stats, params);
@@ -914,6 +1600,40 @@ impl ChainState {
             }
         }
 
+        // ---- 3b'. Speedometer airdrop ----
+        // Airdrops occur every `speedometer_airdrop_interval_blocks` blocks, sized from the
+        // block's highest transaction value (not the Speedometer supply).
+        next.speedometer_airdrop_amount = 0;
+        if new_height >= params.speedometer_activation_height
+            && params.speedometer_airdrop_interval_blocks > 0
+        {
+            let interval = params.speedometer_airdrop_interval_blocks;
+            let since_last = new_height.saturating_sub(next.last_speedometer_airdrop_height);
+            if since_last >= interval {
+                let highest_tx = block_stats.highest_tx_value;
+                let amount = speedometer_airdrop_amount(
+                    next.speedometer_supply,
+                    params.speedometer_airdrop_base_bps,
+                    highest_tx,
+                    params.ox_price_reference,
+                    next.ox_price,
+                );
+                if amount > 0 {
+                    let balances: BTreeMap<PublicKey, Amount> = next
+                        .speedometer
+                        .iter()
+                        .map(|(key, account)| (*key, account.balance))
+                        .collect();
+                    let grants = speedometer_distribute_airdrop(&balances, amount);
+                    for (recipient, grant) in grants {
+                        next.mint_speedometer(recipient, grant);
+                    }
+                    next.last_speedometer_airdrop_height = new_height;
+                    next.speedometer_airdrop_amount = amount;
+                }
+            }
+        }
+
         // ---- 4. Value index ----
         let transition = compute_value(
             params,
@@ -937,6 +1657,56 @@ impl ChainState {
         }
         next.value_index = transition.value;
         next.generation = transition.generation;
+
+        // ---- 4b. Pegged currency price tracking ----
+        if new_height >= params.pegged_currency_activation_height
+            && !next.pegged_currencies.is_empty()
+        {
+            let window = params.pegged_window_blocks;
+            let mut updated: BTreeMap<Hash, PeggedCurrencyState> = BTreeMap::new();
+            for (id, state) in next.pegged_currencies.iter() {
+                let mut cloned = state.clone();
+                let price = match cloned.config.asset {
+                    PriceAsset::Ox => next.value_index.raw(),
+                    PriceAsset::Gas => next.ox_price,
+                    PriceAsset::DaoCurrency { dao_id } => next
+                        .daos
+                        .get(&dao_id)
+                        .map_or(next.value_index.raw(), |d| d.value_index),
+                };
+                cloned.record_sample(new_height, price, window);
+                updated.insert(*id, cloned);
+            }
+            next.pegged_currencies = updated;
+        }
+
+        // ---- 4c. Liquidity pool K recompute ----
+        if new_height >= params.liquidity_pool_activation_height && !next.liquidity_pools.is_empty()
+        {
+            let mut updated: BTreeMap<Hash, LiquidityPoolState> = BTreeMap::new();
+            for (id, state) in next.liquidity_pools.iter() {
+                let mut cloned = state.clone();
+                let (upper_bound, lower_bound) = if let Some(asset) = cloned.other_asset() {
+                    next.pegged_currencies
+                        .values()
+                        .find(|pc| pc.config.asset == asset)
+                        .map_or((1u128, 1u128), |pc| {
+                            (pc.bounds.upper_bound, pc.bounds.lower_bound)
+                        })
+                } else {
+                    (1u128, 1u128)
+                };
+                cloned.k = compute_pool_k(
+                    upper_bound,
+                    lower_bound,
+                    cloned.volume,
+                    cloned.config.k_params.t_ref,
+                );
+                cloned.last_update_height = new_height;
+                updated.insert(*id, cloned);
+            }
+            next.liquidity_pools = updated;
+        }
 
         // ---- 5. Rebound refund ----
         if transition.rebounded {
@@ -963,6 +1733,20 @@ impl ChainState {
         if enforce_header && computed_root != block.header.state_root {
             return Err(StateError::StateRootMismatch);
         }
+        if enforce_header && block.header.speedometer_minted != next.speedometer_minted {
+            return Err(StateError::Speedometer(format!(
+                "header speedometer_minted {} does not match computed {}",
+                block.header.speedometer_minted, next.speedometer_minted
+            )));
+        }
+        if enforce_header
+            && block.header.speedometer_airdrop_amount != next.speedometer_airdrop_amount
+        {
+            return Err(StateError::Speedometer(format!(
+                "header speedometer_airdrop_amount {} does not match computed {}",
+                block.header.speedometer_airdrop_amount, next.speedometer_airdrop_amount
+            )));
+        }
         next.height = new_height;
         next.block_hash = block.hash();
         Ok(next)
@@ -985,7 +1769,10 @@ impl ChainState {
             logs: Vec::new(),
         };
         match action {
-            OvmAction::Deploy { code, stack_bytes: _ } => {
+            OvmAction::Deploy {
+                code,
+                stack_bytes: _,
+            } => {
                 oxydome_ovm::Program::decode(code)
                     .map_err(|error| StateError::OvmExecution(tx_index, error.to_string()))?;
                 let contract_id = oxydome_ovm::contract_id(txid);
@@ -1082,7 +1869,8 @@ impl ChainState {
                 authority_input,
                 stack_bytes: _,
             } => {
-                let required = oxydome_ovm::ACTION_INTRINSIC_GAS + oxydome_ovm::CONTRACT_DISPATCH_GAS;
+                let required =
+                    oxydome_ovm::ACTION_INTRINSIC_GAS + oxydome_ovm::CONTRACT_DISPATCH_GAS;
                 let stack_gas = action.required_stack_gas(bytes_per_gas);
                 if stack_gas < required {
                     return Ok(failed(stack_gas, OvmFailureCode::OutOfGas));
@@ -1145,8 +1933,8 @@ impl ChainState {
             return_data: Vec::new(),
             logs: Vec::new(),
         };
-        let stack_gas_u128 = ((stack_bytes as u128) + (bytes_per_gas as u128) - 1)
-            / (bytes_per_gas as u128);
+        let stack_gas_u128 =
+            ((stack_bytes as u128) + (bytes_per_gas as u128) - 1) / (bytes_per_gas as u128);
         let stack_gas = stack_gas_u128 as u64;
         if (stack_gas_u128 as u64) < intrinsic_gas {
             return Ok(failed(stack_gas, OvmFailureCode::OutOfGas));
@@ -1155,7 +1943,23 @@ impl ChainState {
             .contracts
             .get(contract_id)
             .ok_or(StateError::OvmContractNotFound(*contract_id))?;
-        match oxydome_ovm::execute(program, arguments, &contract.storage, stack_bytes) {
+
+        // Build a host context with price and pool oracles from pegged currency and
+        // liquidity pool state so that `LoadPriceBounds`, `PeggedConvert`,
+        // `LoadPoolState`, and `PoolSwap` instructions can read current state.
+        let host = self.build_host();
+        let result = if host.is_some() {
+            oxydome_ovm::execute_with_host(
+                program,
+                arguments,
+                &contract.storage,
+                stack_bytes,
+                host.as_ref(),
+            )
+        } else {
+            oxydome_ovm::execute(program, arguments, &contract.storage, stack_bytes)
+        };
+        match result {
             Ok(execution) => {
                 let gas_used = stack_gas;
                 self.contracts
@@ -1248,9 +2052,7 @@ fn apply_block_rewards(
             let mut kept = output.clone();
             kept.amount = ox_kept;
             let outpoint = OutPoint::new(op_id, out_idx);
-            next.utxo = next
-                .utxo
-                .insert(UtxoEntry::new(outpoint, kept, height));
+            next.utxo = next.utxo.insert(UtxoEntry::new(outpoint, kept, height));
         }
         if gas_minted > 0 {
             // Burn the converted Ox and mint the GAS fuel to the same recipient.
@@ -1271,9 +2073,7 @@ fn apply_block_rewards(
             let mut kept = output.clone();
             kept.amount = ox_kept;
             let outpoint = OutPoint::new(op_id, out_idx);
-            next.utxo = next
-                .utxo
-                .insert(UtxoEntry::new(outpoint, kept, height));
+            next.utxo = next.utxo.insert(UtxoEntry::new(outpoint, kept, height));
         }
         if gas_minted > 0 {
             next.supply = next.supply.saturating_sub(gas_minted);
@@ -1340,9 +2140,7 @@ fn apply_rewards(
             let mut kept = output.clone();
             kept.amount = ox_kept;
             let outpoint = OutPoint::new(op_id, out_idx);
-            next.utxo = next
-                .utxo
-                .insert(UtxoEntry::new(outpoint, kept, height));
+            next.utxo = next.utxo.insert(UtxoEntry::new(outpoint, kept, height));
         }
         if gas_minted > 0 {
             // Burn the converted Ox and mint the GAS fuel to the same recipient.
@@ -1354,12 +2152,213 @@ fn apply_rewards(
     Ok(())
 }
 
+/// Computes the total held "earnings" balance of `node` as a list of `TokenAmount` entries.
+///
+/// Currently this aggregates all on-chain UTXO entries owned by `node` (all balances held by
+/// the departing node), so the redistribution applies to every asset the node held. This matches
+/// the requirement that 100 tokenA and 1000 tokenB held by the disconnecting node are both
+/// subject to the half-redistribution rule.
+fn held_earnings(next: &ChainState, node: &PublicKey) -> Vec<TokenAmount> {
+    let mut balances: BTreeMap<Option<Hash>, Amount> = BTreeMap::new();
+    for entry in next.utxo.to_map().values() {
+        if entry.output.recipient == *node {
+            let asset_id = match &entry.output.kind {
+                crate::OutputKind::Spendable => None,
+                crate::OutputKind::LockedReward => None,
+                crate::OutputKind::ExitReserve { .. } => None,
+                crate::OutputKind::DaoTreasury { .. } => None,
+                crate::OutputKind::OhmTreasury { ohm_id } => Some(*ohm_id),
+                crate::OutputKind::BusReceipt { asset, .. } => {
+                    if is_ox_asset(asset) {
+                        None
+                    } else {
+                        Some(Hash::zero())
+                    }
+                }
+            };
+            let cur = balances.entry(asset_id).or_insert(0);
+            *cur = cur.saturating_add(entry.output.amount);
+        }
+    }
+    balances
+        .into_iter()
+        .map(|(asset_id, amount)| TokenAmount { asset_id, amount })
+        .collect()
+}
+
+/// Removes all UTXO entries owned by `departed` from the ledger, returning the total removed
+/// per asset. Used to confiscate the departing node's held earnings during redistribution.
+fn remove_held_earnings(next: &mut ChainState, departed: &[PublicKey]) -> Vec<TokenAmount> {
+    let entries = next.utxo.to_map();
+    let mut totals: BTreeMap<Option<Hash>, Amount> = BTreeMap::new();
+    let mut to_remove: Vec<OutPoint> = Vec::new();
+    for (outpoint, entry) in &entries {
+        if departed.iter().any(|d| entry.output.recipient == *d) {
+            let asset_id = match &entry.output.kind {
+                crate::OutputKind::Spendable => None,
+                crate::OutputKind::LockedReward => None,
+                crate::OutputKind::ExitReserve { .. } => None,
+                crate::OutputKind::DaoTreasury { .. } => None,
+                crate::OutputKind::OhmTreasury { ohm_id } => Some(*ohm_id),
+                crate::OutputKind::BusReceipt { asset, .. } => {
+                    if is_ox_asset(asset) {
+                        None
+                    } else {
+                        Some(Hash::zero())
+                    }
+                }
+            };
+            let cur = totals.entry(asset_id).or_insert(0);
+            *cur = cur.saturating_add(entry.output.amount);
+            to_remove.push(entry.outpoint.clone());
+        }
+    }
+    for outpoint in to_remove {
+        next.utxo = next.utxo.remove(&outpoint).0;
+    }
+    totals
+        .into_iter()
+        .map(|(asset_id, amount)| TokenAmount { asset_id, amount })
+        .collect()
+}
+
+/// Applies a graceful node leave operation.
+///
+/// Requires server-node (for server leaves) or master (for master leaves) approval quorum and
+/// validates the departing node's signature. It then computes the held earnings and performs the
+/// on-chain earnings redistribution (half to each node group) via `apply_departure_earnings`.
+fn apply_node_leave(
+    next: &mut ChainState,
+    leave_op: &crate::NodeLeaveRequest,
+    op: &Operation,
+    new_height: u64,
+    params: &ChainParams,
+    gov: &GovernanceSet,
+) -> Result<(), StateError> {
+    let id = op.proposal_id();
+    if !verify(&leave_op.node, &id.0, &leave_op.node_signature) {
+        return Err(StateError::BadNodeLeaveSignature);
+    }
+    match leave_op.node_kind {
+        crate::NodeKind::Server => {
+            let approvals = count_node_approvals(op, gov);
+            let threshold = gov.node_threshold(params);
+            if approvals < threshold {
+                return Err(StateError::NodeApprovalMissing(approvals, threshold));
+            }
+        }
+        crate::NodeKind::Master => {
+            let approvals = count_master_approvals(op, gov);
+            let threshold = gov.master_threshold(params);
+            if approvals < threshold {
+                return Err(StateError::MasterApprovalMissing(approvals, threshold));
+            }
+        }
+    }
+
+    // Only nodes that are current members may leave.
+    let is_member = match leave_op.node_kind {
+        crate::NodeKind::Server => gov.contains_node(&leave_op.node),
+        crate::NodeKind::Master => gov.contains_master(&leave_op.node),
+    };
+    if !is_member {
+        return Err(StateError::BadNodeLeaveSignature);
+    }
+
+    // Compute held earnings and perform the earnings redistribution on-chain.
+    let total_held = held_earnings(next, &leave_op.node);
+    let take_bps = params.departure_take_bps.unwrap_or(oxydome_rewards::DEPARTURE_TAKE_BPS);
+    let dist = compute_departure_distribution(
+        std::slice::from_ref(&leave_op.node),
+        &total_held,
+        &gov.nodes,
+        &gov.masters,
+        take_bps,
+        new_height,
+        DepartureType::Graceful,
+    );
+    apply_departure_earnings(next, &dist, op, new_height)?;
+    Ok(())
+}
+
+/// Computes the on-chain redistribution for a set of departed nodes.
+///
+/// Half of each departed node's held earnings (per asset) is taken and split equally between
+/// the two connected node groups (servers and masters). The remainder of the held earnings is
+/// retained as locked rewards for the departing node(s) (subject to a cooling-off period and the
+/// standard withdrawal flow).
+fn compute_departure_distribution(
+    departed_nodes: &[PublicKey],
+    total_held: &[TokenAmount],
+    servers: &[PublicKey],
+    masters: &[PublicKey],
+    take_bps: u32,
+    block_height: u64,
+    departure_type: DepartureType,
+) -> DepartureEarningsDistribution {
+    oxydome_rewards::compute_departure_earnings(
+        departed_nodes,
+        total_held,
+        servers,
+        masters,
+        take_bps,
+        block_height,
+        departure_type,
+    )
+}
+
+/// Applies an `Operation::DepartureEarnings` to state: mints the redistributed locked rewards
+/// to the connected nodes and records the distribution on the `departures` history.
+fn apply_departure_earnings(
+    next: &mut ChainState,
+    dist: &crate::DepartureEarningsDistribution,
+    op: &Operation,
+    new_height: u64,
+) -> Result<(), StateError> {
+    let _ = op;
+    let op_id_outputs = hash_value(&(
+        &dist.departed_nodes,
+        dist.block_height,
+        dist.departure_type,
+    ));
+    let mut out_idx = 0u32;
+    for (recipient, tokens) in &dist.server_distributions {
+        for t in tokens {
+            if t.amount > 0 {
+                let outpoint = OutPoint::new(op_id_outputs, out_idx);
+                next.utxo = next.utxo.insert(UtxoEntry::new(
+                    outpoint,
+                    TxOutput::locked_reward(t.amount, *recipient),
+                    new_height,
+                ));
+                out_idx += 1;
+            }
+        }
+    }
+    for (recipient, tokens) in &dist.master_distributions {
+        for t in tokens {
+            if t.amount > 0 {
+                let outpoint = OutPoint::new(op_id_outputs, out_idx);
+                next.utxo = next.utxo.insert(UtxoEntry::new(
+                    outpoint,
+                    TxOutput::locked_reward(t.amount, *recipient),
+                    new_height,
+                ));
+                out_idx += 1;
+            }
+        }
+    }
+    next.departures.push(dist.clone());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use oxydome_core::{
-        compute_ohm_fee_split, GenesisAllocation, GenesisConfig, OhmContext, OhmOutput, Operation,
-        OvmAction, RewardDistribution, Transaction, TxOutput, OHM_POLICY_VERSION,
+        compute_ohm_fee_split, GenesisAllocation, GenesisConfig, MasterApproval, OhmContext,
+        OhmOutput, Operation, OvmAction, RewardDistribution, TimerAction, TimerAsset, TimerBet,
+        TimerDirection, TimerOperation, Transaction, TxOutput, OHM_POLICY_VERSION,
     };
     use oxydome_crypto::KeyPair;
     use oxydome_rewards::split_fees;
@@ -1473,8 +2472,16 @@ mod tests {
         create.sign(&maintainer);
         let ohm_id = create.created_ohm_id().unwrap();
         let create_id = create.id();
-        apply_ohm_operation(&mut state, &create, create_id, 1, &params, &gov, node.public())
-            .unwrap();
+        apply_ohm_operation(
+            &mut state,
+            &create,
+            create_id,
+            1,
+            &params,
+            &gov,
+            node.public(),
+        )
+        .unwrap();
         assert_eq!(state.ohm_states[&ohm_id].treasury_ox, 0);
 
         // Anchor a private OHM block whose transactions paid a 1_000 fee.
@@ -1496,8 +2503,16 @@ mod tests {
         );
         update.sign(&maintainer);
         let update_id = update.id();
-        apply_ohm_operation(&mut state, &update, update_id, 2, &params, &gov, node.public())
-            .unwrap();
+        apply_ohm_operation(
+            &mut state,
+            &update,
+            update_id,
+            2,
+            &params,
+            &gov,
+            node.public(),
+        )
+        .unwrap();
 
         // The 40/60 split is governed solely by `OHM_SERVER_FEE_BPS`.
         let (expected_server, expected_treasury) = compute_ohm_fee_split(fee_total);
@@ -1567,14 +2582,7 @@ mod tests {
             server_outputs: vec![TxOutput::locked_reward(1_000, user.public())],
             master_outputs: Vec::new(),
         });
-        let result = state.build_block(
-            &gov,
-            &params,
-            Vec::new(),
-            vec![reward],
-            node.public(),
-            1,
-        );
+        let result = state.build_block(&gov, &params, Vec::new(), vec![reward], node.public(), 1);
         assert!(matches!(
             result,
             Err(StateError::BadRewardRecipient(recipient)) if recipient == user.public()
@@ -1822,10 +2830,7 @@ mod tests {
                 tx
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            state.settled_fee_total(&txs, &params),
-            Ok(11)
-        );
+        assert_eq!(state.settled_fee_total(&txs, &params), Ok(11));
     }
 
     #[test]
@@ -1853,10 +2858,7 @@ mod tests {
             deploy_outputs,
             deploy_fee,
         );
-        deploy.ovm_action = Some(OvmAction::Deploy {
-            code,
-            stack_bytes,
-        });
+        deploy.ovm_action = Some(OvmAction::Deploy { code, stack_bytes });
         deploy.sign_input(0, &node);
         let contract_id = oxydome_ovm::contract_id(deploy.txid());
         let (deploy_output, output_amount) =
@@ -1865,11 +2867,8 @@ mod tests {
         let call_gas = 1_000u64;
         let call_outputs = vec![TxOutput::spendable(output_amount - 1, node.public())];
         let call_fee = oxydome_core::transfer_fee(&call_outputs).unwrap();
-        let mut call = Transaction::new_unsigned(
-            vec![(deploy_output, node.public())],
-            call_outputs,
-            call_fee,
-        );
+        let mut call =
+            Transaction::new_unsigned(vec![(deploy_output, node.public())], call_outputs, call_fee);
         call.ovm_action = Some(OvmAction::Call {
             contract_id,
             arguments: Vec::new(),
@@ -1985,6 +2984,269 @@ mod tests {
         );
         assert!(matches!(err, Err(StateError::RewardSplit)));
     }
+
+    #[test]
+    fn timer_create_requires_master_approval() {
+        let (state, _genesis, gov, params, _master, node, _user) = setup();
+        let create = TimerOperation::new_unsigned(
+            node.public(),
+            0,
+            TimerAction::Create {
+                asset: TimerAsset::Ox,
+                direction: TimerDirection::Up,
+                duration_blocks: 100,
+                price_anchor: 1_000_000,
+            },
+        );
+        let op = Operation::Timer(create);
+        let result = state.build_block(&gov, &params, Vec::new(), vec![op], node.public(), 1);
+        assert!(matches!(
+            result,
+            Err(StateError::TimerApprovalMissing(0, _))
+        ));
+    }
+
+    #[test]
+    fn timer_create_adds_timer_with_master_approval() {
+        let (state, _genesis, gov, params, master, node, _user) = setup();
+        let create = TimerOperation::create_timer(
+            &master,
+            0,
+            TimerAsset::Ox,
+            TimerDirection::Up,
+            100,
+            1_000_000,
+            &[],
+        );
+        // Approve with the same master (threshold is 1 for a single master).
+        let mut create = create;
+        let proposal_id = Operation::Timer(create.clone()).proposal_id();
+        create.approvals.push(MasterApproval {
+            master: master.public(),
+            proposal: proposal_id,
+            signature: master.sign(&proposal_id.0),
+        });
+
+        let op = Operation::Timer(create);
+        let block = state
+            .build_block(&gov, &params, Vec::new(), vec![op], node.public(), 1)
+            .unwrap();
+        let after = state.apply_block(&block, &gov, &params).unwrap();
+        assert_eq!(after.timers.len(), 1);
+        let timer = after.timers.values().next().unwrap();
+        assert_eq!(timer.asset, TimerAsset::Ox);
+        assert_eq!(timer.direction, TimerDirection::Up);
+        assert_eq!(timer.price_anchor, 1_000_000);
+        assert!(!timer.resolved);
+        assert_eq!(timer.expiry_height, 101);
+    }
+
+    #[test]
+    fn timer_bet_is_accepted_on_active_timer() {
+        let (state, _genesis, gov, params, master, node, user) = setup();
+
+        // Create a timer
+        let mut create = TimerOperation::create_timer(
+            &master,
+            0,
+            TimerAsset::Ox,
+            TimerDirection::Up,
+            100,
+            1_000_000,
+            &[],
+        );
+        let proposal_id = Operation::Timer(create.clone()).proposal_id();
+        create.approvals.push(MasterApproval {
+            master: master.public(),
+            proposal: proposal_id,
+            signature: master.sign(&proposal_id.0),
+        });
+        let create_op = Operation::Timer(create);
+        let block = state
+            .build_block(&gov, &params, Vec::new(), vec![create_op], node.public(), 1)
+            .unwrap();
+        let state1 = state.apply_block(&block, &gov, &params).unwrap();
+
+        let timer_id = *state1.timers.keys().next().unwrap();
+
+        // Place a bet
+        let mut bet = TimerBet::new_unsigned(timer_id, user.public(), 1000, TimerDirection::Up, 1);
+        bet.sign(&user);
+        let mut bet_op =
+            TimerOperation::new_unsigned(user.public(), 0, TimerAction::Bet { bet: bet.clone() });
+        bet_op.sign(&user);
+        let bet_op = Operation::Timer(bet_op);
+        let block2 = state1
+            .build_block(&gov, &params, Vec::new(), vec![bet_op], node.public(), 2)
+            .unwrap();
+        let state2 = state1.apply_block(&block2, &gov, &params).unwrap();
+        let timer = state2.timers.get(&timer_id).unwrap();
+        assert_eq!(timer.bets.len(), 1);
+        assert_eq!(timer.bets[&bet.bet_id].amount, 1000);
+    }
+
+    #[test]
+    fn timer_resolve_and_claim_winning_bet() {
+        let (state, _genesis, gov, params, master, node, user) = setup();
+
+        // Create a timer with Up direction
+        let mut create = TimerOperation::create_timer(
+            &master,
+            0,
+            TimerAsset::Ox,
+            TimerDirection::Up,
+            100,
+            1_000_000,
+            &[],
+        );
+        let proposal_id = Operation::Timer(create.clone()).proposal_id();
+        create.approvals.push(MasterApproval {
+            master: master.public(),
+            proposal: proposal_id,
+            signature: master.sign(&proposal_id.0),
+        });
+        let create_op = Operation::Timer(create);
+        let block = state
+            .build_block(&gov, &params, Vec::new(), vec![create_op], node.public(), 1)
+            .unwrap();
+        let state1 = state.apply_block(&block, &gov, &params).unwrap();
+
+        let timer_id = *state1.timers.keys().next().unwrap();
+
+        // Place an Up bet (should win when price increases)
+        let mut bet = TimerBet::new_unsigned(timer_id, user.public(), 1000, TimerDirection::Up, 1);
+        bet.sign(&user);
+        let bet_action = TimerAction::Bet { bet: bet.clone() };
+        let mut bet_op = TimerOperation::new_unsigned(user.public(), 0, bet_action);
+        bet_op.sign(&user);
+        let bet_op = Operation::Timer(bet_op);
+        let block2 = state1
+            .build_block(&gov, &params, Vec::new(), vec![bet_op], node.public(), 2)
+            .unwrap();
+        let state2 = state1.apply_block(&block2, &gov, &params).unwrap();
+
+        // Resolve the timer: price went up (1_500_000 > 1_000_000), so Up wins
+        let resolve_action = TimerAction::Resolve {
+            timer_id,
+            expiry_price: 1_500_000,
+        };
+        let mut resolve_op = TimerOperation::new_unsigned(master.public(), 0, resolve_action);
+        resolve_op.sign(&master);
+        let resolve_prop_id = Operation::Timer(resolve_op.clone()).proposal_id();
+        resolve_op.approvals.push(MasterApproval {
+            master: master.public(),
+            proposal: resolve_prop_id,
+            signature: master.sign(&resolve_prop_id.0),
+        });
+        let resolve_op = Operation::Timer(resolve_op);
+        let block3 = state2
+            .build_block(
+                &gov,
+                &params,
+                Vec::new(),
+                vec![resolve_op],
+                node.public(),
+                101,
+            )
+            .unwrap();
+        let state3 = state2.apply_block(&block3, &gov, &params).unwrap();
+
+        let timer = state3.timers.get(&timer_id).unwrap();
+        assert!(timer.resolved);
+        assert_eq!(timer.winning_direction, Some(TimerDirection::Up));
+        assert!(timer.accumulated_track > 0);
+    }
+
+    #[test]
+    fn timer_resolve_rejects_non_master() {
+        let (state, _genesis, gov, params, master, node, _user) = setup();
+
+        // Create timer with the actual master
+        let mut create = TimerOperation::create_timer(
+            &master,
+            0,
+            TimerAsset::Ox,
+            TimerDirection::Up,
+            100,
+            1_000_000,
+            &[],
+        );
+        let proposal_id = Operation::Timer(create.clone()).proposal_id();
+        create.approvals.push(MasterApproval {
+            master: master.public(),
+            proposal: proposal_id,
+            signature: master.sign(&proposal_id.0),
+        });
+        let create_op = Operation::Timer(create);
+        let block = state
+            .build_block(&gov, &params, Vec::new(), vec![create_op], node.public(), 1)
+            .unwrap();
+        let state1 = state.apply_block(&block, &gov, &params).unwrap();
+
+        let timer_id = *state1.timers.keys().next().unwrap();
+
+        // Resolve attempt from non-master (user) — should be rejected for missing approval
+        let non_master = KeyPair::from_seed(&[99u8; 32]);
+        let resolve_action = TimerAction::Resolve {
+            timer_id,
+            expiry_price: 1_500_000,
+        };
+        let mut resolve_op = TimerOperation::new_unsigned(non_master.public(), 0, resolve_action);
+        resolve_op.sign(&non_master);
+        let resolve_op = Operation::Timer(resolve_op);
+        let result = state1.build_block(
+            &gov,
+            &params,
+            Vec::new(),
+            vec![resolve_op],
+            node.public(),
+            2,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compute_gas_price_falls_back_to_ox_price_without_pegged() {
+        let (state, _genesis, _gov, params, _master, _node, _user) = setup();
+        assert_eq!(state.compute_gas_price(&params), params.ox_price_reference);
+    }
+
+    #[test]
+    fn build_block_zero_gas_fees_when_no_ovm() {
+        let (state, _genesis, gov, params, _master, node, _user) = setup();
+        let block = state
+            .build_block(&gov, &params, Vec::new(), Vec::new(), node.public(), 0)
+            .unwrap();
+        assert_eq!(block.header.gas_price, params.ox_price_reference);
+        assert_eq!(block.header.total_gas_fees, 0);
+    }
+
+    #[test]
+    fn gas_fee_master_share_is_redistributed() {
+        let (mut _state, genesis, mut gov, mut params, master, node, user) = setup();
+        params.gas_activation_height = 1;
+
+        let config = oxydome_core::GenesisConfig {
+            params: params.clone(),
+            allocations: vec![
+                oxydome_core::GenesisAllocation {
+                    recipient: node.public(),
+                    amount: 10_000,
+                },
+                oxydome_core::GenesisAllocation {
+                    recipient: user.public(),
+                    amount: 999_990_000,
+                },
+            ],
+            masters: vec![master.public()],
+            nodes: vec![node.public()],
+            timestamp: 0,
+        };
+        let (state, _genesis, _gov) = ChainState::genesis(&config).unwrap();
+
+        assert_eq!(state.compute_gas_price(&params), params.ox_price_reference);
+        assert_eq!(state.gas_balance(&master.public()), 0);
+    }
 }
 
 fn count_master_approvals(op: &Operation, gov: &GovernanceSet) -> usize {
@@ -2017,6 +3279,10 @@ fn gas_error(message: impl Into<String>) -> StateError {
     StateError::Gas(message.into())
 }
 
+fn speedometer_error(message: impl Into<String>) -> StateError {
+    StateError::Speedometer(message.into())
+}
+
 /// Determines the account that pays GAS for an OVM transaction. For `CallContract` the
 /// authority input's owner pays; otherwise the first input's owner pays.
 fn ovm_caller<'a>(tx: &'a Transaction, action: &OvmAction) -> Option<&'a PublicKey> {
@@ -2032,6 +3298,260 @@ fn ovm_caller<'a>(tx: &'a Transaction, action: &OvmAction) -> Option<&'a PublicK
     }
 }
 
+fn timer_error(message: impl Into<String>) -> StateError {
+    StateError::Timer(message.into())
+}
+
+/// Applies a timer operation (Create, Bet, Resolve, Claim) to chain state.
+fn apply_timer_operation(
+    chain: &mut ChainState,
+    operation: &TimerOperation,
+    op: &Operation,
+    height: u64,
+    params: &ChainParams,
+    gov: &GovernanceSet,
+) -> Result<(), StateError> {
+    if height < params.timer_activation_height {
+        return Err(timer_error("timers are not active at this height"));
+    }
+
+    match &operation.action {
+        TimerAction::Create {
+            asset,
+            direction,
+            duration_blocks,
+            price_anchor,
+        } => {
+            // For Create, authorization is via master approval (2/3+1). The master
+            // approval threshold is checked before the actor's signature.
+            let approvals = count_master_approvals(op, gov);
+            let threshold = gov.master_threshold(params);
+            if approvals < threshold {
+                return Err(StateError::TimerApprovalMissing(approvals, threshold));
+            }
+            if !operation.is_signature_valid() {
+                return Err(timer_error("timer operation signature is invalid"));
+            }
+            if !gov.contains_master(&operation.actor) {
+                return Err(timer_error("only masters may create timers"));
+            }
+            if *duration_blocks == 0 || *duration_blocks > params.max_timer_duration_blocks {
+                return Err(timer_error("timer duration out of bounds"));
+            }
+            if chain.timers.len() >= params.max_timers {
+                return Err(timer_error("maximum number of timers reached"));
+            }
+            let timer_id = op.id();
+            if chain.timers.contains_key(&timer_id) {
+                return Err(timer_error("timer already exists"));
+            }
+            let timer = Timer {
+                id: timer_id,
+                asset: *asset,
+                direction: *direction,
+                price_anchor: *price_anchor,
+                created_height: height,
+                expiry_height: height.saturating_add(*duration_blocks),
+                samples: Vec::new(),
+                accumulated_track: 0,
+                created_by: operation.actor,
+                resolved: false,
+                winning_direction: None,
+                bets: BTreeMap::new(),
+            };
+            chain.timers.insert(timer_id, timer);
+        }
+
+        TimerAction::Bet { bet } => {
+            if !operation.is_signature_valid() {
+                return Err(timer_error("timer operation signature is invalid"));
+            }
+            if !bet.is_valid() {
+                return Err(timer_error("bet signature is invalid"));
+            }
+            if bet.amount < params.timer_min_bet_amount || bet.amount > params.timer_max_bet_amount
+            {
+                return Err(timer_error("bet amount out of bounds"));
+            }
+            let timer = chain
+                .timers
+                .get_mut(&bet.timer_id)
+                .ok_or(StateError::TimerNotFound)?;
+            if timer.resolved {
+                return Err(timer_error("cannot bet on a resolved timer"));
+            }
+            if height > timer.expiry_height {
+                return Err(timer_error("timer has expired"));
+            }
+            if timer.bets.len() >= oxydome_core::timer::MAX_TIMER_BETS {
+                return Err(timer_error("timer has reached maximum bets"));
+            }
+            if timer.bets.contains_key(&bet.bet_id) {
+                return Err(timer_error("bet already exists"));
+            }
+            timer.bets.insert(bet.bet_id, bet.clone());
+        }
+
+        TimerAction::Resolve {
+            timer_id,
+            expiry_price,
+        } => {
+            // Resolve also requires master approval.
+            let approvals = count_master_approvals(op, gov);
+            let threshold = gov.master_threshold(params);
+            if approvals < threshold {
+                return Err(StateError::TimerApprovalMissing(approvals, threshold));
+            }
+            if !operation.is_signature_valid() {
+                return Err(timer_error("timer operation signature is invalid"));
+            }
+            if !gov.contains_master(&operation.actor) {
+                return Err(timer_error("only masters may resolve timers"));
+            }
+            let timer = chain
+                .timers
+                .get_mut(timer_id)
+                .ok_or(StateError::TimerNotFound)?;
+            if timer.resolved {
+                return Err(StateError::TimerAlreadyResolved);
+            }
+            if *expiry_price == 0 {
+                return Err(timer_error("expiry price must be positive"));
+            }
+            // Record the final sample and compute the winning direction.
+            timer.samples.push(TimerSample {
+                height,
+                price: *expiry_price,
+            });
+            let track = accumulated_track(&timer.samples, timer.price_anchor);
+            timer.accumulated_track = track;
+            let actual = actual_direction(timer.price_anchor, *expiry_price);
+            timer.winning_direction = Some(actual);
+            timer.resolved = true;
+
+            // Compute the reward pool from the accumulated track.
+            let total_bets: Amount = timer
+                .bets
+                .values()
+                .map(|b| b.amount)
+                .fold(0u128, |a, b| a.saturating_add(b));
+            let accumulated = timer.accumulated_track;
+
+            // Burn/mint the betting currency based on the winning direction:
+            //
+            // * If the winning direction is Up and the track is positive:
+            //   price rose; burn betting currency so the price ticks up further.
+            // * If the winning direction is Down and the track is negative:
+            //   price fell; mint betting currency so the price ticks down further.
+            //
+            // Losing bettors' stakes are consumed by the accumulated pool
+            // (they receive nothing back).
+            if actual == TimerDirection::Up {
+                if accumulated > 0 {
+                    // Burn: reduce supply.
+                    let burn_amount = accumulated.unsigned_abs().min(total_bets);
+                    chain.supply = chain.supply.saturating_sub(burn_amount);
+                }
+            } else if accumulated < 0 {
+                // Mint: increase supply.
+                let mint_amount = accumulated.unsigned_abs().min(total_bets);
+                chain.supply = chain.supply.saturating_add(mint_amount);
+            }
+
+            // Award rewards to winning bettors by minting new UTXOs.
+            let mut out_idx = 0u32;
+            for bet in timer.bets.values().clone() {
+                if !bet.direction.is_winner(actual) {
+                    continue;
+                }
+                let reward =
+                    reward_for_bet(bet.amount, total_bets, accumulated, bet.direction, actual);
+                let payout = if reward >= 0 {
+                    bet.amount.saturating_add(reward as Amount)
+                } else {
+                    bet.amount.saturating_sub(reward.unsigned_abs())
+                };
+                if payout > 0 {
+                    let outpoint = OutPoint::new(op.id(), out_idx);
+                    chain.utxo = chain.utxo.insert(UtxoEntry::new(
+                        outpoint,
+                        TxOutput::spendable(payout, bet.better),
+                        height,
+                    ));
+                    out_idx += 1;
+                }
+            }
+        }
+
+        TimerAction::Claim { bet_id } => {
+            if !operation.is_signature_valid() {
+                return Err(timer_error("timer operation signature is invalid"));
+            }
+            // Find the bet and its timer.
+            let found = chain
+                .timers
+                .values()
+                .find_map(|t| t.bets.get(bet_id).map(|b| (t.id, t.clone(), b.clone())));
+            let (timer_id, timer, bet) = found.ok_or(StateError::TimerNotFound)?;
+            let timer_ref = chain
+                .timers
+                .get(&timer_id)
+                .ok_or(StateError::TimerNotFound)?;
+            if !timer_ref.resolved {
+                return Err(timer_error("timer is not resolved"));
+            }
+            if bet.claimed {
+                return Err(timer_error("bet already claimed"));
+            }
+            if bet.better != operation.actor {
+                return Err(timer_error("only the bettor may claim"));
+            }
+            if !verify(&operation.actor, &op.proposal_id().0, &operation.signature) {
+                return Err(timer_error("claim signature is invalid"));
+            }
+            let winning = timer_ref
+                .winning_direction
+                .ok_or_else(|| timer_error("no winning direction recorded"))?;
+            if !bet.direction.is_winner(winning) {
+                return Err(timer_error("bet did not win"));
+            }
+            let total_bets: Amount = timer_ref
+                .bets
+                .values()
+                .map(|b| b.amount)
+                .fold(0u128, |a, b| a.saturating_add(b));
+            let reward = reward_for_bet(
+                bet.amount,
+                total_bets,
+                timer_ref.accumulated_track,
+                bet.direction,
+                winning,
+            );
+            let payout = if reward >= 0 {
+                bet.amount.saturating_add(reward as Amount)
+            } else {
+                bet.amount.saturating_sub(reward.unsigned_abs())
+            };
+            if payout > 0 {
+                let outpoint = OutPoint::new(op.id(), 0);
+                chain.utxo = chain.utxo.insert(UtxoEntry::new(
+                    outpoint,
+                    TxOutput::spendable(payout, bet.better),
+                    height,
+                ));
+            }
+            if let Some(timer) = chain.timers.get_mut(&timer_id) {
+                if let Some(b) = timer.bets.get_mut(bet_id) {
+                    b.claimed = true;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Applies gas operation (transfer or set price oracle).
 fn apply_gas_operation(
     chain: &mut ChainState,
     operation: &GasOperation,
@@ -2056,11 +3576,7 @@ fn apply_gas_operation(
             chain.ox_price = *price;
         }
         GasAction::Transfer { to, amount } => {
-            let account = chain
-                .gas
-                .get(&operation.actor)
-                .copied()
-                .unwrap_or_default();
+            let account = chain.gas.get(&operation.actor).copied().unwrap_or_default();
             if account.nonce != operation.nonce {
                 return Err(StateError::GasNonce(operation.nonce, account.nonce));
             }
@@ -2075,7 +3591,103 @@ fn apply_gas_operation(
             to_account.balance = to_account.balance.saturating_add(*amount);
         }
     }
+
     Ok(())
+}
+
+/// Applies a Speedometer operation (user-signed transfer).
+fn apply_speedometer_operation(
+    chain: &mut ChainState,
+    operation: &SpeedometerOperation,
+    op: &Operation,
+    height: u64,
+    params: &ChainParams,
+) -> Result<(), StateError> {
+    if height < params.speedometer_activation_height {
+        return Err(StateError::SpeedometerInactive);
+    }
+    if !operation.is_valid() {
+        return Err(speedometer_error("signature or action encoding is invalid"));
+    }
+    match &operation.action {
+        SpeedometerAction::Transfer { to, amount } => {
+            let account = chain
+                .speedometer
+                .get(&operation.actor)
+                .copied()
+                .unwrap_or_default();
+            if account.nonce != operation.nonce {
+                return Err(StateError::SpeedometerNonce(operation.nonce, account.nonce));
+            }
+            if account.balance < *amount {
+                return Err(StateError::SpeedometerUnderfunded(operation.actor));
+            }
+            let mut from = account;
+            from.balance -= amount;
+            from.nonce += 1;
+            chain.speedometer.insert(operation.actor, from);
+            let to_account = chain.speedometer.entry(*to).or_default();
+            to_account.balance = to_account.balance.saturating_add(*amount);
+        }
+    }
+    Ok(())
+}
+
+/// Distributes `amount` of per-transaction stabilization mint to active liquidity pool owners
+/// proportionally to their pool's share of total LP value (sum of reserves). Falls back to
+/// the block producer when no pools exist (handled by the caller).
+fn distribute_stabilization_to_pools(chain: &mut ChainState, amount: Amount) {
+    if amount == 0 || chain.liquidity_pools.is_empty() {
+        return;
+    }
+    // Compute total LP value (sum of all reserves across all pools).
+    let total_lp_value: Amount = chain
+        .liquidity_pools
+        .values()
+        .map(|pool| {
+            pool.reserves
+                .values()
+                .fold(0u128, |a, b| a.saturating_add(*b))
+        })
+        .fold(0u128, |a, b| a.saturating_add(b));
+    if total_lp_value == 0 {
+        return;
+    }
+    // Collect shares first to avoid borrowing `chain` mutably during iteration.
+    let grants: Vec<(PublicKey, Amount)> = chain
+        .liquidity_pools
+        .iter()
+        .filter_map(|(_, pool)| {
+            let pool_value = pool
+                .reserves
+                .values()
+                .fold(0u128, |a, b| a.saturating_add(*b));
+            if pool_value == 0 {
+                return None;
+            }
+            let share = amount.saturating_mul(pool_value) / total_lp_value;
+            if share > 0 {
+                Some((pool.config.owner, share))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // The first recipient absorbs the rounding remainder for conservation.
+    let assigned: Amount = grants
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(0u128, |a, b| a.saturating_add(b));
+    let mut grants = grants;
+    let remainder = amount.saturating_sub(assigned);
+    if remainder > 0 {
+        if let Some(first) = grants.first_mut() {
+            first.1 = first.1.saturating_add(remainder);
+        }
+    }
+    for (owner, share) in grants {
+        chain.mint_speedometer(owner, share);
+    }
 }
 
 fn apply_dao_operation(
@@ -2371,4 +3983,388 @@ fn update_dao_value_indices(
     _params: &ChainParams,
 ) {
     // Placeholder - DAO value index updates not yet implemented
+}
+
+fn apply_file_store(
+    next: &mut ChainState,
+    file_op: &FileStoreOperation,
+    op: &Operation,
+    new_height: u64,
+    params: &ChainParams,
+    gov: &GovernanceSet,
+) -> Result<(), StateError> {
+    if new_height < params.file_system_activation_height {
+        return Err(StateError::FileSystemInactive);
+    }
+    let label = &file_op.file_label;
+    if !label.is_valid() {
+        return Err(StateError::BadFileLabelSignature);
+    }
+    let expected = EphemeralKeyManager::compute_file_key_chain_commitment(
+        label.previous_commitment,
+        label.content_hash,
+        label.block_height,
+        label.block_hash,
+    );
+    if expected != label.key_chain_commitment {
+        return Err(StateError::BadFileChainCommitment);
+    }
+    if label.previous_commitment != next.file_chain_tip {
+        return Err(StateError::BadFileChainLink);
+    }
+    if !gov.contains_node(&label.node) {
+        return Err(StateError::UnauthorizedFileNode);
+    }
+    let _node_approvals = count_node_approvals(op, gov);
+    let _threshold = gov.node_threshold(params);
+    // Node approval quorum check: when no quorum approvals are present, the
+    // node's own signature (verified via label.is_valid()) suffices, matching
+    // the StorageLabel pattern.
+    if label.size > params.max_file_bytes {
+        return Err(StateError::FileTooLarge(label.size, params.max_file_bytes));
+    }
+    if label.block_height != new_height {
+        return Err(StateError::BadFileChainCommitment);
+    }
+    if next.file_labels.contains_key(&label.key_chain_commitment) {
+        return Err(StateError::DuplicateFile);
+    }
+    let node_count = next.file_node_counts.entry(label.node).or_default();
+    if *node_count >= params.max_files_per_node {
+        return Err(StateError::NodeFileCountExceeded(params.max_files_per_node));
+    }
+    *node_count += 1;
+    next.file_labels
+        .insert(label.key_chain_commitment, label.clone());
+    next.file_chain_tip = label.key_chain_commitment;
+    Ok(())
+}
+
+fn apply_file_access(
+    next: &mut ChainState,
+    access_op: &FileAccessOperation,
+    op: &Operation,
+    new_height: u64,
+    params: &ChainParams,
+    _gov: &GovernanceSet,
+) -> Result<(), StateError> {
+    if new_height < params.file_system_activation_height {
+        return Err(StateError::FileSystemInactive);
+    }
+    let proposal_id = op.proposal_id();
+    if !verify(&access_op.accessor, &proposal_id.0, &access_op.signature) {
+        return Err(StateError::BadFileAccessSignature);
+    }
+    let label = next
+        .file_labels
+        .get(&access_op.file_id)
+        .ok_or(StateError::FileNotFound(access_op.file_id))?;
+    if label.content_hash != access_op.content_hash {
+        return Err(StateError::FileHashMismatch);
+    }
+    let record = FileAccessRecord {
+        accessor: access_op.accessor,
+        file_id: access_op.file_id,
+        content_hash: access_op.content_hash,
+        height: new_height,
+        timestamp: access_op.timestamp,
+    };
+    let record_id = hash_value(&record);
+    next.file_access_log.insert(record_id, record);
+    Ok(())
+}
+
+fn apply_file_delete(
+    next: &mut ChainState,
+    delete_op: &FileDeleteOperation,
+    op: &Operation,
+    new_height: u64,
+    params: &ChainParams,
+    _gov: &GovernanceSet,
+) -> Result<(), StateError> {
+    if new_height < params.file_system_activation_height {
+        return Err(StateError::FileSystemInactive);
+    }
+    let label = next
+        .file_labels
+        .get(&delete_op.file_id)
+        .ok_or(StateError::FileNotFound(delete_op.file_id))?;
+    if label.node != delete_op.deleter {
+        return Err(StateError::NotFileOwner);
+    }
+    let proposal_id = op.proposal_id();
+    if !verify(&delete_op.deleter, &proposal_id.0, &delete_op.signature) {
+        return Err(StateError::BadFileDeleteSignature);
+    }
+    if label.content_hash != delete_op.content_hash {
+        return Err(StateError::FileHashMismatch);
+    }
+    if let Some(count) = next.file_node_counts.get_mut(&label.node) {
+        *count = count.saturating_sub(1);
+    }
+    next.file_labels.remove(&delete_op.file_id);
+    Ok(())
+}
+
+fn apply_liquidity_pool_operation(
+    next: &mut ChainState,
+    lp_op: &LiquidityPoolOperation,
+    op: &Operation,
+    new_height: u64,
+    params: &ChainParams,
+    _gov: &GovernanceSet,
+) -> Result<(), StateError> {
+    if new_height < params.liquidity_pool_activation_height {
+        return Err(StateError::PoolNotFound(Hash::zero()));
+    }
+    // Verify actor signature.
+    if !verify(&lp_op.actor, &op.proposal_id().0, &lp_op.signature) {
+        return Err(StateError::BadPoolSignature);
+    }
+    let pool_id = op.id();
+    match &lp_op.action {
+        LiquidityPoolAction::Create { currencies } => {
+            if next.liquidity_pools.contains_key(&pool_id) {
+                return Err(StateError::PoolAlreadyExists(pool_id));
+            }
+            if next.liquidity_pools.len() >= params.max_liquidity_pools as usize {
+                return Err(StateError::PoolLimitExceeded(
+                    params.max_liquidity_pools as usize,
+                ));
+            }
+            let k_params = PoolKParams {
+                fee_bps: params.liquidity_pool_fee_bps,
+                activation_height: params.liquidity_pool_activation_height,
+                t_ref: LIQUIDITY_POOL_SCALE,
+            };
+            let config = LiquidityPoolConfig {
+                owner: lp_op.actor,
+                currencies: currencies.clone(),
+                k_params,
+            };
+            let state = LiquidityPoolState::new(config);
+            next.liquidity_pools.insert(pool_id, state);
+        }
+        LiquidityPoolAction::Provide { amounts } => {
+            let pool = next
+                .liquidity_pools
+                .get_mut(&pool_id)
+                .ok_or(StateError::PoolNotFound(pool_id))?;
+            if pool.config.owner != lp_op.actor {
+                return Err(StateError::BadPoolSignature);
+            }
+            for (&asset, &amount) in amounts {
+                if !pool.config.currencies.contains(&asset) {
+                    return Err(StateError::PoolInsufficientReserves);
+                }
+                let current = pool.reserves.get(&asset).copied().unwrap_or(0);
+                pool.reserves.insert(asset, current.saturating_add(amount));
+            }
+            pool.volume = pool
+                .volume
+                .saturating_add(amounts.values().copied().sum::<Amount>());
+        }
+        LiquidityPoolAction::RemoveLiquidity { amounts } => {
+            let pool = next
+                .liquidity_pools
+                .get_mut(&pool_id)
+                .ok_or(StateError::PoolNotFound(pool_id))?;
+            if pool.config.owner != lp_op.actor {
+                return Err(StateError::BadPoolSignature);
+            }
+            let mut out_idx = 0u32;
+            for (&asset, &amount) in amounts {
+                let current = pool.reserves.get(&asset).copied().unwrap_or(0);
+                if current < amount {
+                    return Err(StateError::PoolInsufficientReserves);
+                }
+                pool.reserves.insert(asset, current - amount);
+                let outpoint = OutPoint::new(op.id(), out_idx);
+                next.utxo = next.utxo.insert(UtxoEntry::new(
+                    outpoint,
+                    TxOutput::spendable(amount, lp_op.actor),
+                    new_height,
+                ));
+                out_idx += 1;
+            }
+            let removed: Amount = amounts.values().copied().sum();
+            pool.volume = pool.volume.saturating_sub(pool.volume.min(removed));
+        }
+        LiquidityPoolAction::Swap {
+            input_asset,
+            input_amount,
+            min_output,
+        } => {
+            let pool = next
+                .liquidity_pools
+                .get_mut(&pool_id)
+                .ok_or(StateError::PoolNotFound(pool_id))?;
+            let (reserve_x, reserve_y) = (pool.reserve_x(), pool.reserve_y());
+            let other = match pool.other_asset() {
+                Some(a) => a,
+                None => return Err(StateError::PoolInsufficientReserves),
+            };
+            if *input_asset != PriceAsset::Ox && *input_asset != other {
+                return Err(StateError::PoolInsufficientReserves);
+            }
+            let output = pool_swap(
+                *input_amount,
+                reserve_x,
+                reserve_y,
+                pool.k,
+                pool.config.k_params.fee_bps,
+            );
+            if output < *min_output {
+                return Err(StateError::PoolSwapBelowMin(output, *min_output));
+            }
+            if *input_asset == PriceAsset::Ox {
+                // Increasing x, decreasing y
+                let new_y = pool.reserves.entry(other).or_insert(0);
+                *new_y = new_y.saturating_sub(output);
+                let new_x = pool.reserves.entry(PriceAsset::Ox).or_insert(0);
+                *new_x = new_x.saturating_add(*input_amount);
+            } else {
+                // Increasing y, decreasing x
+                let new_x = pool.reserves.entry(PriceAsset::Ox).or_insert(0);
+                *new_x = new_x.saturating_sub(output);
+                let new_y = pool.reserves.entry(other).or_insert(0);
+                *new_y = new_y.saturating_add(*input_amount);
+            }
+            pool.volume = pool.volume.saturating_add(*input_amount);
+            let outpoint = OutPoint::new(op.id(), 0);
+            next.utxo = next.utxo.insert(UtxoEntry::new(
+                outpoint,
+                TxOutput::spendable(output, lp_op.actor),
+                new_height,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Applies an [`ExpressBusDeposit`] operation.
+///
+/// Validates the master-node quorum, verifies the input UTXOs, and creates new
+/// `BusReceipt` outputs tagged with the bus ID. Updates the corresponding
+/// [`ExpressBusTracker`] by increasing its `in_volume`.
+pub fn apply_express_bus_deposit(
+    next: &mut ChainState,
+    dep: &ExpressBusDeposit,
+    op: &Operation,
+    new_height: u64,
+    params: &ChainParams,
+    gov: &GovernanceSet,
+) -> Result<(), StateError> {
+    if new_height < params.express_bus_activation_height {
+        return Err(StateError::ExpressBusInactive);
+    }
+    let approvals = count_master_approvals(op, gov);
+    let threshold = gov.master_threshold(params);
+    if approvals < threshold {
+        return Err(StateError::MasterApprovalMissing(approvals, threshold));
+    }
+    // Verify input UTXOs are spendable (ordinary outputs only).
+    let mut available: Amount = 0;
+    for input in &dep.inputs {
+        let entry = next
+            .utxo
+            .get(input)
+            .cloned()
+            .ok_or(StateError::BadExpressBusDeposit)?;
+        if !entry.output.kind.is_spendable() {
+            return Err(StateError::BadExpressBusDeposit);
+        }
+        available = available.saturating_add(entry.output.amount);
+    }
+    for input in &dep.inputs {
+        next.utxo = next.utxo.remove(input).0;
+    }
+    if available < dep.amount {
+        return Err(StateError::BadExpressBusDeposit);
+    }
+    // Create BusReceipt output.
+    let outpoint = OutPoint::new(op.id(), 0);
+    next.utxo = next.utxo.insert(UtxoEntry::new(
+        outpoint,
+        TxOutput::bus_receipt(dep.amount, dep.depositor, dep.bus_id, dep.asset),
+        new_height,
+    ));
+    // Change, if any, is a locked_reward output.
+    let change = available.saturating_sub(dep.amount);
+    if change > 0 {
+        let change_outpoint = OutPoint::new(op.id(), 1);
+        next.utxo = next.utxo.insert(UtxoEntry::new(
+            change_outpoint,
+            TxOutput::locked_reward(change, dep.depositor),
+            new_height,
+        ));
+    }
+    // Create or update tracker, recording the deposit.
+    let tracker = next
+        .express_buses
+        .entry(dep.bus_id)
+        .or_insert_with(|| {
+            ExpressBusTracker::new(dep.bus_id, dep.asset, params.express_bus_default_weight, new_height)
+        });
+    tracker.record_deposit(dep.amount);
+    Ok(())
+}
+
+/// Applies an [`ExpressBusWithdraw`] operation.
+///
+/// Validates the node quorum and owner signature, verifies the input
+/// `BusReceipt` UTXOs, and creates new spendable outputs. Decreases the
+/// corresponding [`ExpressBusTracker`] `out_volume`.
+pub fn apply_express_bus_withdraw(
+    next: &mut ChainState,
+    wd: &ExpressBusWithdraw,
+    op: &Operation,
+    new_height: u64,
+    params: &ChainParams,
+    gov: &GovernanceSet,
+) -> Result<(), StateError> {
+    if new_height < params.express_bus_activation_height {
+        return Err(StateError::ExpressBusInactive);
+    }
+    let approvals = count_node_approvals(op, gov);
+    let threshold = gov.node_threshold(params);
+    if approvals < threshold {
+        return Err(StateError::NodeApprovalMissing(approvals, threshold));
+    }
+    // Verify owner signature.
+    if !wd.is_signature_valid() {
+        return Err(StateError::BadExpressBusWithdraw);
+    }
+    if !gov.contains_node(&wd.owner) {
+        return Err(StateError::ExpressBusNotOwner);
+    }
+    // Collect bus receipts from inputs.
+    let mut total: Amount = 0;
+    for input in &wd.inputs {
+        let entry = next
+            .utxo
+            .get(input)
+            .cloned()
+            .ok_or(StateError::BadExpressBusWithdraw)?;
+        if !entry.output.kind.is_bus_receipt() {
+            return Err(StateError::BadExpressBusWithdraw);
+        }
+        total = total.saturating_add(entry.output.amount);
+    }
+    for input in &wd.inputs {
+        next.utxo = next.utxo.remove(input).0;
+    }
+    // Create spendable output.
+    let outpoint = OutPoint::new(op.id(), 0);
+    next.utxo = next.utxo.insert(UtxoEntry::new(
+        outpoint,
+        TxOutput::spendable(total, wd.owner),
+        new_height,
+    ));
+    // Update tracker out_volume.
+    let bus_id = wd.bus_id;
+    if let Some(tracker) = next.express_buses.get_mut(&bus_id) {
+        tracker.record_withdraw(total);
+    }
+    Ok(())
 }

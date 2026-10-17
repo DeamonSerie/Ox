@@ -2,8 +2,11 @@
 //!
 //! Masters accept admission requests and liveness pings. They never store or serve block
 //! bodies, so the server deliberately handles only the messages a master is responsible for.
+//!
+//! Block auditing is performed via `smol::unblock` (see `crate::async_audit`) so that
+//! the tokio TCP accept loop is never blocked by header-only verification.
 
-use crate::MasterNode;
+use crate::{async_audit, MasterNode};
 use oxydome_net::{recv_message, send_message, Message};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -45,7 +48,10 @@ async fn handle_connection(
             } => {
                 let (local_chain_id, mismatch) = {
                     let guard = node.lock().unwrap();
-                    let local_id = crate::mvms::compute_chain_id(&guard.params.chain_name, &guard.params.currency_symbol);
+                    let local_id = crate::mvms::compute_chain_id(
+                        &guard.params.chain_name,
+                        &guard.params.currency_symbol,
+                    );
                     let mismatch = req_chain_id
                         .as_ref()
                         .map(|id| id != &local_id)
@@ -98,12 +104,10 @@ async fn handle_connection(
                 })
             }
             // A leader asks the masters to audit a proposed block.
+            // Uses smol::unblock so the tokio accept loop is not blocked by verification.
             Message::Proposal { package, .. } => {
-                let result = {
-                    let guard = node.lock().unwrap();
-                    guard.audit(&package)
-                };
-                match result {
+                let master_clone = { node.lock().unwrap().clone() };
+                match async_audit::audit_async(&master_clone, &package).await {
                     Ok(attestation) => Some(Message::Attestation { attestation }),
                     Err(e) => {
                         eprintln!("audit failed: {e}");

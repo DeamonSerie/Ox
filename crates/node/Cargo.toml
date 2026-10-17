@@ -15,6 +15,7 @@ oxydome-consensus.workspace = true
 oxydome-audit.workspace = true
 oxydome-rewards.workspace = true
 oxydome-net.workspace = true
+oxydome-bridge.workspace = true
 oxydome-wallet.workspace = true
 sled.workspace = true
 serde.workspace = true
@@ -22,6 +23,8 @@ bincode.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 hex.workspace = true
+smol = "2"
+futures-util = "0.3"
 
 [dev-dependencies]
 oxydome-master.workspace = true

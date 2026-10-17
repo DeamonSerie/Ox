@@ -1,10 +1,9 @@
 //! The node-side OHM ledger: private UTXO state re-derived from anchored [`OhmBlock`]s.
 
 use crate::{
-    ohm_cross_msg_id, ohm_genesis_hash, ohm_state_root_full, Amount, CrossBurnCall,
-    CrossTransferCall, Hash, InboundReceipt, OhmBlock, OhmContract, OhmInput, OhmOutput,
-    OhmTransaction, OhmUtxoEntry, OutboundMessage, OutPoint, PublicKey, TransferPayload,
-    reply_arguments,
+    ohm_cross_msg_id, ohm_genesis_hash, ohm_state_root_full, reply_arguments, Amount,
+    CrossBurnCall, CrossTransferCall, Hash, InboundReceipt, OhmBlock, OhmContract, OhmInput,
+    OhmOutput, OhmTransaction, OhmUtxoEntry, OutPoint, OutboundMessage, PublicKey, TransferPayload,
 };
 use oxydome_core::{CrossRecvCall, CrossSendCall, OvmAction, OvmFailureCode};
 use oxydome_crypto::KeyPair;
@@ -213,9 +212,7 @@ impl CrossChainView {
     /// Message ids are globally unique (they commit their source OHM), so this returns at most
     /// one message. Its `target_ohm` field determines which OHM may consume it.
     pub fn find(&self, msg_id: &Hash) -> Option<&OutboundMessage> {
-        self.outboxes
-            .values()
-            .find_map(|outbox| outbox.get(msg_id))
+        self.outboxes.values().find_map(|outbox| outbox.get(msg_id))
     }
 }
 
@@ -345,7 +342,11 @@ impl OhmLedger {
 
     /// Verifies `block` against the current ledger, resolving inbound cross-chain messages
     /// against `view`, without mutating the ledger.
-    pub fn verify_block_with(&self, block: &OhmBlock, view: &CrossChainView) -> Result<(), OhmError> {
+    pub fn verify_block_with(
+        &self,
+        block: &OhmBlock,
+        view: &CrossChainView,
+    ) -> Result<(), OhmError> {
         self.check_continuity(block)?;
         if block.transactions.len() > crate::MAX_OHM_BLOCK_TXS {
             return Err(OhmError::TooManyTransactions);
@@ -373,7 +374,11 @@ impl OhmLedger {
 
     /// Applies `block`, advancing the ledger, resolving inbound cross-chain messages against
     /// `view`. Fails (without mutation) on any inconsistency.
-    pub fn apply_block_with(&mut self, block: &OhmBlock, view: &CrossChainView) -> Result<(), OhmError> {
+    pub fn apply_block_with(
+        &mut self,
+        block: &OhmBlock,
+        view: &CrossChainView,
+    ) -> Result<(), OhmError> {
         self.verify_block_with(block, view)?;
         let delta = self.apply_transactions_with(&block.transactions, Some(view))?;
         let root = ohm_state_root_full(&delta.utxos, &delta.contracts, &delta.outbox, &delta.inbox);
@@ -432,12 +437,8 @@ impl OhmLedger {
         );
         // Compute the resulting root and commit it to the header before signing.
         let delta = self.apply_transactions_with(&block.transactions, Some(view))?;
-        block.header.state_root = ohm_state_root_full(
-            &delta.utxos,
-            &delta.contracts,
-            &delta.outbox,
-            &delta.inbox,
-        );
+        block.header.state_root =
+            ohm_state_root_full(&delta.utxos, &delta.contracts, &delta.outbox, &delta.inbox);
         block.header.fee_total = delta.fee_total;
         block.sign(key);
         self.verify_block_with(&block, view)?;
@@ -612,8 +613,12 @@ impl OhmLedger {
         let program = oxydome_ovm::Program::decode(&function.code)
             .map_err(|error| OhmError::Ovm(error.to_string()))?;
         let execution_limit = gas_limit - intrinsic;
-        match oxydome_ovm::execute(&program, &execution_arguments, &contract.storage, execution_limit)
-        {
+        match oxydome_ovm::execute(
+            &program,
+            &execution_arguments,
+            &contract.storage,
+            execution_limit,
+        ) {
             Ok(execution) => Ok(OhmCallOutcome {
                 failure: None,
                 gas_used: intrinsic + execution.gas_used,
@@ -1001,8 +1006,7 @@ impl OhmLedger {
 
         let mut failure: Option<OvmFailureCode> = None;
         let mut return_value: Option<u64> = None;
-        let intrinsic_gas =
-            oxydome_ovm::ACTION_INTRINSIC_GAS + oxydome_ovm::CONTRACT_DISPATCH_GAS;
+        let intrinsic_gas = oxydome_ovm::ACTION_INTRINSIC_GAS + oxydome_ovm::CONTRACT_DISPATCH_GAS;
         if message.gas_limit >= intrinsic_gas {
             let mut execution_arguments: Vec<u64> = message
                 .caller
@@ -1014,6 +1018,8 @@ impl OhmLedger {
             let host = CrossHost {
                 origin_ohm: *consumer,
                 inbox: receipt_view(inbox),
+                price_oracle: None,
+                pool_oracle: None,
             };
             match Self::execute_cross_entry(
                 contracts,
@@ -1311,7 +1317,10 @@ impl OhmLedger {
                 );
                 Ok(())
             }
-            OvmAction::DeployContract { artifact, stack_bytes } => {
+            OvmAction::DeployContract {
+                artifact,
+                stack_bytes,
+            } => {
                 let gas_limit = *stack_bytes;
                 oxydome_ovm::ContractArtifact::decode(artifact)
                     .map_err(|error| OhmError::Ovm(error.to_string()))?;
@@ -1363,6 +1372,8 @@ impl OhmLedger {
                     &CrossHost {
                         origin_ohm: *origin_ohm,
                         inbox: receipt_view(inbox),
+                        price_oracle: None,
+                        pool_oracle: None,
                     },
                     outbox,
                     outbox_seq,
@@ -1421,6 +1432,8 @@ impl OhmLedger {
                     &CrossHost {
                         origin_ohm: *origin_ohm,
                         inbox: receipt_view(inbox),
+                        price_oracle: None,
+                        pool_oracle: None,
                     },
                     outbox,
                     outbox_seq,
@@ -1501,7 +1514,7 @@ mod tests {
             .map(|_| OhmOutput {
                 amount: per,
                 recipient: owner,
-            lock: false,
+                lock: false,
             })
             .collect();
         OhmLedger::from_genesis(
@@ -1521,7 +1534,7 @@ mod tests {
             &[OhmOutput {
                 amount: pool,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             Hash::from([8u8; 64]),
         )
@@ -1547,7 +1560,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 990,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             10,
             &key(),
@@ -1571,7 +1584,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             &key(),
@@ -1596,7 +1609,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             &key(),
@@ -1606,7 +1619,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             &key(),
@@ -1665,7 +1678,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::Deploy {
@@ -1680,7 +1693,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 800,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::Call {
@@ -1718,7 +1731,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::Deploy {
@@ -1769,7 +1782,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -1867,7 +1880,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             CrossSendCall {
@@ -1901,9 +1914,17 @@ mod tests {
         assert_eq!(applied.state_root, block.header.state_root);
         assert_eq!(
             applied.state_root,
-            ohm_state_root_full(&applied.utxos, &applied.contracts, &applied.outbox, &applied.inbox)
+            ohm_state_root_full(
+                &applied.utxos,
+                &applied.contracts,
+                &applied.outbox,
+                &applied.inbox
+            )
         );
-        assert_ne!(applied.state_root, ohm_state_root(&applied.utxos, &applied.contracts));
+        assert_ne!(
+            applied.state_root,
+            ohm_state_root(&applied.utxos, &applied.contracts)
+        );
     }
 
     #[test]
@@ -1918,7 +1939,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -1929,17 +1950,24 @@ mod tests {
         );
         let target_contract = oxydome_ovm::contract_id(deploy_tx.txid());
         consumer
-            .apply_block(&consumer.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
+            .apply_block(
+                &consumer
+                    .build_block(vec![deploy_tx.clone()], 3, &key())
+                    .unwrap(),
+            )
             .unwrap();
 
         // Sender hosts an on_reply contract to collect the automatic reply.
         let mut source_applied = source.clone();
         let source_deploy_tx = source_applied.build_ovm_transaction(
-            vec![(source_applied.utxos.values().next().unwrap().outpoint, owner)],
+            vec![(
+                source_applied.utxos.values().next().unwrap().outpoint,
+                owner,
+            )],
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -1999,7 +2027,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 800,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             CrossRecvCall { msg_id: msg.msg_id },
@@ -2029,10 +2057,7 @@ mod tests {
         assert_eq!(reply.target_contract, reply_contract);
         assert_eq!(reply.entry_selector, oxydome_ovm::fn_selector("on_reply"));
         assert_eq!(reply.reply_to_msg_id, Some(msg.msg_id));
-        assert_eq!(
-            reply.arguments,
-            reply_arguments(&msg.msg_id, true, 41)
-        );
+        assert_eq!(reply.arguments, reply_arguments(&msg.msg_id, true, 41));
 
         // The sender then consumes the reply.
         let reply_msg = consumed.outbox[&reply_id].clone();
@@ -2044,10 +2069,12 @@ mod tests {
             vec![OhmOutput {
                 amount: 700,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
-            CrossRecvCall { msg_id: reply_msg.msg_id },
+            CrossRecvCall {
+                msg_id: reply_msg.msg_id,
+            },
             &key(),
         );
         let reply_block = reply_consume
@@ -2077,7 +2104,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             CrossRecvCall {
@@ -2098,7 +2125,7 @@ mod tests {
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -2108,8 +2135,8 @@ mod tests {
             &key(),
         );
         let target_contract = oxydome_ovm::contract_id(deploy_tx.txid());
-l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
-    .unwrap();
+        l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
+            .unwrap();
 
         let other = ledger(1000, 1);
         // The message targets `other`'s OHM, but we try to consume it here.
@@ -2139,7 +2166,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 800,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             CrossRecvCall { msg_id },
@@ -2162,7 +2189,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -2173,14 +2200,21 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
         );
         let target_contract = oxydome_ovm::contract_id(deploy_tx.txid());
         consumer
-            .apply_block(&consumer.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
+            .apply_block(
+                &consumer
+                    .build_block(vec![deploy_tx.clone()], 3, &key())
+                    .unwrap(),
+            )
             .unwrap();
 
         let mut source_applied = source.clone();
         let send_block = source_applied
             .build_block(
                 vec![source_applied.build_cross_send_transaction(
-                    vec![(source_applied.utxos.values().next().unwrap().outpoint, owner)],
+                    vec![(
+                        source_applied.utxos.values().next().unwrap().outpoint,
+                        owner,
+                    )],
                     vec![OhmOutput {
                         amount: 900,
                         recipient: owner,
@@ -2237,7 +2271,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 800,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             CrossRecvCall { msg_id },
@@ -2248,7 +2282,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 700,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             CrossRecvCall { msg_id },
@@ -2264,15 +2298,19 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
     /// with payload `[123, 456]` and `gas_limit 400`.
     fn xcall_launcher_artifact(target_ohm: Hash, target_contract: Hash) -> Vec<u8> {
         use oxydome_core::hash_words;
-        let mut instructions =
-            vec![oxydome_ovm::Instruction::Push(123), oxydome_ovm::Instruction::Push(456)];
+        let mut instructions = vec![
+            oxydome_ovm::Instruction::Push(123),
+            oxydome_ovm::Instruction::Push(456),
+        ];
         for word in hash_words(&target_ohm) {
             instructions.push(oxydome_ovm::Instruction::Push(word));
         }
         for word in hash_words(&target_contract) {
             instructions.push(oxydome_ovm::Instruction::Push(word));
         }
-        instructions.push(oxydome_ovm::Instruction::Push(oxydome_ovm::fn_selector("poke")));
+        instructions.push(oxydome_ovm::Instruction::Push(oxydome_ovm::fn_selector(
+            "poke",
+        )));
         instructions.push(oxydome_ovm::Instruction::Push(400));
         instructions.push(oxydome_ovm::Instruction::XCall { arg_count: 2 });
         instructions.push(oxydome_ovm::Instruction::Return);
@@ -2311,7 +2349,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -2326,7 +2364,7 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::CallContract {
@@ -2408,12 +2446,12 @@ l.apply_block(&l.build_block(vec![deploy_tx.clone()], 3, &key()).unwrap())
         .unwrap();
 
         let utxos: Vec<_> = b.utxos.values().map(|entry| entry.outpoint).collect();
-let deploy = b.build_ovm_transaction(
+        let deploy = b.build_ovm_transaction(
             vec![(utxos[0], owner)],
             vec![OhmOutput {
                 amount: 950,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             50,
             Some(OvmAction::DeployContract {
@@ -2428,7 +2466,7 @@ let deploy = b.build_ovm_transaction(
             vec![OhmOutput {
                 amount: 900,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             50,
             Some(OvmAction::CallContract {
@@ -2455,13 +2493,17 @@ let deploy = b.build_ovm_transaction(
         let owner = key().public();
         let target_contract = Hash::from([7u8; 64]);
 
-        let utxos: Vec<_> = consumer.utxos.values().map(|entry| entry.outpoint).collect();
+        let utxos: Vec<_> = consumer
+            .utxos
+            .values()
+            .map(|entry| entry.outpoint)
+            .collect();
         let deploy = consumer.build_ovm_transaction(
             vec![(utxos[0], owner)],
             vec![OhmOutput {
                 amount: 950,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             50,
             Some(OvmAction::DeployContract {
@@ -2477,7 +2519,10 @@ let deploy = b.build_ovm_transaction(
         let send_block = source_applied
             .build_block(
                 vec![source_applied.build_cross_send_transaction(
-                    vec![(source_applied.utxos.values().next().unwrap().outpoint, owner)],
+                    vec![(
+                        source_applied.utxos.values().next().unwrap().outpoint,
+                        owner,
+                    )],
                     vec![OhmOutput {
                         amount: 900,
                         recipient: owner,
@@ -2556,7 +2601,7 @@ let deploy = b.build_ovm_transaction(
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::DeployContract {
@@ -2571,7 +2616,7 @@ let deploy = b.build_ovm_transaction(
             vec![OhmOutput {
                 amount: 400,
                 recipient: owner,
-            lock: false,
+                lock: false,
             }],
             100,
             Some(OvmAction::CallContract {

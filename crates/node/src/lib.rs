@@ -2,6 +2,7 @@
 //! Proof-of-Authority leader, builds audit packages for the masters, and finalizes blocks once
 //! BFT and `MasterCheck` quorums are present.
 
+pub mod async_verify;
 pub mod content_store;
 pub mod index;
 pub mod server;
@@ -10,15 +11,17 @@ pub mod storage;
 use crate::content_store::ContentStore;
 use crate::index::{IndexStore, WalletIndex};
 use crate::storage::{Labeler, LabelerConfig};
-use oxydome_core::StorageLabel;
 use oxydome_audit::{attestation_quorum, AuditAttestation, AuditPackage, InputProof};
 use oxydome_consensus::{AdmissionCertificate, MasterCheck, QuorumCertificate, Vote, VoteKind};
+use oxydome_core::StorageLabel;
 use oxydome_core::{
-    Amount, Block, BlockRewardDistribution, ChainParams, GenesisConfig, GovernanceSet, Hash,
+    Amount, Block, BlockRewardDistribution, ChainParams, FileAccessOperation, FileAccessRecord,
+    FileDeleteOperation, FileEvkLabel, FileStoreOperation, GenesisConfig, GovernanceSet, Hash,
     InboundReceipt, OhmAction, OhmBlock, OhmPolicy, OhmState, Operation, OutPoint, OvmAction,
     PublicKey, Transaction,
 };
-use oxydome_crypto::{CodeManifest, KeyPair, SparseProof};
+use oxydome_crypto::evk::EphemeralKeyManager;
+use oxydome_crypto::{hash_value, verify, CodeManifest, KeyPair, SparseProof};
 use oxydome_currency::rebound_utxo_spendable;
 use oxydome_net::{
     BalanceInfo, FinalityEvidence, FinalizedBlockRecord, HistoryEntry, NodeEvent, TxLocation,
@@ -209,6 +212,168 @@ impl Node {
         let label = self.labeler.generate_label(height, timestamp);
         self.labeler.update_last_label(height, timestamp, &label);
         label
+    }
+
+    /// Stores file content in the local content store.
+    pub fn put_file_content(&mut self, hash: Hash, bytes: Vec<u8>) -> Result<(), NodeError> {
+        self.content_store
+            .put(hash, bytes)
+            .map_err(|e| NodeError::Operation(e.to_string()))
+    }
+
+    /// Retrieves file content from the local content store.
+    pub fn get_file_content(&self, hash: &Hash) -> Option<Vec<u8>> {
+        self.content_store.get(hash).map(|b| b.to_vec())
+    }
+
+    /// Creates and signs a `FileEvkLabel` for the given content hash and chain context.
+    pub fn create_file_label(
+        &self,
+        content_hash: Hash,
+        size: u64,
+        previous_commitment: Hash,
+        height: u64,
+        block_hash: Hash,
+        block_params: &ChainParams,
+    ) -> Result<FileEvkLabel, NodeError> {
+        if self.state.height + 1 < block_params.file_system_activation_height {
+            return Err(NodeError::Operation("file system is not yet active".into()));
+        }
+        let key_chain_commitment = EphemeralKeyManager::compute_file_key_chain_commitment(
+            previous_commitment,
+            content_hash,
+            height,
+            block_hash,
+        );
+        let commitment = oxydome_crypto::hash_value(&FileEvkLabel {
+            content_hash,
+            key_chain_commitment,
+            node: self.key.public(),
+            block_height: height,
+            block_hash,
+            previous_commitment,
+            size,
+            signature: oxydome_crypto::Sig([0u8; 64]),
+        });
+        let signature = self.key.sign(&commitment.0);
+        Ok(FileEvkLabel {
+            content_hash,
+            key_chain_commitment,
+            node: self.key.public(),
+            block_height: height,
+            block_hash,
+            previous_commitment,
+            size,
+            signature,
+        })
+    }
+
+    /// Submits a `FileStoreOperation` to the mempool.
+    pub fn submit_file_store_operation(
+        &mut self,
+        label: FileEvkLabel,
+        approvals: Vec<oxydome_core::NodeApproval>,
+    ) -> Result<Hash, NodeError> {
+        let op = Operation::FileStore(FileStoreOperation {
+            file_label: label,
+            approvals,
+        });
+        let op_id = op.id();
+        self.submit_operation(op)?;
+        Ok(op_id)
+    }
+
+    /// Submits a `FileAccessOperation` to the mempool.
+    pub fn submit_file_access_operation(
+        &mut self,
+        file_id: Hash,
+        content_hash: Hash,
+        timestamp: u64,
+    ) -> Result<Hash, NodeError> {
+        let accessor = self.key.public();
+        let op = Operation::FileAccess(FileAccessOperation {
+            file_id,
+            content_hash,
+            accessor,
+            signature: oxydome_crypto::Sig([0u8; 64]),
+            timestamp,
+        });
+        let proposal_id = op.proposal_id();
+        let signature = self.key.sign(&proposal_id.0);
+        let op = Operation::FileAccess(FileAccessOperation {
+            file_id,
+            content_hash,
+            accessor,
+            signature,
+            timestamp,
+        });
+        let op_id = op.id();
+        self.submit_operation(op)?;
+        Ok(op_id)
+    }
+
+    /// Submits a `FileDeleteOperation` to the mempool.
+    pub fn submit_file_delete_operation(
+        &mut self,
+        file_id: Hash,
+        content_hash: Hash,
+    ) -> Result<Hash, NodeError> {
+        let deleter = self.key.public();
+        let op = Operation::FileDelete(FileDeleteOperation {
+            file_id,
+            content_hash,
+            deleter,
+            signature: oxydome_crypto::Sig([0u8; 64]),
+        });
+        let proposal_id = op.proposal_id();
+        let signature = self.key.sign(&proposal_id.0);
+        let op = Operation::FileDelete(FileDeleteOperation {
+            file_id,
+            content_hash,
+            deleter,
+            signature,
+        });
+        let op_id = op.id();
+        self.submit_operation(op)?;
+        Ok(op_id)
+    }
+
+    /// Queries the on-chain file label by its key chain commitment.
+    pub fn file_label(&self, commitment: Hash) -> Option<&FileEvkLabel> {
+        self.state.file_labels.get(&commitment)
+    }
+
+    /// Returns the access records for a file (all records whose `file_id` matches).
+    pub fn file_access_log(&self, file_id: Hash) -> Vec<&FileAccessRecord> {
+        self.state
+            .file_access_log
+            .values()
+            .filter(|r| r.file_id == file_id)
+            .collect()
+    }
+
+    /// Updates the labeler's file metadata from on-chain state.
+    pub fn sync_file_metadata(&self) {
+        let mut file_count: u64 = 0;
+        let mut file_storage_bytes: u64 = 0;
+        let mut labels: Vec<FileEvkLabel> = Vec::new();
+        for label in self.state.file_labels.values() {
+            labels.push(label.clone());
+            file_count += 1;
+            file_storage_bytes += label.size;
+        }
+        let file_root = if labels.is_empty() {
+            None
+        } else {
+            Some(self.labeler.compute_file_root(&labels))
+        };
+        self.labeler
+            .update_file_metadata(file_root, file_count, file_storage_bytes);
+    }
+
+    /// Returns the node's file root, file count and file storage bytes.
+    pub fn node_file_root(&self) -> (Option<Hash>, u64, u64) {
+        self.labeler.file_metadata()
     }
 
     fn verify_finality_evidence(
@@ -579,10 +744,9 @@ impl Node {
         // The wallet-makers API fee rule is exact: reject any fee that deviates from it.
         let base_fee =
             oxydome_core::transfer_fee(&tx.outputs).map_err(|e| NodeError::Tx(e.to_string()))?;
-        let stack_gas_val = tx
-            .ovm_action
-            .as_ref()
-            .map_or(0u64, |a| a.required_stack_gas(self.params.ovm_stack_bytes_per_gas));
+        let stack_gas_val = tx.ovm_action.as_ref().map_or(0u64, |a| {
+            a.required_stack_gas(self.params.ovm_stack_bytes_per_gas)
+        });
         let legacy_fee = base_fee
             .checked_add(u128::from(stack_gas_val))
             .ok_or_else(|| NodeError::Tx("required fee overflows".into()))?;
@@ -602,7 +766,9 @@ impl Node {
                 if let Some(caller) = tx.inputs.first().map(|i| &i.owner) {
                     let sg = action.required_stack_gas(self.params.ovm_stack_bytes_per_gas);
                     if self.state.gas_balance(caller) < u128::from(sg) {
-                        return Err(NodeError::Tx("insufficient GAS balance for OVM execution".into()));
+                        return Err(NodeError::Tx(
+                            "insufficient GAS balance for OVM execution".into(),
+                        ));
                     }
                 }
             }
@@ -625,11 +791,9 @@ impl Node {
             })
             .ok_or_else(|| NodeError::Tx("mempool OVM gas total overflows".into()))?;
         let total_gas = pending_gas
-            .checked_add(
-                tx.ovm_action
-                    .as_ref()
-                    .map_or(0, |a| a.required_stack_gas(self.params.ovm_stack_bytes_per_gas)),
-            )
+            .checked_add(tx.ovm_action.as_ref().map_or(0, |a| {
+                a.required_stack_gas(self.params.ovm_stack_bytes_per_gas)
+            }))
             .ok_or_else(|| NodeError::Tx("mempool OVM gas total overflows".into()))?;
         if total_gas > oxydome_core::MAX_OVM_BLOCK_GAS_LIMIT {
             return Err(NodeError::Tx(
@@ -799,9 +963,9 @@ impl Node {
         arguments: &[u64],
         gas_limit: u64,
     ) -> Result<OhmCallOutcome, NodeError> {
-        let ledger = self.ohm_ledger(ohm_id).ok_or_else(|| {
-            NodeError::Operation("OHM ledger is not tracked".into())
-        })?;
+        let ledger = self
+            .ohm_ledger(ohm_id)
+            .ok_or_else(|| NodeError::Operation("OHM ledger is not tracked".into()))?;
         ledger
             .simulate_contract_call(contract_id, entry_point, caller, arguments, gas_limit)
             .map_err(|error| NodeError::Operation(error.to_string()))
@@ -810,10 +974,7 @@ impl Node {
     /// Re-derives the OHM ledgers after applying `block`, validating that every `Update` anchor
     /// matches the private block it commits to. Returns the updated ledger set on success and
     /// leaves `self` untouched on failure.
-    fn advance_ohm_ledgers(
-        &self,
-        block: &Block,
-    ) -> Result<BTreeMap<Hash, OhmLedger>, NodeError> {
+    fn advance_ohm_ledgers(&self, block: &Block) -> Result<BTreeMap<Hash, OhmLedger>, NodeError> {
         let mut ledgers = self.ohm_ledgers.clone();
         // The cross-chain view is built once from the *committed* ledgers (finalized strictly
         // before this block), so inbound messages always reference finalized source outboxes.
@@ -866,9 +1027,9 @@ impl Node {
                             "OHM anchor fee total does not match the anchored block".into(),
                         ));
                     }
-                    let ledger = ledgers.get_mut(ohm_id).ok_or_else(|| {
-                        NodeError::Operation("OHM ledger is not tracked".into())
-                    })?;
+                    let ledger = ledgers
+                        .get_mut(ohm_id)
+                        .ok_or_else(|| NodeError::Operation("OHM ledger is not tracked".into()))?;
                     ledger
                         .apply_block_with(ohm_block, &view)
                         .map_err(|error| NodeError::Operation(error.to_string()))?;
@@ -944,6 +1105,60 @@ impl Node {
             timestamp,
         )?;
         Ok(block)
+    }
+
+    /// Async block production: validates and filters mempool transactions first, removing
+    /// any that are structurally invalid, then produces a block via `smol::unblock`.
+    pub async fn produce_block_async(&mut self, timestamp: u64) -> Result<Block, NodeError> {
+        let height = self.next_height();
+        if !self.is_leader(height) {
+            return Err(NodeError::NotLeader);
+        }
+
+        // Pre-validate and filter mempool transactions asynchronously.
+        let mempool_block = crate::async_verify::prepare_mempool_block(
+            &self.state,
+            &self.mempool,
+            &self.params,
+            height,
+        )
+        .await;
+        let valid_txs = mempool_block;
+
+        let total_fees = self.state.settled_fee_total(&valid_txs, &self.params)?;
+        let mut operations = self.pending_ops.clone();
+        if total_fees > 0 {
+            operations.push(self.reward_operation(total_fees, &self.public()));
+        }
+
+        if self.params.block_rewards_enabled {
+            if let Some(block_reward_op) = build_block_reward_operation(
+                &self.params,
+                self.state.ox_price,
+                self.params.ox_price_reference,
+                self.state.price_last_update_height,
+                height,
+                &self.gov.nodes,
+                &self.public(),
+                &self.gov.masters,
+                self.prev_server_block_reward.unwrap_or(0),
+            ) {
+                if let Operation::BlockRewards(ref dist) = block_reward_op {
+                    self.prev_server_block_reward = Some(dist.server_total());
+                }
+                operations.push(block_reward_op);
+            }
+        }
+
+        let state = self.state.clone();
+        let gov = self.gov.clone();
+        let params = self.params.clone();
+        let producer = self.public();
+        smol::unblock(move || {
+            state.build_block(&gov, &params, valid_txs, operations, producer, timestamp)
+        })
+        .await
+        .map_err(NodeError::from)
     }
 
     /// Builds the audit package (with Merkle proofs) for a proposed block.
@@ -1462,8 +1677,8 @@ pub fn default_config(masters: usize, nodes: usize, supply: Amount) -> oxydome_c
 mod recovery_tests {
     use super::*;
     use oxydome_core::{
-        CrossRecvCall, CrossSendCall, OhmOperation, OhmOutput, OHM_POLICY_VERSION, Operation,
-        OvmAction, Transaction, TxOutput,
+        CrossRecvCall, CrossSendCall, OhmOperation, OhmOutput, Operation, OvmAction, Transaction,
+        TxOutput, OHM_POLICY_VERSION,
     };
     use oxydome_rewards::split_fees;
 
@@ -1647,11 +1862,11 @@ mod recovery_tests {
         let genesis_out = ledger.utxos.values().next().unwrap().outpoint;
         let tx = ledger.build_transaction(
             vec![(genesis_out, maintainer.public())],
-             vec![OhmOutput {
-                 amount: 900,
-                 recipient: maintainer.public(),
-                 lock: false,
-             }],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: maintainer.public(),
+                lock: false,
+            }],
             100,
             &maintainer,
         );
@@ -1911,11 +2126,11 @@ mod recovery_tests {
         .unwrap();
         let deploy = ledger.build_ovm_transaction(
             vec![(genesis_out, maintainer.public())],
-             vec![OhmOutput {
-                 amount: 900,
-                 recipient: maintainer.public(),
-                 lock: false,
-             }],
+            vec![OhmOutput {
+                amount: 900,
+                recipient: maintainer.public(),
+                lock: false,
+            }],
             100,
             Some(OvmAction::DeployContract {
                 artifact,
@@ -1926,11 +2141,11 @@ mod recovery_tests {
         let contract_id = oxydome_ovm::contract_id(deploy.txid());
         let call = ledger.build_ovm_transaction(
             vec![(OutPoint::new(deploy.txid(), 0), maintainer.public())],
-             vec![OhmOutput {
-                 amount: 800,
-                 recipient: maintainer.public(),
-                 lock: false,
-             }],
+            vec![OhmOutput {
+                amount: 800,
+                recipient: maintainer.public(),
+                lock: false,
+            }],
             100,
             Some(OvmAction::CallContract {
                 contract_id,
@@ -1941,7 +2156,9 @@ mod recovery_tests {
             }),
             &maintainer,
         );
-        let ohm_block = ledger.build_block(vec![deploy, call], 6, &maintainer).unwrap();
+        let ohm_block = ledger
+            .build_block(vec![deploy, call], 6, &maintainer)
+            .unwrap();
         let ohm_block_hash = node.submit_ohm_block(ohm_block.clone()).unwrap();
 
         // Anchor it at Ox height 2.
@@ -2194,7 +2411,10 @@ mod recovery_tests {
         // B hosts an echo contract.
         let ledger_b = node.ohm_ledgers[&ohm_b].clone();
         let deploy_b = ledger_b.build_ovm_transaction(
-            vec![(ledger_b.utxos.values().next().unwrap().outpoint, maintainer_b.public())],
+            vec![(
+                ledger_b.utxos.values().next().unwrap().outpoint,
+                maintainer_b.public(),
+            )],
             vec![OhmOutput {
                 amount: 900,
                 recipient: maintainer_b.public(),
@@ -2220,7 +2440,10 @@ mod recovery_tests {
         // A hosts an on_reply contract and sends a message requesting a reply.
         let ledger_a = node.ohm_ledgers[&ohm_a].clone();
         let deploy_a = ledger_a.build_ovm_transaction(
-            vec![(ledger_a.utxos.values().next().unwrap().outpoint, maintainer_a.public())],
+            vec![(
+                ledger_a.utxos.values().next().unwrap().outpoint,
+                maintainer_a.public(),
+            )],
             vec![OhmOutput {
                 amount: 900,
                 recipient: maintainer_a.public(),
@@ -2257,12 +2480,20 @@ mod recovery_tests {
         anchor_ohm_block(
             &mut node,
             ohm_a,
-            ledger_a.build_block(vec![deploy_a, send], 5, &maintainer_a).unwrap(),
+            ledger_a
+                .build_block(vec![deploy_a, send], 5, &maintainer_a)
+                .unwrap(),
             &maintainer_a,
         );
 
         // A's outbox now carries the outbound message.
-        let msg_id = node.ohm_outbox(&ohm_a).unwrap().values().next().unwrap().msg_id;
+        let msg_id = node
+            .ohm_outbox(&ohm_a)
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .msg_id;
         assert!(node.ohm_message(&msg_id).is_some());
 
         // B consumes the message in a later Ox block, executing the target and auto-replying.
@@ -2282,7 +2513,9 @@ mod recovery_tests {
         anchor_ohm_block(
             &mut node,
             ohm_b,
-            ledger_b.build_block_with(vec![consume], 6, &maintainer_b, &view).unwrap(),
+            ledger_b
+                .build_block_with(vec![consume], 6, &maintainer_b, &view)
+                .unwrap(),
             &maintainer_b,
         );
 
@@ -2299,7 +2532,10 @@ mod recovery_tests {
         let view = CrossChainView::from_ledgers(&node.ohm_ledgers);
         let ledger_a = node.ohm_ledgers[&ohm_a].clone();
         let consume_reply = ledger_a.build_cross_recv_transaction(
-            vec![(ledger_a.utxos.values().next().unwrap().outpoint, maintainer_a.public())],
+            vec![(
+                ledger_a.utxos.values().next().unwrap().outpoint,
+                maintainer_a.public(),
+            )],
             vec![OhmOutput {
                 amount: 700,
                 recipient: maintainer_a.public(),
@@ -2312,7 +2548,9 @@ mod recovery_tests {
         anchor_ohm_block(
             &mut node,
             ohm_a,
-            ledger_a.build_block_with(vec![consume_reply], 7, &maintainer_a, &view).unwrap(),
+            ledger_a
+                .build_block_with(vec![consume_reply], 7, &maintainer_a, &view)
+                .unwrap(),
             &maintainer_a,
         );
 
@@ -2320,7 +2558,9 @@ mod recovery_tests {
         assert_eq!(reply_receipt.failure, None);
         assert_eq!(reply_receipt.reply_to_msg_id, Some(msg_id));
         assert_eq!(
-            node.ohm_ledgers[&ohm_a].contracts[&reply_contract].storage.get(&1),
+            node.ohm_ledgers[&ohm_a].contracts[&reply_contract]
+                .storage
+                .get(&1),
             Some(&41)
         );
         assert!(node.ohm_receipt(&reply_id).is_some());
@@ -2345,10 +2585,7 @@ mod recovery_tests {
         );
         assert!(restored.ohm_receipt(&reply_id).is_some());
         assert!(restored.ohm_message(&msg_id).is_some());
-        assert_eq!(
-            restored.ohm_ledgers[&ohm_b].inbox[&msg_id].failure,
-            None
-        );
+        assert_eq!(restored.ohm_ledgers[&ohm_b].inbox[&msg_id].failure, None);
         assert_eq!(
             restored.ohm_ledgers[&ohm_a].inbox[&reply_id].reply_to_msg_id,
             Some(msg_id)

@@ -19,7 +19,7 @@ pub fn verify_policy_signature(policy: &OhmPolicy, signature: &Sig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OHM_POLICY_VERSION, PublicKey};
+    use crate::{PublicKey, OHM_POLICY_VERSION};
     use oxydome_crypto::KeyPair;
 
     #[test]
@@ -35,10 +35,7 @@ mod tests {
         let policy_hash = hash_value(&policy);
         let sig = key.sign(&policy_hash.0);
         assert!(verify_policy_signature(&policy, &sig));
-        assert!(!verify_policy_signature(
-            &policy,
-            &Sig([0u8; 64])
-        ));
+        assert!(!verify_policy_signature(&policy, &Sig([0u8; 64])));
         let _ = PublicKey::from([0u8; 32]);
     }
 }

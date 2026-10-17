@@ -44,7 +44,7 @@ pub struct ChainParams {
     pub airdrop_interval_blocks: u64,
     /// Base airdrop size as basis points of the current circulating GAS supply.
     #[serde(default = "default_airdrop_base_bps")]
-pub airdrop_base_bps: u32,
+    pub airdrop_base_bps: u32,
     /// Normalizing reference for the Ox price oracle in the airdrop formula.
     #[serde(default = "default_amount_one")]
     pub ox_price_reference: Amount,
@@ -64,6 +64,10 @@ pub airdrop_base_bps: u32,
     // ---- fee split ----
     /// Share of block fees paid to masters, in basis points (`400` = 4%).
     pub fee_master_bps: u32,
+    /// Share of OVM gas fees (in GAS) redistributed to masters, in basis points
+    /// (`400` = 4%). The remainder of gas fees is burned.
+    #[serde(default = "default_gas_fee_master_bps")]
+    pub gas_fee_master_bps: u32,
 
     // ---- consensus thresholds ----
     /// BFT commit super-majority numerator (e.g. 2).
@@ -157,6 +161,93 @@ pub airdrop_base_bps: u32,
     pub storage_label_max_deviation_bps: u32,
     #[serde(default = "default_u64_zero")]
     pub storage_audit_interval_blocks: u64,
+
+    // ---- timers ----
+    /// Height at which timer operations become active.
+    #[serde(default = "default_timer_activation_height")]
+    pub timer_activation_height: u64,
+    /// Maximum number of simultaneous active timers.
+    #[serde(default = "default_max_timers")]
+    pub max_timers: usize,
+    /// Maximum duration of a timer in blocks (1 day at ~5s blocks).
+    #[serde(default = "default_max_timer_duration_blocks")]
+    pub max_timer_duration_blocks: u64,
+    /// Minimum bet amount.
+    #[serde(default = "default_timer_min_bet_amount")]
+    pub timer_min_bet_amount: Amount,
+    /// Maximum bet amount.
+    #[serde(default = "default_timer_max_bet_amount")]
+    pub timer_max_bet_amount: Amount,
+
+    // ---- pegged currency ----
+    /// Height at which pegged currency operations become active.
+    #[serde(default = "default_pegged_currency_activation_height")]
+    pub pegged_currency_activation_height: u64,
+    /// Basis points for the spread between upper and lower price bounds (e.g. 500 = 5%).
+    #[serde(default = "default_pegged_spread_bps")]
+    pub pegged_spread_bps: u32,
+    /// Window (blocks) for computing the average price.
+    #[serde(default = "default_pegged_window_blocks")]
+    pub pegged_window_blocks: u64,
+
+    // ---- liquidity pools ----
+    /// Height at which liquidity pool K recomputation and swaps become active.
+    #[serde(default = "default_liquidity_pool_activation_height")]
+    pub liquidity_pool_activation_height: u64,
+    /// Swap fee in basis points (100 = 1%).
+    #[serde(default = "default_liquidity_pool_fee_bps")]
+    pub liquidity_pool_fee_bps: u32,
+    /// Maximum number of liquidity pools.
+    #[serde(default = "default_max_liquidity_pools")]
+    pub max_liquidity_pools: usize,
+
+    // ---- speedometer stabilization currency ----
+    /// Height at which Speedometer minting and airdrops become active.
+    #[serde(default = "default_one")]
+    pub speedometer_activation_height: u64,
+    /// Number of blocks between automatic Speedometer airdrops (`0` disables airdrops).
+    #[serde(default = "default_speedometer_airdrop_interval_blocks")]
+    pub speedometer_airdrop_interval_blocks: u64,
+    /// Base Speedometer airdrop size as basis points of the block's highest transaction value.
+    #[serde(default = "default_speedometer_airdrop_base_bps")]
+    pub speedometer_airdrop_base_bps: u32,
+    /// Per-transaction Speedometer stabilization mint, basis points of the tx value.
+    #[serde(default = "default_speedometer_stabilization_bps")]
+    pub speedometer_stabilization_bps: u32,
+
+    // ---- EVFS file system ----
+    /// Height at which EVFS file operations become active.
+    #[serde(default = "default_file_system_activation_height")]
+    pub file_system_activation_height: u64,
+    /// Maximum file size in bytes.
+    #[serde(default = "default_max_file_bytes")]
+    pub max_file_bytes: u64,
+    /// Maximum number of files a single node may store (state cap).
+    #[serde(default = "default_max_files_per_node")]
+    pub max_files_per_node: u64,
+
+    // ---- node departure ----
+    /// Fraction of a departing node's held earnings to take and redistribute, in basis points.
+    /// Default `5000` = 50%. A value of `0` disables confiscation (earnings stay with the node).
+    #[serde(default = "default_departure_take_bps")]
+    pub departure_take_bps: Option<u32>,
+
+    // ---- express bus ----
+    /// Height at which Express Bus deposit/withdraw operations become active.
+    #[serde(default = "default_express_bus_activation_height")]
+    pub express_bus_activation_height: u64,
+    /// Maximum number of simultaneous Express Bus trackers.
+    #[serde(default = "default_express_bus_max_trackers")]
+    pub max_express_buses: usize,
+    /// Sampling window (blocks) for the In/Out tracker timer.
+    #[serde(default = "default_express_bus_window_blocks")]
+    pub express_bus_window_blocks: u64,
+    /// Default weight for new Express Bus trackers (FP scale: 1.0 == 1_000_000_000_000).
+    #[serde(default = "default_express_bus_weight")]
+    pub express_bus_default_weight: i128,
+    /// Impact (basis points) of the express-flow signal on the value index per window.
+    #[serde(default = "default_express_bus_impact_bps")]
+    pub express_bus_impact_bps: u32,
 }
 
 fn default_chain_name() -> String {
@@ -255,6 +346,102 @@ fn default_storage_label_max_deviation_bps() -> u32 {
     100
 }
 
+fn default_timer_activation_height() -> u64 {
+    u64::MAX
+}
+
+fn default_max_timers() -> usize {
+    crate::timer::MAX_TIMERS
+}
+
+fn default_max_timer_duration_blocks() -> u64 {
+    crate::timer::MAX_TIMER_DURATION_BLOCKS
+}
+
+fn default_timer_min_bet_amount() -> Amount {
+    10
+}
+
+fn default_timer_max_bet_amount() -> Amount {
+    1_000_000_000
+}
+
+fn default_pegged_currency_activation_height() -> u64 {
+    u64::MAX
+}
+
+fn default_pegged_spread_bps() -> u32 {
+    500
+}
+
+fn default_gas_fee_master_bps() -> u32 {
+    400
+}
+
+fn default_pegged_window_blocks() -> u64 {
+    100
+}
+
+fn default_file_system_activation_height() -> u64 {
+    u64::MAX
+}
+
+fn default_max_file_bytes() -> u64 {
+    oxydome_ovm::MAX_ASSET_BYTES
+}
+
+fn default_max_files_per_node() -> u64 {
+    100_000
+}
+
+fn default_departure_take_bps() -> Option<u32> {
+    None
+}
+
+fn default_express_bus_activation_height() -> u64 {
+    u64::MAX
+}
+
+fn default_express_bus_max_trackers() -> usize {
+    crate::express_bus::MAX_EXPRESS_BUSES
+}
+
+fn default_express_bus_window_blocks() -> u64 {
+    100
+}
+
+fn default_express_bus_weight() -> i128 {
+    crate::express_bus::FP
+}
+
+fn default_express_bus_impact_bps() -> u32 {
+    100
+}
+
+fn default_liquidity_pool_activation_height() -> u64 {
+    crate::pricing::default_liquidity_pool_activation_height()
+}
+
+fn default_liquidity_pool_fee_bps() -> u32 {
+    crate::pricing::default_liquidity_pool_fee_bps()
+}
+
+fn default_max_liquidity_pools() -> usize {
+    crate::pricing::default_max_liquidity_pools()
+}
+
+fn default_speedometer_airdrop_interval_blocks() -> u64 {
+    2
+}
+
+fn default_speedometer_airdrop_base_bps() -> u32 {
+    100
+}
+
+fn default_speedometer_stabilization_bps() -> u32 {
+    10
+}
+
 impl ChainParams {
     pub fn execution_version_at(&self, height: u64) -> u32 {
         if height >= self.smart_contract_activation_height {
@@ -287,6 +474,7 @@ impl ChainParams {
             price_change_limit_bps: 500,
             price_smoothing_bps: 250,
             fee_master_bps: 400,
+            gas_fee_master_bps: default_gas_fee_master_bps(),
             bft_num: 2,
             bft_den: 3,
             master_approval_num: 2,
@@ -301,27 +489,51 @@ impl ChainParams {
             t_ref: 10_000,
             a_ref: 100,
             e_ref: 10_000,
-initial_value_index: 1_000_000_000_000,
-        value_impact_limit_bps: 200,
-        supply_change_limit_bps: 10,
-        fee_affordability_bps: 100,
-        min_tx_amount: 100,
-        withdraw_limit_bps: 10,
-        per_account_withdraw_bps: 3000,
-        base_fee: 1,
-        server_base_reward: 1_000,
-        master_base_reward: 50,
-        gas_derivative_sensitivity_bps: 100,
-        master_derivative_sensitivity_bps: 50,
-        server_reward_cap_bps: 2_000,
-        master_reward_cap_bps: 1_000,
-        min_price_update_interval: 10,
+            initial_value_index: 1_000_000_000_000,
+            value_impact_limit_bps: 200,
+            supply_change_limit_bps: 10,
+            fee_affordability_bps: 100,
+            min_tx_amount: 100,
+            withdraw_limit_bps: 10,
+            per_account_withdraw_bps: 3000,
+            base_fee: 1,
+            server_base_reward: 1_000,
+            master_base_reward: 50,
+            gas_derivative_sensitivity_bps: 100,
+            master_derivative_sensitivity_bps: 50,
+            server_reward_cap_bps: 2_000,
+            master_reward_cap_bps: 1_000,
+            min_price_update_interval: 10,
             block_rewards_enabled: true,
             ovm_stack_bytes_per_gas: default_ovm_stack_bytes_per_gas(),
             max_ovm_data_stack_bytes: default_max_ovm_data_stack_bytes(),
             expected_network_storage: 0,
             storage_label_max_deviation_bps: default_storage_label_max_deviation_bps(),
             storage_audit_interval_blocks: 0,
+            timer_activation_height: 1,
+            max_timers: default_max_timers(),
+            max_timer_duration_blocks: default_max_timer_duration_blocks(),
+            timer_min_bet_amount: default_timer_min_bet_amount(),
+            timer_max_bet_amount: default_timer_max_bet_amount(),
+            pegged_currency_activation_height: default_pegged_currency_activation_height(),
+            pegged_spread_bps: default_pegged_spread_bps(),
+            pegged_window_blocks: default_pegged_window_blocks(),
+            file_system_activation_height: 1,
+            max_file_bytes: default_max_file_bytes(),
+            max_files_per_node: default_max_files_per_node(),
+            liquidity_pool_activation_height: 1,
+            liquidity_pool_fee_bps: default_liquidity_pool_fee_bps(),
+            max_liquidity_pools: default_max_liquidity_pools(),
+            speedometer_activation_height: 1,
+            speedometer_airdrop_interval_blocks: default_speedometer_airdrop_interval_blocks(),
+            speedometer_airdrop_base_bps: default_speedometer_airdrop_base_bps(),
+            speedometer_stabilization_bps: default_speedometer_stabilization_bps(),
+            departure_take_bps: default_departure_take_bps(),
+            express_bus_activation_height: 1,
+            max_express_buses: default_express_bus_max_trackers(),
+            express_bus_window_blocks: default_express_bus_window_blocks(),
+            express_bus_default_weight: default_express_bus_weight(),
+            express_bus_impact_bps: default_express_bus_impact_bps(),
         }
     }
 }

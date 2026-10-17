@@ -12,3 +12,5 @@ oxydome-currency.workspace = true
 oxydome-rewards.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+smol = "2"
+futures-util = "0.3"

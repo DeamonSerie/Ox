@@ -108,6 +108,12 @@ pub struct WindowStats {
     pub tx_count: u64,
     /// Amount of Ox deposited into the Exit/Reserve sink in the window.
     pub exit_amount: Amount,
+    /// Highest single transaction `output_total` in the window (used for Speedometer airdrops).
+    pub highest_tx_value: Amount,
+    /// Net Express Bus flow signal (signed, FP-scaled) accumulated across the window.
+    /// Positive = net withdrawals from the bus system (upward value pressure);
+    /// negative = net deposits into the bus system (downward value pressure).
+    pub express_flow: i128,
 }
 
 impl WindowStats {
@@ -118,6 +124,15 @@ impl WindowStats {
         } else {
             self.volume / self.tx_count as u128
         }
+    }
+
+    /// Accumulates `other` into `self` (used by window aggregation).
+    pub fn accumulate(&mut self, other: &WindowStats) {
+        self.volume = self.volume.saturating_add(other.volume);
+        self.tx_count = self.tx_count.saturating_add(other.tx_count);
+        self.exit_amount = self.exit_amount.saturating_add(other.exit_amount);
+        self.highest_tx_value = self.highest_tx_value.max(other.highest_tx_value);
+        self.express_flow = self.express_flow.saturating_add(other.express_flow);
     }
 }
 
@@ -168,6 +183,9 @@ pub fn exit_term(
 ///
 /// `previous` is the value index of the preceding block (always positive, because a rebound
 /// resets it to the previous positive value).
+///
+/// The express-flow signal from `stats.express_flow` is applied as an additional term:
+/// deposits (negative flow) exert downward pressure, withdrawals (positive flow) upward.
 pub fn compute_value(
     params: &ChainParams,
     stats: &WindowStats,
@@ -179,7 +197,8 @@ pub fn compute_value(
     let act = activity_term(params, stats);
     let x = exit_term(params, stats, supply, genesis_supply);
     let v0 = params.initial_value_index as i128;
-    let raw = fp_mul(v0, act - x);
+    let express_term = fp_mul(bps(params.express_bus_impact_bps), stats.express_flow);
+    let raw = fp_mul(v0, act - x + express_term);
     let lambda = bps(params.lambda_bps);
     let smoothed = fp_mul(lambda, raw) + fp_mul(FP - lambda, previous.raw() as i128);
     if smoothed <= 0 {
@@ -307,6 +326,54 @@ pub fn max_supply_change(
 }
 
 // ---------------------------------------------------------------------------
+// Liquidity pool K recomputation
+// ---------------------------------------------------------------------------
+
+/// Computes the constant-product invariant `K` for a liquidity pool.
+///
+/// `K = upper_bound^(2 * V_norm) * lower_bound^(ln(V_norm))`
+///
+/// where `V_norm = volume / t_ref` (a fixed-point ratio at `FP` scale). The formula is
+/// evaluated in log-space to avoid overflow:
+///
+/// `ln_K = 2 * V_norm * ln(upper_bound) + ln(V_norm) * ln(lower_bound)`
+/// `K = exp_fixed(ln_K)` (saturating)
+///
+/// All inputs are at the `FPU` (`1e12`) fixed-point scale (matching `PriceBounds` and
+/// `ValueIndex`). Returns `K` at the same `FPU` scale. Returns `0` when any input is zero
+/// or `t_ref` is zero.
+pub fn compute_pool_k(
+    upper_bound: oxydome_core::Amount,
+    lower_bound: oxydome_core::Amount,
+    volume: oxydome_core::Amount,
+    t_ref: oxydome_core::Amount,
+) -> oxydome_core::Amount {
+    if upper_bound == 0 || lower_bound == 0 || t_ref == 0 || volume == 0 {
+        return 0;
+    }
+    let ub = i128::try_from(upper_bound).unwrap_or(i128::MAX);
+    let lb = i128::try_from(lower_bound).unwrap_or(i128::MAX);
+    let vol = volume as i128;
+    let tref = t_ref as i128;
+    let v_norm = fp_div(vol, tref);
+    if v_norm <= 0 {
+        return 0;
+    }
+    let ln_v = ln_fixed(v_norm);
+    let ln_upper = ln_fixed(ub);
+    let ln_lower = ln_fixed(lb);
+    let term1 = fp_mul(v_norm.saturating_mul(2), ln_upper);
+    let term2 = fp_mul(ln_v, ln_lower);
+    let ln_k = term1.saturating_add(term2);
+    let k = exp_fixed(ln_k);
+    if k < 0 {
+        0
+    } else {
+        k as u128
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bunny-hop maturity (BH1 / BH2)
 // ---------------------------------------------------------------------------
 
@@ -367,11 +434,13 @@ mod tests {
             volume: 1_000,
             tx_count: 10,
             exit_amount: 0,
+            highest_tx_value: 0,
         };
         let high = WindowStats {
             volume: 1_000_000,
             tx_count: 10_000,
             exit_amount: 0,
+            highest_tx_value: 0,
         };
         let v_low = compute_value(
             &params,
@@ -399,6 +468,7 @@ mod tests {
             volume: 0,
             tx_count: 0,
             exit_amount: 10_000_000_000,
+            highest_tx_value: 0,
         };
         let prev = ValueIndex::from_raw(2 * FPU);
         let t = compute_value(
@@ -431,5 +501,24 @@ mod tests {
             &params
         ));
         assert!(rebound_utxo_spendable(0, 0, None, &params));
+    }
+
+    #[test]
+    fn compute_pool_k_returns_nonzero_for_valid_inputs() {
+        // With upper_bound = lower_bound = v_norm = FPU, K should be exp(2*v_norm*ln(FPU) + ln(v_norm)*ln(FPU))
+        let upper = FPU; // 1e12
+        let lower = FPU;
+        let volume = FPU * 100; // 1e14
+        let t_ref = FPU; // 1e12
+        let k = compute_pool_k(upper, lower, volume, t_ref);
+        assert!(k > 0);
+    }
+
+    #[test]
+    fn compute_pool_k_returns_zero_for_zero_inputs() {
+        assert_eq!(compute_pool_k(0, FPU, FPU, FPU), 0);
+        assert_eq!(compute_pool_k(FPU, 0, FPU, FPU), 0);
+        assert_eq!(compute_pool_k(FPU, FPU, 0, FPU), 0);
+        assert_eq!(compute_pool_k(FPU, FPU, FPU, 0), 0);
     }
 }

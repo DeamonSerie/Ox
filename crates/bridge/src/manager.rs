@@ -21,8 +21,8 @@ pub struct MicroTokenDistribution {
     pub total_supply: u64,
 }
 
-use ::serde::Serialize;
 use ::serde::Deserialize;
+use ::serde::Serialize;
 
 use crate::state::{BridgeError, BridgeState};
 
@@ -74,12 +74,13 @@ impl MicroTokenManager {
         let expected_master = (total_amount * PERCENTAGE_MASTER) / 100;
         let expected_bridger = (total_amount * PERCENTAGE_BRIDGER) / 100;
         let burn_ok = burn_amount == 0;
-        let totals_ok = (server_amount + master_amount + burn_amount + bridger_amount) == total_amount;
+        let totals_ok =
+            (server_amount + master_amount + burn_amount + bridger_amount) == total_amount;
 
-        server_amount == expected_server &&
-        master_amount == expected_master &&
-        bridger_amount == expected_bridger &&
-        burn_ok &&
-        totals_ok
+        server_amount == expected_server
+            && master_amount == expected_master
+            && bridger_amount == expected_bridger
+            && burn_ok
+            && totals_ok
     }
 }

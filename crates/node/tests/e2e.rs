@@ -260,10 +260,7 @@ fn end_to_end_blocks_and_governance() {
     }
     advance(&mut w, 2, vec![], vec![Operation::Mint(mint)]);
     assert_consistent(&w);
-    assert_eq!(
-        w.nodes[0].state.supply,
-        supply_after_fees + mint_amount
-    );
+    assert_eq!(w.nodes[0].state.supply, supply_after_fees + mint_amount);
     assert_eq!(w.nodes[0].state.epoch_minted, mint_amount);
 
     // ---- Block 3: governed burn from the user's change output. ----

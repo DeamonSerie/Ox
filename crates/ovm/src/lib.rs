@@ -3,17 +3,40 @@
 //! OVM v1 is intentionally small: fixed-width `u64` arithmetic, bounded stack and gas,
 //! indexed local variables, and `u64` contract storage slots/values. It does not execute
 //! host code or perform I/O.
+//!
+//! Opcodes are executed via inline `asm!` blocks compiled to native machine code at build time.
+//! The dispatcher scans the decoded instruction stream and dispatches to pre-compiled handlers.
 
 use oxydome_crypto::{hash_value, Hash};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod context;
+pub mod dispatcher;
+pub mod opcode;
+pub mod opcodes;
+
+// Re-export the opcode handler functions for Solid compiler to access
+pub mod opcode_handlers {
+    pub use crate::opcodes as handlers;
+}
+
+/// Serialises eight little-endian `u64` words (the OVM cross-message identifier convention) back
+/// into the 64-byte `Hash` byte representation they were derived from.
+pub(crate) fn words_to_hash_bytes(words: &[u64; 8]) -> [u8; 64] {
+    let mut bytes = [0u8; 64];
+    for (chunk, word) in bytes.chunks_exact_mut(8).zip(words.iter()) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
 const MAGIC: &[u8; 4] = b"OVM\x01";
 const CONTRACT_MAGIC: &[u8; 4] = b"OSC\x01";
 const ASSET_MANIFEST_MAGIC: &[u8; 4] = b"OAM\x01";
 const MAX_CODE_BYTES: usize = 64 * 1024;
-const MAX_STACK: usize = 1024;
-const MAX_LOCALS: usize = 256;
+pub(crate) const MAX_STACK: usize = 1024;
+pub(crate) const MAX_LOCALS: usize = 256;
 pub const MAX_ARGUMENTS: usize = 64;
 pub const AUTHORITY_WORD_COUNT: usize = 4;
 pub const MAX_CONTRACT_FUNCTIONS: usize = 128;
@@ -23,7 +46,7 @@ pub const MAX_ASSET_MANIFEST_ENTRIES: usize = 1024;
 pub const MAX_ASSET_PATH_BYTES: usize = 255;
 pub const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_ASSET_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
-pub const MAX_STORAGE_SLOTS: usize = 1_024;
+pub const MAX_STORAGE_SLOTS: usize = 4_096;
 pub const MAX_CONTRACTS: usize = 10_000;
 pub const ACTION_INTRINSIC_GAS: u64 = 10;
 pub const CONTRACT_DISPATCH_GAS: u64 = 5;
@@ -33,6 +56,8 @@ pub const MAX_CROSS_ARGUMENTS: usize = 64;
 pub const CROSS_HOST_GAS: u64 = 20;
 /// Number of bytes of data stack that a single GAS unit reserves.
 pub const STACK_BYTES_PER_GAS: u64 = 6;
+/// Fixed-point scale used for packed liquidity-pool reserves and K in OVM u64 space.
+pub const POOL_FP_SCALE: u64 = 1_000_000_000_000; // 1e12
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Instruction {
@@ -42,6 +67,16 @@ pub enum Instruction {
     StoreLocal(u8),
     LoadStorage(u64),
     StoreStorage(u64),
+    /// Consumes `words` u64 values from the stack (top first), hashes their
+    /// little-endian byte concatenation with SHA3-512, and pushes the first
+    /// 8 bytes of the digest as a `u64`. Used for mapping slot derivation.
+    Hash {
+        words: u8,
+    },
+    /// Dynamic storage: pops a `u64` slot, loads `storage[slot]` (0 if unset).
+    LoadStorageDyn,
+    /// Dynamic storage: pops a `u64` value, then a `u64` slot, stores the value.
+    StoreStorageDyn,
     Add,
     Sub,
     Mul,
@@ -53,6 +88,9 @@ pub enum Instruction {
     And,
     Or,
     Not,
+    BitXor,
+    Shl,
+    Shr,
     Jump(u32),
     JumpIfFalse(u32),
     Emit(u32),
@@ -60,10 +98,27 @@ pub enum Instruction {
     /// `entry_selector`, eight `target_contract` words, eight `target_ohm` words, then
     /// `arg_count` payload words. Pushes the staged-call token onto the stack. Requires a
     /// [`CrossHost`].
-    XCall { arg_count: u16 },
+    XCall {
+        arg_count: u16,
+    },
     /// Reads the receipt for `msg_id` (eight words). Pushes `success` then `value`. Requires a
     /// [`CrossHost`]; a missing receipt resolves to `(success = 0, value = 0)`.
     ReadReply,
+    /// Loads price bounds for an asset. Pops `asset_id` (u64) from the stack and pushes
+    /// `upper_bound`, `lower_bound`, `bound_price_position`, and `midpoint` (each u64).
+    /// Requires a [`CrossHost`] with a [`PriceOracle`].
+    LoadPriceBounds,
+    /// Performs a pegged-currency conversion. Pops `amount` and `asset_id` (top first) and
+    /// pushes the guaranteed converted amount. The asset's current price must be >= its
+    /// `midpoint` (upper-half check). Requires a [`CrossHost`] with a [`PriceOracle`].
+    PeggedConvert,
+    /// Loads liquidity-pool state. Pops `pool_id` (u64) and pushes `reserve_x`,
+    /// `reserve_y`, `k`, and `fee_bps` (each u64). Requires a [`CrossHost`] with a
+    /// [`PoolOracle`].
+    LoadPoolState,
+    /// Performs a constant-product swap. Pops `input_amount` and `pool_id` (top first) and
+    /// pushes the output amount. Requires a [`CrossHost`] with a [`PoolOracle`].
+    PoolSwap,
     Return,
     Revert,
     /// Pushes the byte length of the pre-reserved data stack onto the operand stack.
@@ -108,6 +163,7 @@ impl Program {
 pub enum ContractValueType {
     U64,
     Bool,
+    Address,
 }
 
 /// One exported Solid function in a compiled contract.
@@ -404,6 +460,7 @@ fn encode_value_type(value_type: ContractValueType) -> u8 {
     match value_type {
         ContractValueType::U64 => 1,
         ContractValueType::Bool => 2,
+        ContractValueType::Address => 3,
     }
 }
 
@@ -411,6 +468,7 @@ fn decode_value_type(value: u8) -> Result<ContractValueType, VmError> {
     match value {
         1 => Ok(ContractValueType::U64),
         2 => Ok(ContractValueType::Bool),
+        3 => Ok(ContractValueType::Address),
         _ => Err(VmError::InvalidBytecode),
     }
 }
@@ -469,16 +527,54 @@ pub struct ReceiptView {
     pub value: u64,
 }
 
+/// Packed price bounds for OVM consumption (u64 scale).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriceBoundsPacked {
+    pub upper_bound: u64,
+    pub lower_bound: u64,
+    pub bound_price_position: u64,
+    pub midpoint: u64,
+    /// Current price of the asset, needed for the in-bounds check.
+    pub current_price: u64,
+}
+
+/// Packed liquidity pool state for OVM consumption (u64 scale).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PoolStatePacked {
+    pub reserve_x: u64,
+    pub reserve_y: u64,
+    pub k: u64,
+    pub fee_bps: u64,
+}
+
+/// Host-side liquidity pool oracle carrying packed pool state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PoolOracle {
+    /// Keyed by the LiquidityPoolConfig id, folded to a u64 oracle key.
+    pub pools: BTreeMap<u64, PoolStatePacked>,
+}
+
+/// Host-side price oracle carrying packed bounds for one or more priced assets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PriceOracle {
+    /// Keyed by the `PriceAsset::oracle_key()` u64 hash.
+    pub bounds: BTreeMap<u64, PriceBoundsPacked>,
+}
+
 /// Host context for contract-originated cross-OHM instructions.
 ///
 /// `origin_ohm` is the ledger executing the contract (the source of any staged `XCall`
 /// messages). `inbox` is the set of receipts already recorded on that ledger that `ReadReply`
-/// may consult. A [`CrossHost`] is never serialized and only exists while a block is being
-/// derived.
+/// may consult. `price_oracle` optionally carries packed price bounds for pegged-currency
+/// conversions (`LoadPriceBounds`, `PeggedConvert`). `pool_oracle` optionally carries packed
+/// liquidity-pool state for AMM swaps (`LoadPoolState`, `PoolSwap`). A [`CrossHost`] is never
+/// serialized and only exists while a block is being derived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossHost {
     pub origin_ohm: Hash,
     pub inbox: BTreeMap<Hash, ReceiptView>,
+    pub price_oracle: Option<PriceOracle>,
+    pub pool_oracle: Option<PoolOracle>,
 }
 
 impl Default for CrossHost {
@@ -486,6 +582,8 @@ impl Default for CrossHost {
         Self {
             origin_ohm: Hash::zero(),
             inbox: BTreeMap::new(),
+            price_oracle: None,
+            pool_oracle: None,
         }
     }
 }
@@ -593,6 +691,9 @@ pub fn verify(program: &Program) -> Result<(), VmError> {
             Instruction::XCall { arg_count } if *arg_count as usize > MAX_CROSS_ARGUMENTS => {
                 return Err(VmError::InvalidProgram)
             }
+            Instruction::Hash { words } if *words == 0 || *words > 8 => {
+                return Err(VmError::InvalidProgram)
+            }
             _ => {}
         }
     }
@@ -629,287 +730,28 @@ pub fn execute_with_host(
             gas_used: 0,
         });
     }
-    let mut stack = Vec::new();
-    let mut locals = vec![0u64; program.local_count as usize];
-    let mut storage = initial_storage.clone();
-    let mut logs = Vec::new();
-    let mut staged_calls = Vec::new();
-    let mut pc = 0usize;
-    let mut token_base: u64 = 0;
-    let mut data: Vec<u8> = vec![0u8; stack_bytes as usize];
 
-    while let Some(instruction) = program.instructions.get(pc) {
-        pc += 1;
-        let result = match instruction {
-            Instruction::Push(value) => push(&mut stack, *value),
-            Instruction::LoadArg(index) => push(&mut stack, arguments[*index as usize]),
-            Instruction::LoadLocal(index) => push(&mut stack, locals[*index as usize]),
-            Instruction::StoreLocal(index) => pop(&mut stack).map(|value| {
-                locals[*index as usize] = value;
-            }),
-            Instruction::LoadStorage(slot) => push(&mut stack, *storage.get(slot).unwrap_or(&0)),
-            Instruction::StoreStorage(slot) => match pop(&mut stack) {
-                Ok(value) if value == 0 => {
-                    storage.remove(slot);
-                    Ok(())
-                }
-                Ok(value) if storage.contains_key(slot) || storage.len() < MAX_STORAGE_SLOTS => {
-                    storage.insert(*slot, value);
-                    Ok(())
-                }
-                Ok(_) => Err(VmError::StorageLimitExceeded),
-                Err(error) => Err(error),
-            },
-            Instruction::Add => binary(&mut stack, u64::checked_add),
-            Instruction::Sub => binary(&mut stack, u64::checked_sub),
-            Instruction::Mul => binary(&mut stack, u64::checked_mul),
-            Instruction::Div => match pop(&mut stack) {
-                Err(error) => Err(error),
-                Ok(0) => Err(VmError::DivisionByZero),
-                Ok(rhs) => match pop(&mut stack) {
-                    Err(error) => Err(error),
-                    Ok(lhs) => push(&mut stack, lhs / rhs),
-                },
-            },
-            Instruction::Mod => match pop(&mut stack) {
-                Err(error) => Err(error),
-                Ok(0) => Err(VmError::DivisionByZero),
-                Ok(rhs) => match pop(&mut stack) {
-                    Err(error) => Err(error),
-                    Ok(lhs) => push(&mut stack, lhs % rhs),
-                },
-            },
-            Instruction::Equal => compare(&mut stack, |left, right| left == right),
-            Instruction::LessThan => compare(&mut stack, |left, right| left < right),
-            Instruction::GreaterThan => compare(&mut stack, |left, right| left > right),
-            Instruction::And => binary(&mut stack, |left, right| Some(left & right)),
-            Instruction::Or => binary(&mut stack, |left, right| Some(left | right)),
-            Instruction::Not => {
-                pop(&mut stack).and_then(|value| push(&mut stack, u64::from(value == 0)))
-            }
-            Instruction::Jump(target) => {
-                pc = *target as usize;
-                Ok(())
-            }
-            Instruction::JumpIfFalse(target) => match pop(&mut stack) {
-                Ok(0) => {
-                    pc = *target as usize;
-                    Ok(())
-                }
-                Ok(_) => Ok(()),
-                Err(error) => Err(error),
-            },
-            Instruction::Emit(topic) => pop(&mut stack).map(|value| {
-                logs.push(Log {
-                    topic: *topic,
-                    value,
-                });
-            }),
-            Instruction::XCall { arg_count } => {
-                if host.is_none() {
-                    return Err(ExecutionFailure {
-                        error: VmError::InvalidProgram,
-                        gas_used: stack_bytes,
-                    });
-                }
-                let arg_count = *arg_count as usize;
-                if arg_count > MAX_CROSS_ARGUMENTS {
-                    return Err(ExecutionFailure {
-                        error: VmError::InvalidProgram,
-                        gas_used: stack_bytes,
-                    });
-                }
-                let gas_limit = match pop(&mut stack) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return Err(ExecutionFailure { error, gas_used: stack_bytes })
-                    }
-                };
-                let entry_selector = match pop(&mut stack) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return Err(ExecutionFailure { error, gas_used: stack_bytes })
-                    }
-                };
-                let mut contract_words = [0u64; 8];
-                for word in contract_words.iter_mut().rev() {
-                    *word = match pop(&mut stack) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            return Err(ExecutionFailure { error, gas_used: stack_bytes })
-                        }
-                    };
-                }
-                let target_contract = Hash(words_to_hash_bytes(&contract_words));
-                let mut ohm_words = [0u64; 8];
-                for word in ohm_words.iter_mut().rev() {
-                    *word = match pop(&mut stack) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            return Err(ExecutionFailure { error, gas_used: stack_bytes })
-                        }
-                    };
-                }
-                let target_ohm = Hash(words_to_hash_bytes(&ohm_words));
-                let mut arguments = Vec::with_capacity(arg_count);
-                for _ in 0..arg_count {
-                    arguments.push(match pop(&mut stack) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            return Err(ExecutionFailure { error, gas_used: stack_bytes })
-                        }
-                    });
-                }
-                arguments.reverse();
-                staged_calls.push(StagedCrossCall {
-                    token: token_base,
-                    target_ohm,
-                    target_contract,
-                    entry_selector,
-                    gas_limit,
-                    arguments,
-                });
-                token_base += 1;
-                push(&mut stack, token_base - 1)
-            }
-            Instruction::ReadReply => {
-                let host = match host {
-                    Some(host) => host,
-                    None => {
-                        return Err(ExecutionFailure {
-                            error: VmError::InvalidProgram,
-                            gas_used: stack_bytes,
-                        })
-                    }
-                };
-                let mut words = [0u64; 8];
-                for word in words.iter_mut().rev() {
-                    *word = match pop(&mut stack) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            return Err(ExecutionFailure { error, gas_used: stack_bytes })
-                        }
-                    };
-                }
-                let msg_id = Hash(words_to_hash_bytes(&words));
-                let view = host
-                    .inbox
-                    .get(&msg_id)
-                    .copied()
-                    .unwrap_or(ReceiptView {
-                        success: false,
-                        value: 0,
-                    });
-                push(&mut stack, u64::from(view.success)).and_then(|()| {
-                    push(&mut stack, view.value)
-                })
-            }
-            Instruction::DataSize => push(&mut stack, stack_bytes),
-            Instruction::LoadData(offset) => {
-                let value = read_data_u64(&data, *offset).map_err(|error| ExecutionFailure {
-                    error,
-                    gas_used: stack_bytes,
-                })?;
-                push(&mut stack, value)
-            }
-            Instruction::StoreData(offset) => {
-                let value = pop(&mut stack).map_err(|error| ExecutionFailure {
-                    error,
-                    gas_used: stack_bytes,
-                })?;
-                write_data_u64(&mut data, *offset, value)
-            }
-            Instruction::Return => {
-                let return_value = if stack.is_empty() {
-                    None
-                } else {
-                    match pop(&mut stack) {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            return Err(ExecutionFailure { error, gas_used: stack_bytes });
-                        }
-                    }
-                };
-                return Ok(Execution {
-                    return_value,
-                    gas_used: stack_bytes,
-                    logs,
-                    storage,
-                    staged_calls,
-                });
-            }
-            Instruction::Revert => {
-                return Err(ExecutionFailure {
-                    error: VmError::Reverted,
-                    gas_used: stack_bytes,
-                });
-            }
-        };
-        if let Err(error) = result {
-            return Err(ExecutionFailure { error, gas_used: stack_bytes });
-        }
-    }
-    Err(ExecutionFailure {
-        error: VmError::MissingReturn,
-        gas_used: stack_bytes,
-    })
-}
+    let mut ctx = context::ExecutionContext {
+        stack: Vec::new(),
+        locals: vec![0u64; program.local_count as usize],
+        storage: initial_storage.clone(),
+        data: vec![0u8; stack_bytes as usize],
+        arguments,
+        logs: Vec::new(),
+        staged_calls: Vec::new(),
+        pc: 0,
+        instructions_used: 0,
+        gas_limit: stack_bytes,
+        token_base: 0,
+        return_value: None,
+        operand_u64: 0,
+        operand_u32: 0,
+        operand_u16: 0,
+        operand_u8: 0,
+        host,
+    };
 
-fn push(stack: &mut Vec<u64>, value: u64) -> Result<(), VmError> {
-    if stack.len() >= MAX_STACK {
-        return Err(VmError::StackOverflow);
-    }
-    stack.push(value);
-    Ok(())
-}
-
-fn read_data_u64(data: &[u8], offset: u64) -> Result<u64, VmError> {
-    let start = offset as usize;
-    let end = start.checked_add(8).ok_or(VmError::DataStackOverflow)?;
-    if end > data.len() {
-        return Err(VmError::DataStackOverflow);
-    }
-    let bytes: [u8; 8] = data[start..end].try_into().expect("checked range above");
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn write_data_u64(data: &mut [u8], offset: u64, value: u64) -> Result<(), VmError> {
-    let start = offset as usize;
-    let end = start.checked_add(8).ok_or(VmError::DataStackOverflow)?;
-    if end > data.len() {
-        return Err(VmError::DataStackOverflow);
-    }
-    data[start..end].copy_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-/// Serialises eight little-endian `u64` words (the OVM cross-message identifier convention) back
-/// into the 64-byte `Hash` byte representation they were derived from.
-fn words_to_hash_bytes(words: &[u64; 8]) -> [u8; 64] {
-    let mut bytes = [0u8; 64];
-    for (chunk, word) in bytes.chunks_exact_mut(8).zip(words.iter()) {
-        chunk.copy_from_slice(&word.to_le_bytes());
-    }
-    bytes
-}
-
-fn pop(stack: &mut Vec<u64>) -> Result<u64, VmError> {
-    stack.pop().ok_or(VmError::StackUnderflow)
-}
-
-fn binary(stack: &mut Vec<u64>, operation: fn(u64, u64) -> Option<u64>) -> Result<(), VmError> {
-    let right = pop(stack)?;
-    let left = pop(stack)?;
-    push(
-        stack,
-        operation(left, right).ok_or(VmError::ArithmeticOverflow)?,
-    )
-}
-
-fn compare(stack: &mut Vec<u64>, operation: fn(u64, u64) -> bool) -> Result<(), VmError> {
-    let right = pop(stack)?;
-    let left = pop(stack)?;
-    push(stack, u64::from(operation(left, right)))
+    dispatcher::run_program(program, &mut ctx)
 }
 
 fn encode_instruction(instruction: &Instruction, output: &mut Vec<u8>) {
@@ -938,6 +780,12 @@ fn encode_instruction(instruction: &Instruction, output: &mut Vec<u8>) {
             output.push(0x06);
             output.extend_from_slice(&slot.to_le_bytes());
         }
+        Instruction::Hash { words } => {
+            output.push(0x07);
+            output.push(*words);
+        }
+        Instruction::StoreStorageDyn => output.push(0x0e),
+        Instruction::LoadStorageDyn => output.push(0x0f),
         Instruction::Add => output.push(0x10),
         Instruction::Sub => output.push(0x11),
         Instruction::Mul => output.push(0x12),
@@ -949,6 +797,9 @@ fn encode_instruction(instruction: &Instruction, output: &mut Vec<u8>) {
         Instruction::And => output.push(0x18),
         Instruction::Or => output.push(0x19),
         Instruction::Not => output.push(0x1a),
+        Instruction::BitXor => output.push(0x1b),
+        Instruction::Shl => output.push(0x1c),
+        Instruction::Shr => output.push(0x1d),
         Instruction::Jump(target) => {
             output.push(0x20);
             output.extend_from_slice(&target.to_le_bytes());
@@ -966,6 +817,10 @@ fn encode_instruction(instruction: &Instruction, output: &mut Vec<u8>) {
             output.extend_from_slice(&arg_count.to_le_bytes());
         }
         Instruction::ReadReply => output.push(0x41),
+        Instruction::LoadPriceBounds => output.push(0x60),
+        Instruction::PeggedConvert => output.push(0x61),
+        Instruction::LoadPoolState => output.push(0x62),
+        Instruction::PoolSwap => output.push(0x63),
         Instruction::Return => output.push(0xf0),
         Instruction::Revert => output.push(0xf1),
         Instruction::DataSize => output.push(0x50),
@@ -1003,6 +858,11 @@ fn decode_instruction(bytes: &[u8], cursor: &mut usize) -> Result<Instruction, V
         0x04 => Instruction::StoreLocal(take::<1>(bytes, cursor)?[0]),
         0x05 => Instruction::LoadStorage(u64::from_le_bytes(take(bytes, cursor)?)),
         0x06 => Instruction::StoreStorage(u64::from_le_bytes(take(bytes, cursor)?)),
+        0x07 => Instruction::Hash {
+            words: take::<1>(bytes, cursor)?[0],
+        },
+        0x0e => Instruction::StoreStorageDyn,
+        0x0f => Instruction::LoadStorageDyn,
         0x10 => Instruction::Add,
         0x11 => Instruction::Sub,
         0x12 => Instruction::Mul,
@@ -1014,6 +874,9 @@ fn decode_instruction(bytes: &[u8], cursor: &mut usize) -> Result<Instruction, V
         0x18 => Instruction::And,
         0x19 => Instruction::Or,
         0x1a => Instruction::Not,
+        0x1b => Instruction::BitXor,
+        0x1c => Instruction::Shl,
+        0x1d => Instruction::Shr,
         0x20 => Instruction::Jump(u32::from_le_bytes(take(bytes, cursor)?)),
         0x21 => Instruction::JumpIfFalse(u32::from_le_bytes(take(bytes, cursor)?)),
         0x30 => Instruction::Emit(u32::from_le_bytes(take(bytes, cursor)?)),
@@ -1021,6 +884,10 @@ fn decode_instruction(bytes: &[u8], cursor: &mut usize) -> Result<Instruction, V
             arg_count: u16::from_le_bytes(take(bytes, cursor)?),
         },
         0x41 => Instruction::ReadReply,
+        0x60 => Instruction::LoadPriceBounds,
+        0x61 => Instruction::PeggedConvert,
+        0x62 => Instruction::LoadPoolState,
+        0x63 => Instruction::PoolSwap,
         0xf0 => Instruction::Return,
         0xf1 => Instruction::Revert,
         0x50 => Instruction::DataSize,
@@ -1072,16 +939,16 @@ mod tests {
         let overflow = execute(&program, &[], &BTreeMap::new(), 100).unwrap_err();
         assert_eq!(overflow.error, VmError::ArithmeticOverflow);
         assert_eq!(overflow.gas_used, 100);
-// Accessing the data stack beyond the reserved size fails with DataStackOverflow,
-    // not a mid-run fuel stop: the reservation itself bounds the stack.
-    let oob = Program {
-        argument_count: 0,
-        local_count: 0,
-        instructions: vec![Instruction::LoadData(100), Instruction::Return],
-    };
-    let failure = execute(&oob, &[], &BTreeMap::new(), 100).unwrap_err();
-    assert_eq!(failure.error, VmError::DataStackOverflow);
-    assert_eq!(failure.gas_used, 100);
+        // Accessing the data stack beyond the reserved size fails with DataStackOverflow,
+        // not a mid-run fuel stop: the reservation itself bounds the stack.
+        let oob = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![Instruction::LoadData(100), Instruction::Return],
+        };
+        let failure = execute(&oob, &[], &BTreeMap::new(), 100).unwrap_err();
+        assert_eq!(failure.error, VmError::DataStackOverflow);
+        assert_eq!(failure.gas_used, 100);
     }
 
     #[test]
@@ -1299,6 +1166,8 @@ mod tests {
             Some(&CrossHost {
                 origin_ohm: Hash::zero(),
                 inbox: BTreeMap::new(),
+                price_oracle: None,
+                pool_oracle: None,
             }),
         )
         .unwrap();
@@ -1327,13 +1196,19 @@ mod tests {
             instructions,
         };
         assert_eq!(
-            execute(&xcall, &[], &BTreeMap::new(), 1_000).unwrap_err().error,
+            execute(&xcall, &[], &BTreeMap::new(), 1_000)
+                .unwrap_err()
+                .error,
             VmError::InvalidProgram
         );
         let readprogram = Program {
             argument_count: 0,
             local_count: 0,
-            instructions: vec![Instruction::Push(1), Instruction::ReadReply, Instruction::Return],
+            instructions: vec![
+                Instruction::Push(1),
+                Instruction::ReadReply,
+                Instruction::Return,
+            ],
         };
         assert_eq!(
             execute(&readprogram, &[], &BTreeMap::new(), 1_000)
@@ -1370,17 +1245,27 @@ mod tests {
         let host = CrossHost {
             origin_ohm: Hash::zero(),
             inbox,
+            price_oracle: None,
+            pool_oracle: None,
         };
-        let execution = execute_with_host(&program, &[], &BTreeMap::new(), 1_000, Some(&host))
-            .unwrap();
+        let execution =
+            execute_with_host(&program, &[], &BTreeMap::new(), 1_000, Some(&host)).unwrap();
         assert_eq!(execution.storage.get(&0), Some(&41));
         assert_eq!(execution.storage.get(&1), Some(&1));
         // Missing receipts resolve to `(success = 0, value = 0)`; zero values are pruned from
         // storage, so both slots disappear.
-        let missing = execute_with_host(&program, &[], &BTreeMap::new(), 1_000, Some(&CrossHost {
-            origin_ohm: Hash::zero(),
-            inbox: BTreeMap::new(),
-        }))
+        let missing = execute_with_host(
+            &program,
+            &[],
+            &BTreeMap::new(),
+            1_000,
+            Some(&CrossHost {
+                origin_ohm: Hash::zero(),
+                inbox: BTreeMap::new(),
+                price_oracle: None,
+                pool_oracle: None,
+            }),
+        )
         .unwrap();
         assert!(missing.storage.is_empty());
     }
@@ -1395,5 +1280,241 @@ mod tests {
             }],
         };
         assert_eq!(program.encode(), Err(VmError::InvalidProgram));
+    }
+
+    #[test]
+    fn hash_instruction_computes_sha3_512_of_stack_words() {
+        let program = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![
+                Instruction::Push(0x1122334455667788),
+                Instruction::Push(0x0000000000000001),
+                Instruction::Hash { words: 2 },
+                Instruction::Return,
+            ],
+        };
+        let execution = execute(&program, &[], &BTreeMap::new(), 100).unwrap();
+        let bytes: [u8; 8] = (1u64).to_le_bytes();
+        let mut input = Vec::new();
+        input.extend_from_slice(&0x1122334455667788u64.to_le_bytes());
+        input.extend_from_slice(&0x0000000000000001u64.to_le_bytes());
+        let expected = oxydome_crypto::hash(&input);
+        let expected_u64 = u64::from_le_bytes(expected.0[..8].try_into().unwrap());
+        assert_eq!(execution.return_value, Some(expected_u64));
+    }
+
+    #[test]
+    fn hash_instruction_rejects_invalid_word_count() {
+        let bad_zero = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![Instruction::Hash { words: 0 }, Instruction::Return],
+        };
+        assert_eq!(bad_zero.encode(), Err(VmError::InvalidProgram));
+        let bad_nine = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![
+                Instruction::Push(1),
+                Instruction::Push(2),
+                Instruction::Push(3),
+                Instruction::Push(4),
+                Instruction::Push(5),
+                Instruction::Push(6),
+                Instruction::Push(7),
+                Instruction::Push(8),
+                Instruction::Push(9),
+                Instruction::Hash { words: 9 },
+                Instruction::Return,
+            ],
+        };
+        assert_eq!(bad_nine.encode(), Err(VmError::InvalidProgram));
+    }
+
+    #[test]
+    fn dynamic_storage_load_store_round_trips() {
+        let base = 42u64;
+        let key = 7u64;
+        let value = 99u64;
+        let program = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![
+                Instruction::Push(base),
+                Instruction::Push(key),
+                Instruction::Hash { words: 2 },
+                Instruction::Push(value),
+                Instruction::StoreStorageDyn,
+                Instruction::Push(base),
+                Instruction::Push(key),
+                Instruction::Hash { words: 2 },
+                Instruction::LoadStorageDyn,
+                Instruction::Return,
+            ],
+        };
+        let execution = execute(&program, &[], &BTreeMap::new(), 1000).unwrap();
+        assert_eq!(execution.return_value, Some(value));
+        // Confirm the storage slot was set to the hashed key, not the raw key.
+        let expected_slot = {
+            let mut input = Vec::new();
+            input.extend_from_slice(&base.to_le_bytes());
+            input.extend_from_slice(&key.to_le_bytes());
+            u64::from_le_bytes(oxydome_crypto::hash(&input).0[..8].try_into().unwrap())
+        };
+        assert!(execution.storage.contains_key(&expected_slot));
+    }
+
+    #[test]
+    fn dynamic_storage_returns_zero_for_unset_slot() {
+        let program = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![
+                Instruction::Push(1),
+                Instruction::LoadStorageDyn,
+                Instruction::Return,
+            ],
+        };
+        let execution = execute(&program, &[], &BTreeMap::new(), 100).unwrap();
+        assert_eq!(execution.return_value, Some(0));
+    }
+
+    #[test]
+    fn address_value_type_round_trips_in_artifact() {
+        let program = Program {
+            argument_count: (AUTHORITY_WORD_COUNT + 1) as u8,
+            local_count: 0,
+            instructions: vec![Instruction::Push(7), Instruction::Return],
+        }
+        .encode()
+        .unwrap();
+        let artifact = ContractArtifact {
+            source_hash: None,
+            asset_manifest_hash: None,
+            functions: vec![ContractFunction {
+                name: "read".into(),
+                inputs: vec![ContractValueType::Address],
+                output: Some(ContractValueType::Address),
+                code: program,
+            }],
+        };
+        let encoded = artifact.encode().unwrap();
+        let decoded = ContractArtifact::decode(&encoded).unwrap();
+        assert_eq!(decoded, artifact);
+    }
+
+    #[test]
+    fn load_pool_state_pushes_packed_fields() {
+        let pool_id = 0x1234u64;
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            pool_id,
+            PoolStatePacked {
+                reserve_x: 1_000,
+                reserve_y: 2_000,
+                k: 2_000_000,
+                fee_bps: 100,
+            },
+        );
+        let program = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![
+                Instruction::Push(pool_id),
+                Instruction::LoadPoolState,
+                Instruction::Return,
+            ],
+        };
+        let host = CrossHost {
+            origin_ohm: Hash::zero(),
+            inbox: BTreeMap::new(),
+            price_oracle: None,
+            pool_oracle: Some(PoolOracle { pools }),
+        };
+        let result = execute_with_host(&program, &[], &BTreeMap::new(), 100, Some(&host));
+        assert!(result.is_ok());
+        let exec = result.unwrap();
+        // Stack order: reserve_x, reserve_y, k, fee_bps (fee_bps on top)
+        // Return pops the top value (fee_bps)
+        assert_eq!(exec.return_value, Some(100));
+    }
+
+    #[test]
+    fn pool_swap_computes_constant_product_output() {
+        // Pools with: x=2, y=8, k = x*y*scale = 16*1e12
+        let pool_id = 0x9999u64;
+        let scale: u128 = 1_000_000_000_000;
+        let k = 16 * scale as u64; // 16_000_000_000_000
+        let pools = {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                pool_id,
+                PoolStatePacked {
+                    reserve_x: 2,
+                    reserve_y: 8,
+                    k,
+                    fee_bps: 0,
+                },
+            );
+            m
+        };
+        // Input: 1 unit of x, no fee
+        // effective_input = 1*1e12 = 1e12
+        // new_x = 2e12 + 1e12 = 3e12
+        // new_y = (16e12 * 1e12) / 3e12 = 16e24 / 3e12 = 5.333e12
+        // output = 8e12 - 5.333e12 = 2.667e12
+        // result = 2.667e12 / 1e12 = 2 (truncated)
+        let program = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![
+                Instruction::Push(1),
+                Instruction::Push(pool_id),
+                Instruction::PoolSwap,
+                Instruction::Return,
+            ],
+        };
+        let host = CrossHost {
+            origin_ohm: Hash::zero(),
+            inbox: BTreeMap::new(),
+            price_oracle: None,
+            pool_oracle: Some(PoolOracle { pools }),
+        };
+        let exec = execute_with_host(&program, &[], &BTreeMap::new(), 100, Some(&host)).unwrap();
+        assert_eq!(exec.return_value, Some(2));
+    }
+
+    #[test]
+    fn load_pool_state_requires_host() {
+        let program = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![
+                Instruction::Push(1),
+                Instruction::LoadPoolState,
+                Instruction::Return,
+            ],
+        };
+        let result = execute(&program, &[], &BTreeMap::new(), 100);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().error, VmError::InvalidProgram);
+    }
+
+    #[test]
+    fn pool_swap_requires_host() {
+        let program = Program {
+            argument_count: 0,
+            local_count: 0,
+            instructions: vec![
+                Instruction::Push(1),
+                Instruction::Push(1),
+                Instruction::PoolSwap,
+                Instruction::Return,
+            ],
+        };
+        let result = execute(&program, &[], &BTreeMap::new(), 100);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().error, VmError::InvalidProgram);
     }
 }

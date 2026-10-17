@@ -148,6 +148,41 @@ pub struct DaoDeclaration {
     pub peg: Option<DaoPegDeclaration>,
 }
 
+/// Timer declaration for a Solid contract, specifying default timer parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimerDeclaration {
+    /// Asset being bet on ("Ox" or a DAO id).
+    pub asset: String,
+    /// Default direction: "up" or "down".
+    pub direction: String,
+    /// Maximum timer duration in blocks.
+    pub duration_blocks: u64,
+    /// Price anchor for the timer.
+    pub price_anchor: u128,
+}
+
+/// Pegged currency declaration for a Solid contract, specifying the price asset
+/// and spread used to derive bounds for pegged conversions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeggedCurrencyDeclaration {
+    /// Asset being priced ("Ox", "Gas", or a DAO id hex).
+    pub asset: String,
+    /// Spread in basis points between upper and lower bounds (e.g. 500 = 5%).
+    pub spread_bps: u32,
+    /// X of the main currency in the peg ratio.
+    pub pegged_numerator: u128,
+    /// Y of the target currency in the peg ratio.
+    pub pegged_denominator: u128,
+}
+
+/// Liquidity pool declaration for a Solid contract, specifying the currencies
+/// accepted by the pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiquidityPoolDeclaration {
+    /// Currencies accepted by the pool (always includes "Ox"; the other drives K).
+    pub currencies: Vec<String>,
+}
+
 /// Parsed contract definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contract {
@@ -169,6 +204,9 @@ pub struct Contract {
     pub modifiers: Vec<Modifier>,
     pub errors: Vec<CustomError>,
     pub dao: Option<DaoDeclaration>,
+    pub timer: Option<TimerDeclaration>,
+    pub pegged_currency: Option<PeggedCurrencyDeclaration>,
+    pub liquidity_pool: Option<LiquidityPoolDeclaration>,
 }
 
 /// Block statements

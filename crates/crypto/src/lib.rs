@@ -6,8 +6,15 @@
 //! * **Ed25519** for all signatures: transactions, blocks, admission certificates and
 //!   governance votes.
 //!
-//! The plan originally said "SHA-512"; SHA-512 is a hash (not encryption) and a hash alone
-//! cannot sign anything, so SHA3-512 is paired with Ed25519.
+//! ## Cross-Chain Verification
+//!
+//! The crypto crate also provides cryptographic primitives for cross-chain verification:
+//! * **Merkle proof verification** using SHA3-512 with maximum 64 levels depth
+//! * **Consensus proof verification** for 2/3 validator set threshold signatures
+//! * **X25519 key exchange** for secure channel establishment
+//! * **AES-256-GCM encryption** for secure message communication
+//!
+//! See the individual modules for detailed documentation.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -17,6 +24,11 @@ use std::collections::BTreeMap;
 pub const HASH_LEN: usize = 64;
 pub const PUBKEY_LEN: usize = 32;
 pub const SIG_LEN: usize = 64;
+
+// Re-export for convenience
+pub use bincode;
+pub use serde;
+pub use sha3;
 
 /// Generates a fixed-size byte wrapper with hex `Debug`, byte accessors and
 /// serialization as a byte vector (portable across bincode and JSON).
@@ -103,6 +115,15 @@ fixed_bytes!(
     "An Ed25519 public key / Oxydome address."
 );
 fixed_bytes!(Sig, SIG_LEN, "An Ed25519 signature.");
+
+// Re-export zeroize for secure memory clearing
+pub use zeroize;
+
+pub mod aes256gcm;
+pub mod consensus;
+pub mod evk;
+pub mod merkle;
+pub mod x25519;
 
 impl Hash {
     pub const fn zero() -> Self {

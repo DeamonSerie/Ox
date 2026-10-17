@@ -35,8 +35,11 @@ pub enum OutputKind {
     ExitReserve { generation: u64 },
     /// Ox held by a DAO until a DAO-approved transfer releases it.
     DaoTreasury { dao_id: Hash },
-    /// Ox held in an OHM's treasury. Spendable only via OHM operations (deposit/transfer).
+    /// Ox held by an OHM's treasury. Spendable only via OHM operations (deposit/transfer).
     OhmTreasury { ohm_id: Hash },
+    /// Ox tagged as a tracked Express Bus receipt (deposit). Non-spendable by ordinary
+    /// transactions — only via an `ExpressBusWithdraw` operation.
+    BusReceipt { bus_id: Hash, asset: crate::PriceAsset },
 }
 
 impl OutputKind {
@@ -58,6 +61,10 @@ impl OutputKind {
 
     pub fn is_ohm_treasury(&self) -> bool {
         matches!(self, OutputKind::OhmTreasury { .. })
+    }
+
+    pub fn is_bus_receipt(&self) -> bool {
+        matches!(self, OutputKind::BusReceipt { .. })
     }
 }
 
@@ -113,6 +120,20 @@ impl TxOutput {
             amount,
             recipient,
             kind: OutputKind::OhmTreasury { ohm_id },
+            rebound_gen: None,
+        }
+    }
+
+    pub fn bus_receipt(
+        amount: Amount,
+        recipient: PublicKey,
+        bus_id: Hash,
+        asset: crate::PriceAsset,
+    ) -> Self {
+        Self {
+            amount,
+            recipient,
+            kind: OutputKind::BusReceipt { bus_id, asset },
             rebound_gen: None,
         }
     }

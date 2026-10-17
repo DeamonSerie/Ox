@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+pub mod secure_channel;
+pub use secure_channel::PeerAdminSecureLink;
+
 /// Maximum accepted frame size (16 MiB).
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
@@ -340,6 +343,53 @@ pub enum Message {
     /// Response containing a node's storage label.
     StorageLabelResponse {
         label: oxydome_core::StorageLabel,
+    },
+    // -- timers --
+    /// Query for a timer by id.
+    GetTimer {
+        timer_id: Hash,
+    },
+    TimerResponse {
+        timer: Option<oxydome_core::Timer>,
+    },
+    /// Query for all active (unresolved) timers.
+    GetActiveTimers,
+    ActiveTimersResponse {
+        timers: Vec<oxydome_core::Timer>,
+    },
+    /// Query for a specific better's bets.
+    GetTimerBets {
+        better: PublicKey,
+    },
+    TimerBetsResponse {
+        bets: Vec<oxydome_core::TimerBet>,
+    },
+    // -- EVFS file system --
+    /// Query for a file label by its key chain commitment.
+    GetFileLabel {
+        key_chain_commitment: Hash,
+    },
+    /// Response containing a file label, if present.
+    FileLabelResponse {
+        label: Option<oxydome_core::FileEvkLabel>,
+    },
+    /// Query for the access log of a file.
+    GetFileAccessLog {
+        file_id: Hash,
+    },
+    /// Response with access records for a file.
+    FileAccessLogResponse {
+        records: Vec<oxydome_core::FileAccessRecord>,
+    },
+    /// Query for a node's file root, count and storage.
+    GetNodeFileRoot {
+        node: PublicKey,
+    },
+    /// Response with a node's file system state.
+    NodeFileRootResponse {
+        file_root: Option<Hash>,
+        file_count: u64,
+        file_storage_bytes: u64,
     },
 }
 

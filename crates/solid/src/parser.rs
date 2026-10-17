@@ -1,7 +1,7 @@
 use crate::ast::{
     Block, Contract, ContractKind, CustomError, DaoCurrencyDeclaration, DaoDeclaration,
-    DaoPegDeclaration, Enum, Event, Expr, Function, FunctionKind, LValue, Modifier,
-    ModifierInvocation, Mutability, Param, Statement, Struct, Type, Variable, Visibility,
+    DaoPegDeclaration, Enum, Event, Expr, Function, FunctionKind, LValue, LiquidityPoolDeclaration,
+    Modifier, ModifierInvocation, Mutability, Param, Statement, Struct, Type, Variable, Visibility,
 };
 use pest::error::ErrorVariant;
 use pest::iterators::Pair;
@@ -73,6 +73,9 @@ fn build_contract(pair: Pair<Rule>) -> Result<Contract, PestError<Rule>> {
         modifiers: Vec::new(),
         errors: Vec::new(),
         dao: None,
+        timer: None,
+        pegged_currency: None,
+        liquidity_pool: None,
     };
 
     for item in inner {
@@ -107,6 +110,9 @@ fn build_contract(pair: Pair<Rule>) -> Result<Contract, PestError<Rule>> {
                         contract.modifiers.push(parse_modifier(definition)?)
                     }
                     Rule::dao_definition => contract.dao = Some(parse_dao(definition)?),
+                    Rule::liquidity_pool_definition => {
+                        contract.liquidity_pool = Some(parse_liquidity_pool(definition)?)
+                    }
                     _ => {}
                 }
             }
@@ -172,6 +178,20 @@ fn parse_dao_amount(pair: Pair<Rule>) -> Result<u128, PestError<Rule>> {
         .map_err(|error| conversion_error(&pair, format!("invalid DAO amount: {error}")))
 }
 
+fn parse_liquidity_pool(pair: Pair<Rule>) -> Result<LiquidityPoolDeclaration, PestError<Rule>> {
+    let mut currencies = Vec::new();
+    for field in pair.into_inner() {
+        if field.as_rule() == Rule::liquidity_pool_currencies {
+            currencies = field
+                .into_inner()
+                .filter(|part| part.as_rule() == Rule::string_literal)
+                .map(parse_string)
+                .collect();
+        }
+    }
+    Ok(LiquidityPoolDeclaration { currencies })
+}
+
 fn parse_type(pair: Pair<Rule>) -> Result<Type, PestError<Rule>> {
     let text = pair.as_str().to_owned();
     if pair.as_rule() == Rule::elementary_type {
@@ -191,7 +211,7 @@ fn parse_type(pair: Pair<Rule>) -> Result<Type, PestError<Rule>> {
                 value: Box::new(value),
             }
         }
-        Rule::elementary_type => elementary_type(first.as_str()),
+        Rule::elementary_type => elementary_type(first.as_str().trim()),
         Rule::identifier => Type::Named(first.as_str().to_owned()),
         _ => {
             return Err(conversion_error(

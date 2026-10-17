@@ -16,6 +16,7 @@
 
 pub mod ast;
 mod codegen;
+mod opcode;
 mod ovm_compiler;
 mod ovm_validation;
 mod parser;
@@ -27,14 +28,44 @@ use ast::{
 
 pub use ast::Contract;
 pub use ovm_compiler::{
-    compile_contract_to_ovm, compile_dao_policy, compile_function_to_ovm, compile_solid_to_ovm,
-    CompileError, CompiledSolid,
+    compile_contract_to_ovm, compile_dao_policy, compile_function_to_ovm,
+    compile_liquidity_pool_config, compile_solid_to_ovm, CompileError, CompiledSolid,
 };
 pub use parser::{PestError, Rule};
 
 /// Parse one Solidity contract, interface, or library definition into an AST.
 pub fn parse_contract(input: &str) -> Result<Contract, PestError<Rule>> {
     parser::parse_contract(input)
+}
+
+/// Compile a `.solid` source string into the canonical OVM artifact, accepting
+/// either Solid-lang source or raw OVM opcode text.
+///
+/// A source is treated as opcode text when its first non-blank, non-`//` line is
+/// exactly the `%OPCODE_FILE%` marker; otherwise the existing Solid-lang path is
+/// used. A `%OPCODE_FILE%` token that appears anywhere else in a Solid-lang source
+/// is rejected, since it is only meaningful at the top of an opcode-only file.
+pub fn compile_source_to_ovm(
+    src: &str,
+    source_hash: Option<oxydome_crypto::Hash>,
+    asset_manifest_hash: Option<oxydome_crypto::Hash>,
+) -> Result<CompiledSolid, CompileError> {
+    match opcode::detect_marker(src) {
+        opcode::Detect::OpcodeFile => {
+            opcode::compile_opcode_file(src, source_hash, asset_manifest_hash)
+        }
+        opcode::Detect::SolidMode => {
+            if src.contains(opcode::MARKER) {
+                return Err(CompileError::Unsupported(
+                    "marker `%OPCODE_FILE%` is only valid at the top of an opcode-only `.solid` file"
+                        .to_string(),
+                ));
+            }
+            let contract =
+                parse_contract(src).map_err(|error| CompileError::Parse(error.to_string()))?;
+            compile_solid_to_ovm(&contract, source_hash, asset_manifest_hash)
+        }
+    }
 }
 
 /// Validate that one named contract function uses the supported native OVM subset.
@@ -197,6 +228,9 @@ pub fn token_contract() -> Contract {
         modifiers: vec![],
         errors: vec![],
         dao: None,
+        timer: None,
+        pegged_currency: None,
+        liquidity_pool: None,
     }
 }
 
@@ -408,5 +442,44 @@ mod tests {
             compile_dao_policy(&bad_symbol),
             Err(CompileError::InvalidDao(_))
         ));
+    }
+
+    #[test]
+    fn parses_liquidity_pool_declaration() {
+        let source = r#"
+            contract C {
+                liquidity_pool {
+                    currencies: ["Ox", "Gas", "0x6f6b6173706563742d616d6f756e74"];
+                }
+            }
+        "#;
+        let contract = parse_contract(source).expect("valid liquidity pool declaration");
+        let lp = contract
+            .liquidity_pool
+            .expect("liquidity pool should be parsed");
+        assert_eq!(
+            lp.currencies,
+            ["Ox", "Gas", "0x6f6b6173706563742d616d6f756e74"]
+        );
+    }
+
+    #[test]
+    fn compiles_liquidity_pool_config_from_declaration() {
+        let source = r#"
+            contract C {
+                liquidity_pool {
+                    currencies: ["Ox", "Gas"];
+                }
+            }
+        "#;
+        let contract = parse_contract(source).expect("valid liquidity pool declaration");
+        let encoded = compile_liquidity_pool_config(&contract)
+            .expect("config compiles")
+            .expect("config is present");
+        let currencies: Vec<oxydome_core::PriceAsset> =
+            bincode::deserialize(&encoded).expect("decodes to Vec<PriceAsset>");
+        assert_eq!(currencies.len(), 2);
+        assert_eq!(currencies[0], oxydome_core::PriceAsset::Ox);
+        assert_eq!(currencies[1], oxydome_core::PriceAsset::Gas);
     }
 }

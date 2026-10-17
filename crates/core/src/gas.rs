@@ -164,7 +164,10 @@ mod tests {
         for reward in [0u128, 1, 2, 7, 99, 100, 999, 12_345] {
             let (ox, gas) = conversion_split(reward);
             assert_eq!(ox + gas, reward);
-            assert_eq!(gas, reward * GAS_SERVER_FEE_BPS as u128 / GAS_BPS_DENOMINATOR);
+            assert_eq!(
+                gas,
+                reward * GAS_SERVER_FEE_BPS as u128 / GAS_BPS_DENOMINATOR
+            );
         }
     }
 

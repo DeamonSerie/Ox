@@ -145,7 +145,8 @@ mod tests {
     fn test_parameter_negotiation() {
         let key = KeyPair::generate();
         let config = profiles::devnet();
-        let mvms = MvmsMaster::new(key, config.clone(), vec![], vec![]).expect("create devnet mvms");
+        let mvms =
+            MvmsMaster::new(key, config.clone(), vec![], vec![]).expect("create devnet mvms");
 
         let valid_params = config.to_chain_params();
         assert!(mvms.negotiate_parameters(&valid_params).is_ok());

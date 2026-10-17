@@ -277,7 +277,11 @@ async fn handle_connection(
                 ohm_id,
                 contract_id,
             } => {
-                let contract = node.lock().unwrap().ohm_contract(&ohm_id, &contract_id).cloned();
+                let contract = node
+                    .lock()
+                    .unwrap()
+                    .ohm_contract(&ohm_id, &contract_id)
+                    .cloned();
                 let (code, storage) = match contract {
                     Some(contract) => {
                         let storage = contract.storage.into_iter().collect();
@@ -438,17 +442,75 @@ async fn handle_connection(
                 };
                 Some(Message::StoreContentResponse { stored, error })
             }
+            Message::GetFileLabel {
+                key_chain_commitment,
+            } => {
+                let label = {
+                    let guard = node.lock().unwrap();
+                    guard.state.file_labels.get(&key_chain_commitment).cloned()
+                };
+                Some(Message::FileLabelResponse { label })
+            }
+            Message::GetFileAccessLog { file_id } => {
+                let records = {
+                    let guard = node.lock().unwrap();
+                    guard
+                        .state
+                        .file_access_log
+                        .values()
+                        .filter(|r| r.file_id == file_id)
+                        .cloned()
+                        .collect()
+                };
+                Some(Message::FileAccessLogResponse { records })
+            }
+            Message::GetNodeFileRoot { .. } => {
+                let (file_root, file_count, file_storage_bytes) = {
+                    let guard = node.lock().unwrap();
+                    guard.node_file_root()
+                };
+                Some(Message::NodeFileRootResponse {
+                    file_root,
+                    file_count,
+                    file_storage_bytes,
+                })
+            }
             Message::FinalizedBlock { finalized } => {
-                let result = node.lock().unwrap().finalize_block(
-                    finalized.block,
-                    &finalized.evidence.attestations,
-                    &finalized.evidence.prepare_qc,
-                    &finalized.evidence.commit_qc,
-                    &finalized.evidence.master_checks,
-                );
-                if let Err(error) = result {
-                    eprintln!("rejected finalized peer block: {error}");
-                }
+                // Clone state for async transaction pre-validation so no mutex guard
+                // is held across the await point.
+                let (state_clone, params_clone, record_clone) = {
+                    let guard = node.lock().unwrap();
+                    (guard.state.clone(), guard.params.clone(), finalized.clone())
+                };
+                let node_ref = node.clone();
+                tokio::spawn(async move {
+                    let block_clone = &record_clone.block;
+                    let evidence_clone = &record_clone.evidence;
+                    // filter_sync runs on a smol blocking thread via filter_invalid_transactions,
+                    // so the tokio worker is never blocked by CPU-bound validation.
+                    let (valid_txs, _stats, filtered_count) =
+                        oxydome_state::async_verify::filter_invalid_transactions(
+                            &state_clone,
+                            block_clone,
+                            &params_clone,
+                        )
+                        .await;
+                    let block_to_finalize = if filtered_count > 0 {
+                        oxydome_state::async_verify::rebuild_block(block_clone, valid_txs)
+                    } else {
+                        block_clone.clone()
+                    };
+                    let mut guard = node_ref.lock().unwrap();
+                    if let Err(error) = guard.finalize_block(
+                        block_to_finalize,
+                        &evidence_clone.attestations,
+                        &evidence_clone.prepare_qc,
+                        &evidence_clone.commit_qc,
+                        &evidence_clone.master_checks,
+                    ) {
+                        eprintln!("rejected finalized peer block: {error}");
+                    }
+                });
                 None
             }
             Message::Subscribe { kinds } => {
@@ -896,8 +958,20 @@ fn apply_finalized_record(
     node: &mut Node,
     record: oxydome_net::FinalizedBlockRecord,
 ) -> Result<(), NetError> {
+    // Pre-validate transactions synchronously; rebuild the block if any are invalid.
+    let (valid_txs, _stats, filtered_count) = oxydome_state::async_verify::filter_sync(
+        &node.state,
+        &record.block,
+        &node.params,
+        record.block.header.height,
+    );
+    let block = if filtered_count > 0 {
+        oxydome_state::async_verify::rebuild_block(&record.block, valid_txs)
+    } else {
+        record.block
+    };
     node.finalize_block(
-        record.block,
+        block,
         &record.evidence.attestations,
         &record.evidence.prepare_qc,
         &record.evidence.commit_qc,
@@ -917,6 +991,28 @@ async fn request(peer: SocketAddr, req: &Message) -> Result<Message, NetError> {
             }
             reply => return Ok(reply),
         }
+    }
+}
+
+/// Fetches a batch of finalized blocks (with finality evidence) from a peer.
+///
+/// Used by `catch_up_from_peer_parallel` to fetch multiple blocks in a single round-trip,
+/// enabling parallel finality verification of multiple blocks per epoch.
+pub async fn fetch_batch(
+    peer: SocketAddr,
+    from_height: u64,
+    limit: u8,
+) -> Result<(Vec<oxydome_net::FinalizedBlockRecord>, u64), NetError> {
+    match request(peer, &Message::GetFinalizedBlocks { from_height, limit }).await? {
+        Message::FinalizedBlocksResponse {
+            blocks,
+            tip_height,
+            error: None,
+        } if blocks.len() <= limit as usize => Ok((blocks, tip_height)),
+        Message::FinalizedBlocksResponse {
+            error: Some(error), ..
+        } => Err(NetError::Unexpected(error)),
+        other => Err(NetError::Unexpected(format!("{other:?}"))),
     }
 }
 

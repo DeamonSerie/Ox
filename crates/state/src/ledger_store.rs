@@ -15,7 +15,10 @@
 
 use crate::chain::OvmContract;
 use crate::utxo::{Summary, UtxoEntry, UtxoLedger, VNode};
-use oxydome_core::{Amount, DaoState, GasAccount, OhmBlock, OhmState, OutPoint, PublicKey};
+use oxydome_core::{
+    Amount, DaoState, FileAccessRecord, FileEvkLabel, GasAccount, OhmBlock, OhmState, OutPoint,
+    PublicKey,
+};
 use oxydome_crypto::{merkle_leaf_hash, merkle_node_hash, Hash};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -64,6 +67,25 @@ pub struct GasSnapshot {
     pub last_airdrop_height: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvfsSnapshot {
+    pub height: u64,
+    pub root: Hash,
+    pub file_labels: BTreeMap<Hash, FileEvkLabel>,
+    pub file_access_log: BTreeMap<Hash, FileAccessRecord>,
+}
+
+impl Default for EvfsSnapshot {
+    fn default() -> Self {
+        EvfsSnapshot {
+            height: 0,
+            root: Hash::zero(),
+            file_labels: BTreeMap::new(),
+            file_access_log: BTreeMap::new(),
+        }
+    }
+}
+
 /// The committed summary of a specific ledger version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRecord {
@@ -99,6 +121,7 @@ const PREFIX_OHM_STATE: u8 = 8u8;
 /// Content-addressed private OHM blocks, keyed by OHM block hash.
 const PREFIX_OHM_BLOCK: u8 = 9u8;
 const PREFIX_GAS: u8 = 10u8;
+const PREFIX_EVFS: u8 = 11u8;
 const KEY_CURRENT: [u8; 1] = [3u8];
 
 fn node_key(hash: &Hash) -> Vec<u8> {
@@ -305,6 +328,37 @@ impl LedgerStore {
                 ))
             }
             None => Ok((Default::default(), 0, 0, 0)),
+        }
+    }
+
+    /// Loads the EVFS file state committed at `height`.
+    pub fn load_evfs_state(
+        &self,
+        height: u64,
+    ) -> Result<
+        (
+            BTreeMap<Hash, FileEvkLabel>,
+            BTreeMap<Hash, FileAccessRecord>,
+            Hash,
+        ),
+        LedgerError,
+    > {
+        match self.tree.get(height_key(PREFIX_EVFS, height))? {
+            Some(raw) => {
+                let snapshot: EvfsSnapshot = Self::decode(&raw)?;
+                if snapshot.height != height {
+                    return Err(LedgerError::Corrupt(format!(
+                        "EVFS snapshot height {} stored at {height}",
+                        snapshot.height
+                    )));
+                }
+                Ok((
+                    snapshot.file_labels,
+                    snapshot.file_access_log,
+                    snapshot.root,
+                ))
+            }
+            None => Ok((Default::default(), Default::default(), Hash::zero())),
         }
     }
 
@@ -630,6 +684,7 @@ impl LedgerStore {
             gas,
             None,
             None,
+            &EvfsSnapshot::default(),
         )
     }
 
@@ -660,6 +715,7 @@ impl LedgerStore {
             gas,
             Some(block),
             None,
+            &EvfsSnapshot::default(),
         )
     }
 
@@ -694,6 +750,7 @@ impl LedgerStore {
             gas,
             Some(block),
             None,
+            &EvfsSnapshot::default(),
         )
     }
 
@@ -768,6 +825,7 @@ impl LedgerStore {
             gas,
             Some(block),
             Some(finality_evidence),
+            &EvfsSnapshot::default(),
         )
     }
 
@@ -784,6 +842,7 @@ impl LedgerStore {
         gas: &(BTreeMap<PublicKey, GasAccount>, Amount, Amount, u64),
         block: Option<&oxydome_core::Block>,
         finality_evidence: Option<&[u8]>,
+        evfs: &EvfsSnapshot,
     ) -> Result<(), LedgerError> {
         self.ensure_seeded()?;
 
@@ -898,6 +957,15 @@ impl LedgerStore {
         if let Some(evidence) = finality_evidence {
             batch.insert(height_key(PREFIX_FINALITY, height), evidence);
         }
+        batch.insert(
+            height_key(PREFIX_EVFS, height),
+            Self::encode(&EvfsSnapshot {
+                height,
+                root: evfs.root,
+                file_labels: evfs.file_labels.clone(),
+                file_access_log: evfs.file_access_log.clone(),
+            })?,
+        );
         batch.insert(&KEY_CURRENT, height.to_le_bytes().to_vec());
         self.tree.apply_batch(batch)?;
 

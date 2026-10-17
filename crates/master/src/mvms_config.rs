@@ -115,6 +115,20 @@ pub struct MvmsConfig {
     /// Blocks between storage audits (0 disables)
     #[serde(default)]
     pub storage_audit_interval_blocks: u64,
+
+    // ---- speedometer stabilization currency ----
+    /// Height at which Speedometer minting and airdrops become active
+    #[serde(default = "default_one")]
+    pub speedometer_activation_height: u64,
+    /// Number of blocks between automatic Speedometer airdrops (0 disables)
+    #[serde(default = "default_speedometer_airdrop_interval")]
+    pub speedometer_airdrop_interval_blocks: u64,
+    /// Base Speedometer airdrop size as bps of the block's highest transaction value
+    #[serde(default = "default_speedometer_airdrop_base_bps")]
+    pub speedometer_airdrop_base_bps: u32,
+    /// Per-transaction Speedometer stabilization mint, bps of the tx value
+    #[serde(default = "default_speedometer_stabilization_bps")]
+    pub speedometer_stabilization_bps: u32,
 }
 
 impl fmt::Display for MvmsConfig {
@@ -137,6 +151,22 @@ fn default_two_gib() -> u64 {
 
 fn default_deviation_bps() -> u32 {
     100
+}
+
+fn default_one() -> u64 {
+    1
+}
+
+fn default_speedometer_airdrop_interval() -> u64 {
+    2
+}
+
+fn default_speedometer_airdrop_base_bps() -> u32 {
+    100
+}
+
+fn default_speedometer_stabilization_bps() -> u32 {
+    10
 }
 
 fn serialize_u128_compat<S>(val: &u128, serializer: S) -> Result<S::Ok, S::Error>
@@ -243,6 +273,10 @@ impl Default for MvmsConfig {
             expected_network_storage: 0,
             storage_label_max_deviation_bps: 100,
             storage_audit_interval_blocks: 0,
+            speedometer_activation_height: 1,
+            speedometer_airdrop_interval_blocks: default_speedometer_airdrop_interval(),
+            speedometer_airdrop_base_bps: default_speedometer_airdrop_base_bps(),
+            speedometer_stabilization_bps: default_speedometer_stabilization_bps(),
         }
     }
 }
@@ -308,6 +342,7 @@ impl MvmsConfig {
             block_window: 10,
             rebound_lock_blocks: 5,
             audit_checkpoint_blocks: 100,
+            departure_take_bps: None,
 
             // OVM activation
             ovm_activation_height: 1,
@@ -328,6 +363,7 @@ impl MvmsConfig {
 
             // fee split
             fee_master_bps: 400,
+            gas_fee_master_bps: 400,
 
             // consensus thresholds
             bft_num: self.bft_num,
@@ -371,11 +407,40 @@ impl MvmsConfig {
             expected_network_storage: 0,
             storage_label_max_deviation_bps: 100,
             storage_audit_interval_blocks: 0,
+            timer_activation_height: 1,
+            max_timers: oxydome_core::MAX_TIMERS,
+            max_timer_duration_blocks: oxydome_core::MAX_TIMER_DURATION_BLOCKS,
+            timer_min_bet_amount: 1,
+            timer_max_bet_amount: Amount::from(self.genesis_supply),
+            pegged_currency_activation_height: u64::MAX,
+            pegged_spread_bps: 500,
+            pegged_window_blocks: 100,
+            liquidity_pool_activation_height: u64::MAX,
+            liquidity_pool_fee_bps: 100,
+            max_liquidity_pools: 1_000,
+            speedometer_activation_height: self.speedometer_activation_height,
+            speedometer_airdrop_interval_blocks: self.speedometer_airdrop_interval_blocks,
+            speedometer_airdrop_base_bps: self.speedometer_airdrop_base_bps,
+            speedometer_stabilization_bps: self.speedometer_stabilization_bps,
+            file_system_activation_height: u64::MAX,
+            max_file_bytes: 8 * 1024 * 1024,
+            max_files_per_node: 100_000,
+
+            // Express Bus
+            express_bus_activation_height: u64::MAX,
+            max_express_buses: oxydome_core::MAX_EXPRESS_BUSES,
+            express_bus_window_blocks: 100,
+            express_bus_default_weight: oxydome_core::EXPRESS_FP,
+            express_bus_impact_bps: 0,
         }
     }
 
     /// Build a GenesisConfig with given masters and nodes
-    pub fn to_genesis_config(&self, masters: Vec<PublicKey>, nodes: Vec<PublicKey>) -> GenesisConfig {
+    pub fn to_genesis_config(
+        &self,
+        masters: Vec<PublicKey>,
+        nodes: Vec<PublicKey>,
+    ) -> GenesisConfig {
         let params = self.to_chain_params();
         let recipient = masters
             .first()
@@ -620,9 +685,7 @@ impl MvmsBuilder {
     }
 
     pub fn build(self) -> MvmsResult<MvmsConfig> {
-        self.config
-            .validate()
-            .map_err(MvmsError::Validation)?;
+        self.config.validate().map_err(MvmsError::Validation)?;
         Ok(self.config)
     }
 }
