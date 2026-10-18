@@ -1,0 +1,1167 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black
+}
+
+\title{\textsf{Oxydome}\\[0.3em]
+       \large An Ethereum-like Account and UTXO Hybrid Blockchain with\\
+       \large Tenant Chains, Fuel Currencies, and Authenticated Auditing}
+\author{
+  \texttt{Oxydome Contributors}
+}
+\date{\today}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{invariant}{Invariant}
+
+\newcommand{\ox}{\textsf{Ox}}
+\newcommand{\gas}{\textsf{GAS}}
+\newcommand{\ohm}{\textsf{OH\scriptsize M}}\newcommand{\evk}{\textsf{EVK}}
+\newcommand{\evfs}{\textsf{EVFS}}
+\newcommand{\ovm}{\textsf{OVM}}
+\newcommand{\ohms}{OHMs}
+\newcommand{\bft}{\textsf{BFT}}
+\newcommand{\poa}{\textsf{PoA}}
+\newcommand{\outpoint}{\textsf{OutPoint}}
+\newcommand{\pk}{\textsf{pk}}
+\newcommand{\txid}{\textsf{txid}}
+\newcommand{\WithdrawRequest}{\textsf{WithdrawRequest}}
+\newcommand{\ExpressBusWithdraw}{\textsf{ExpressBusWithdraw}}
+\newcommand{\BusReceipt}{\textsf{BusReceipt}}
+\newcommand{\ChainId}{\textsf{ChainId}}
+\newcommand{\ChainParams}{\textsf{ChainParams}}
+\newcommand{\ConsensusProof}{\textsf{ConsensusProof}}
+\newcommand{\DAO}{DAO}
+\newcommand{\DAOAction}{\textsf{DAOAction}}
+\newcommand{\EpochTransition}{\textsf{EpochTransition}}
+\newcommand{\FileEvkLabel}{\textsf{FileEvkLabel}}
+\newcommand{\InboundReceipt}{\textsf{InboundReceipt}}
+\newcommand{\LockedReward}{\textsf{LockedReward}}
+\newcommand{\Message}{\textsf{Message}}
+\newcommand{\OhmState}{\textsf{OhmState}}
+\newcommand{\OutboundMessage}{\textsf{OutboundMessage}}
+\newcommand{\PriceAsset}{\textsf{PriceAsset}}
+\newcommand{\PriceBounds}{\textsf{PriceBounds}}
+\newcommand{\ProofManager}{\textsf{ProofManager}}
+\newcommand{\SecureCommunicationLayer}{\textsf{SecureCommunicationLayer}}
+\newcommand{\StorageLabel}{\textsf{StorageLabel}}
+\newcommand{\VerificationCoordinator}{\textsf{VerificationCoordinator}}
+\newcommand{\tx}{tx}
+\newcommand{\hash}{\mathcal{H}}
+\newcommand{\hashvalue}{\mathsf{Hash}}
+\newcommand{\sign}{\mathsf{Sign}}
+\newcommand{\verify}{\mathsf{Verify}}
+\newcommand{\emptyroot}{\mathbf{0}}
+\newcommand{\FP}{10^{12}}
+\newcommand{\bps}{\mathrm{bps}}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Oxydome (the \ox{} network) is a decentralized ledger that combines a permissioned
+Proof-of-Authority consensus core with an authenticated sparse-Merkle UTXO
+state, a deterministic bytecode virtual machine, tenant-owned private chains,
+and a family of fuel currencies.  This paper describes the protocol-level
+systems of the Oxydome blockchain as they are realized in its reference
+implementation: the cryptographic primitives, the authenticated state model, the
+block and transaction format, the value-index currency engine, the layered
+consensus and master-audit architecture, the \ohm{} tenant-chain subsystem, the
+GAS and Speedometer fuel currencies, a coin-toss transaction-ordering
+layer that deterministically labels every transaction for OVM execution,
+the DAO governance framework, pegged
+currencies and liquidity pools, cross-chain bridging via the Express Bus and
+bridge module, and the ephemeral-verification-key infrastructure for node
+authentication and secure channels.  All on-chain arithmetic is integer
+fixed-point with no floating point, and every computation is deterministic so
+that all honest nodes derive byte-identical results.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+
+The \ox{} network (``Oxydome''), whose native unit is the \ox{} token (symbol
+\ox{}), is a layered blockchain protocol designed around the principle of
+\emph{authenticated delegation}: a small set of \emph{master} nodes does not
+store block bodies or the UTXO set, yet can cryptographically audit every block
+through Merkle inclusion proofs, a deterministic state-transition replay, and a
+supply-conservation invariant.  Server nodes store and execute the full state,
+produce blocks, and participate in a Practical-Byzantine-Fault-Tolerance-style
+(PBFT-inspired) voting protocol layered on top of a round-robin leader
+selection.
+
+In addition to the base ledger, the protocol hosts several integrated subsystems:
+
+\begin{itemize}[leftmargin=1.5em]
+  \item The \textbf{Ox Virtual Machine} (\ovm{}): a deterministic, fixed-width
+    bytecode interpreter for on-chain programs, supporting two deployment
+    tiers (raw bytecode and compiled Solid-lang contracts).
+  \item The \textbf{GAS} fuel currency: an account-based token minted from server
+    rewards and airdropped according to an on-chain price oracle.
+  \item The \textbf{Speedometer} stabilization currency: an account-based
+    token minted per-transaction and airdropped proportionally to balances.
+  \item \textbf{OHMs} (Ox Hosted Machines): tenant-owned private chains that
+    execute privately but anchor their continuity into \ox{} blocks.
+  \item A \textbf{DAO} framework: on-chain governance with maker-controlled
+    currencies and pegged redemptions.
+  \item \textbf{Express Bus} and \textbf{Bridge} modules: tracked
+    cross-system value flow and verifiable cross-chain asset transfer.
+  \item The \evk{} system: ephemeral per-block verification keys for node
+    authentication, secure channels, and file-system labeling.
+\end{itemize}
+
+This paper is organized as follows.  Sections~\ref{sec:prelim}--\ref{sec:net}
+cover the foundational systems; Section~\ref{sec:ovm} describes the virtual
+machine; Section~\ref{sec:ohm} the tenant-chain system; and Section~\ref{sec:analysis}
+discusses security and invariants.  Section~\ref{sec:coin-toss} documents
+the coin-toss transaction-ordering layer.
+
+\section{Prerequisites}
+\label{sec:prelim}
+
+\subsection{Cryptographic Primitives}
+\label{sec:crypto}
+
+All hashing in \ox{} uses \textbf{SHA3-512} (FIPS~202 / Keccak), producing
+64-byte digests.  The protocol defines three derived operations:
+
+\paragraph{Plain hash.} $\hash(x) = \mathrm{SHA3\text{-}512}(x)$, mapping an
+arbitrary byte string to a $64$-byte \emph{hash}.
+
+\paragraph{Length-prefixed multi-part hash.}
+$\hash_{\mathrm{many}}(p_1,\dots,p_n)$ concatenates each part preceded by its
+length in little-endian bytes, then hashes the result.  This prevents
+concatenation ambiguity (``$ab$'' vs.\ ``$a$, $b$''):
+\[
+\hash_{\mathrm{many}}(p_1,\dots,p_n)
+  = \mathrm{SHA3\text{-}512}\!\Bigl(\sum_{i=1}^{n}
+  \bigl(\mathrm{LE64}(|p_i|)\,\|\,p_i\bigr)\Bigr).
+\]
+
+\paragraph{Serialized-value hash.}
+$\hashvalue(v) = \hash(\mathsf{encode}(v))$, where $\mathsf{encode}(v)$ is a
+deterministic serialization.  This is the primitive used to commit structured
+values (leaves, proposals, signing payloads) to a hash.
+
+\paragraph{Signatures.}
+All signing and verification uses \textbf{Ed25519}.  A key pair consists of a
+32-byte public key and a 64-byte signature.  $\verify(pk, m, \sigma)$ returns
+true iff $\sigma$ is a valid Ed25519 signature on message $m$ under public key
+$pk$.  The same primitive signs transactions, blocks, admission certificates,
+governance votes, and audit attestations.
+
+\paragraph{Position-dependent labeling hash.}
+For transaction labeling (Section~\ref{sec:coin-toss}) the protocol also uses
+\textbf{BLAKE2b-512}---the same 64-byte digest width as SHA3-512 but a
+cryptographically secure, deliberately less common alternative to the SHA
+family.  The \emph{position label} for transaction $j$ in block $h$ is
+\[
+\lambda_j = \mathrm{BLAKE2b\text{-}512}\!\Bigl(
+  \tau,\; \mathrm{LE64}(j),\; \mathrm{LE64}(\tau_{\mathrm{block}}),\;
+  \mathrm{LE64}(|\mathcal{M}|)\,\|\,\mathcal{M}
+\Bigr),
+\]
+where $\tau = \hash(H_h)$ is the block header hash, $\tau_{\mathrm{block}}$ is
+the block timestamp, and $\mathcal{M}$ is the network magic phrase.
+
+\subsection{Merkle Trees}
+\label{sec:merkle}
+
+Two Merkle-tree constructions are used.
+
+\paragraph{Standard Merkle tree.} Used for transaction roots, operation roots,
+OVM-receipt roots, and the masters-root commitment.  Leaves are
+$\mathbf{0x00}\,\hash(\ell)$ and internal nodes are
+$\mathbf{0x01}\,\hash(\ell)\,\hash(r)$, giving second-preimage resistance.
+An odd level duplicates its last node.  The empty set commits to
+$\emptyroot$ (the $64$-byte all-zero hash).  An inclusion proof is the list of
+siblings from the leaf level to the root; verification recomputes the path and
+checks equality with the stored root.
+
+\paragraph{Sparse Merkle tree.}
+Used for the UTXO ledger.  It is a $256$-level binary tree
+($D = 256$) in which every leaf sits at exactly depth $D$.  An empty subtree
+commits to $\emptyroot$ at every level.  Keys are derived as
+\[
+\mathsf{path}(o) = \mathrm{first\_32\_bytes}\bigl(\hashvalue(o)\bigr),
+\]
+where $o$ is an \outpoint\ (Definition~\ref{def:outpoint}).  A leaf stores a
+\emph{leaf commitment} $\hashvalue(\mathit{entry})$, where an entry is
+$(\mathit{outpoint}, \mathit{output}, \mathit{created\_height})$.  Inclusion
+proofs have exactly $D$ siblings ordered leaf-to-root; verification is purely a
+function of the sibling list and the path bits.  The tree is \emph{pure}: the
+root depends only on the set of live entries, not their insertion order, which
+makes it portable between implementations.
+
+\section{State Model}
+\label{sec:state}
+
+\subsection{The UTXO Set}
+
+The primary on-chain state is an authenticated UTXO set implemented as a sparse
+Merkle tree of depth $256$.  Each unspent output is an entry
+\[
+e = (o,\; v,\; h)
+\]
+where $o$ is an \outpoint, $v$ is a TxOutput, and $h$ is the height at which the
+output was created.  The \outpoint\ (Definition~\ref{def:outpoint}) is a pair
+$(t, i)$: a $64$-byte transaction identifier and a $32$-bit output index.
+
+\begin{definition}[Outpoint]
+\label{def:outpoint}
+An \outpoint\ $o = (t, i)$ references output $i$ of the transaction whose
+identifier is $t$.
+\end{definition}
+
+\paragraph{TxOutput.} A TxOutput is a tuple $(\mathit{amount}, \mathit{recipient}, \mathit{kind}, \mathit{rebound\_gen})$
+where $\mathit{amount}$ is a non-negative integer, $\mathit{recipient}$ is a
+32-byte public key (address), and $\mathit{kind} \in K$ (Section~\ref{sec:output-kinds}).
+
+\subsection{Output Kinds}
+\label{sec:output-kinds}
+
+The \emph{kind} of an output determines how and by whom it may be spent:
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Spendable} --- ordinary transferable value.
+  \item \textbf{LockedReward} --- node or master fee earnings; spendable only
+    via an approved \WithdrawRequest.
+  \item \textbf{ExitReserve($g$)} --- value deposited into the exit/reserve sink
+    in generation $g$; exerts downward pressure on the value index.  Refunded
+    (tagged) on a rebound.
+  \item \textbf{DaoTreasury($d$)} --- held by a DAO until a DAO-approved
+    transfer releases it.
+  \item \textbf{OhmTreasury($m$)} --- held by an \ohm{}'s treasury; spendable
+    only via OHM operations.
+  \item \textbf{BusReceipt($\beta$, $a$)} --- tagged by an Express-Bus deposit;
+    spendable only via an \ExpressBusWithdraw.
+\end{itemize}
+
+\paragraph{Rebound credits.}
+Outputs created by a rebound event carry $\mathit{rebound\_gen} = g$, marking
+them as maturity-locked.  A rebound-credited output created at height $h$ in
+generation $g$ may not be spent before
+\[
+h + L \quad\text{or before generation } g{+}1,
+\]
+where $L$ is the rebound lock blocks parameter.  This ``bunny-hop'' maturity
+prevents rapid respending of rebound refunds and stabilizes the value index.
+
+\subsection{Composite State Root}
+\label{sec:state-root}
+
+The block header commits a single \emph{state root} that binds together the
+UTXO tree and all optional subsystem states:
+\[
+R_{\mathrm{state}} = \hash\bigl(
+  \mathit{domain},\;
+  R_{\mathrm{utxo}},\;
+  R_{\mathrm{ovm}},\;
+  R_{\mathrm{dao}},\;
+  R_{\mathrm{ohm}},\;
+  R_{\mathrm{storage}},\;
+  R_{\mathrm{timer}},\;
+  R_{\mathrm{pegged}},\;
+  R_{\mathrm{pool}},\;
+  R_{\mathrm{file}},\;
+  R_{\mathrm{express}}
+\bigr).
+\]
+The domain-separator string (``\texttt{oxydome-combined-state-v9}'' family) is
+chosen feature-sensitively so that chains running a subset of features retain
+byte-identical roots to prior versions.  The header also commits the bare
+UTXO root $R_{\mathrm{utxo}}$ to a separate field so that header-only masters
+can verify UTXO-spend inclusion proofs without the composite root (which also
+covers contract code and storage they do not store).
+
+\section{Block Structure}
+\label{sec:block}
+
+A block $B$ at height $h$ consists of a header $H$ and a body
+$(\mathcal{T}, \mathcal{O}, \mathcal{R})$:
+
+\paragraph{Header fields.}
+\[
+H = \bigl(
+  h,\; \nu,\; H_{\mathrm{ovm\_act}},\; H_{\mathrm{sc\_act}},\;
+  H_{\mathrm{prev}},\; R_T,\; R_O,\; R_{\mathcal{R}},\;
+  R_{\mathrm{utxo}},\; R_{\mathrm{state}},\;
+  \Sigma,\; e,\; g,\; V,\; p,\; \tau,\;
+  \Phi,\; n_T,\; \Phi_{\mathrm{exit}},\;
+  s_{\mathrm{toss}},\; R_{\mathcal{T}}^{\mathrm{ord}}
+\bigr).
+\]
+Here:
+\begin{itemize}[leftmargin=2em]
+  \item $\nu$ is the execution version ($1$ = legacy, $2$ = \ovm{}, $4$ =
+    smart-contract artifact);
+  \item $H_{\mathrm{ovm\_act}}$, $H_{\mathrm{sc\_act}}$ are activation heights;
+  \item $H_{\mathrm{prev}} = \hash(H_{h-1})$ links blocks;
+  \item $R_T, R_O, R_{\mathcal{R}}$ are Merkle roots over the transaction,
+    operation, and OVM-receipt lists;
+  \item $R_{\mathrm{utxo}}$ and $R_{\mathrm{state}}$ are the UTXO and composite
+    state roots (Section~\ref{sec:state-root});
+  \item $\Sigma$ is the circulating supply;
+  \item $e$ is the epoch; $g$ is the rebound generation;
+  \item $V$ is the value index (fixed-point, Section~\ref{sec:value-index});
+  \item $p$ is the block producer (a server-node public key);
+  \item $\tau$ is the timestamp;
+  \item $\Phi$ is the total transaction volume (window statistic);
+  \item $n_T$ is the transaction count; $\Phi_{\mathrm{exit}}$ is the exit sink amount;
+  \item $s_{\mathrm{toss}}$ is the coin-toss seed commitment (Section~\ref{sec:coin-toss});
+  \item $R_{\mathcal{T}}^{\mathrm{ord}}$ is the root of the ordered-transaction
+    Merkle tree (Section~\ref{sec:coin-toss}).
+  \item optional EVK extension fields (Section~\ref{sec:evk}).
+\end{itemize}
+
+\paragraph{Header roots must match.}
+The producer computes $R_T$, $R_O$, $R_{\mathcal{R}}$ as Merkle roots over the
+body, and $R_{\mathrm{utxo}}$, $R_{\mathrm{state}}$ from the resulting state.
+Any node re-applying the block independently verifies
+\[
+R_T = \mathsf{txroot}(\mathcal{T}),\quad
+R_O = \mathsf{oproot}(\mathcal{O}),\quad
+R_{\mathcal{R}} = \mathsf{receiptroot}(\mathcal{R}),
+\]
+and, after coin-toss ordering (Section~\ref{sec:coin-toss}),
+\[
+R_{\mathcal{T}}^{\mathrm{ord}}
+   = \mathsf{ordroot}(\mathcal{T}_{\pi}),
+\]
+where $\mathcal{T}_{\pi}$ is the producer-committed permutation of $\mathcal{T}$.
+
+\subsection{State Transition}
+
+Applying a block is a pure function
+\[
+\Sigma' = \mathsf{Apply}(\Sigma,\; B,\; G,\; P),
+\]
+where $G$ is the GovernanceSet and $P$ the ChainParams.  The transition:
+\begin{enumerate}[label=(\arabic*),leftmargin=2em]
+  \item validates linkage ($H_{\mathrm{prev}}$, height, execution version,
+    producer authorization);
+  \item consumes inputs against the UTXO set (verifying signatures and
+    maturity for rebound credits);
+  \item creates outputs (updating the UTXO tree, tracking rebound generations);
+  \item executes governance operations (mint, burn, withdraw, rewards, DAO,
+    OHM, GAS, Express Bus, liquidity pool, timer, file-system, speedometer,
+    node-leave, departure-earnings);
+  \item executes OVM receipts committed in $\mathcal{R}$;
+  \item recomputes the value index, generation, and supply from window
+    statistics and explicit operation amounts;
+  \item commits the new $R_{\mathrm{utxo}}$ and $R_{\mathrm{state}}$.
+\end{enumerate}
+The \emph{lineage invariant} $\sum_{\mathit{live}} \mathit{amount} = \Sigma$
+must hold after every transition (Section~\ref{sec:audit}).
+
+\section{Transactions}
+\label{sec:tx}
+
+A transaction is a value transfer with optional program execution:
+\[
+\mathcal{T} = (I,\; O,\; \phi,\; \alpha),
+\]
+where $I$ is a list of inputs, $O$ a list of outputs, $\phi$ the fee, and
+$\alpha$ an optional OVM action.
+
+\paragraph{Input.} Each input $I_j = (o_j,\, pk_j,\, \sigma_j)$ references an
+\outpoint\ $o_j$, declares its owner $pk_j$, and carries an Ed25519 signature
+$\sigma_j$ over a canonical signing payload that excludes all signatures
+(self-reference-free commitment).
+
+\paragraph{Conservation.}
+A transaction is valid iff the owner of every input holds a live UTXO at that
+\outpoint, every input signature verifies, no input is spent twice, and
+\[
+\sum_j \mathit{amount}(o_j) \;=\; \sum_i \mathit{amount}(O_i) \;+\; \phi.
+\]
+
+\paragraph{Fee.}
+The base transfer fee is
+\[
+\phi_{\mathrm{base}} = \max\!\Bigl(1,\; \bigl\lfloor
+  \textstyle\sum_i \mathit{amount}(O_i) \cdot 12 / 10^{6}\bigr\rfloor\Bigr),
+\]
+scaled by the current value index at block construction time.
+
+\paragraph{OVM action.}
+An action $\alpha$ attached to a transaction requests on-chain program execution:
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Deploy}: upload raw bytecode (a $\leq 64\,\mathrm{KiB}$ program)
+    and reserve $\leq 2\,\mathrm{GiB}$ of data stack.
+  \item \textbf{Call}: invoke a deployed contract by id.
+  \item \textbf{DeployContract}: deploy a compiled Solid-lang contract artifact
+    ($\leq 256\,\mathrm{KiB}$).
+  \item \textbf{CallContract}: invoke a named entry point on a contract, with
+    an authority-input word and up to 64 arguments.
+\end{itemize}
+Gas for the action is bounded by $\lceil\mathsf{stack\_bytes}/6\rceil$ per
+transaction and by an aggregate block limit.
+
+\paragraph{Position hash.}
+Once a block producer has committed to an ordering of $\mathcal{T}$, each
+transaction is labeled with a deterministic \emph{position hash}:
+\[
+\hash_{\mathcal{T}} = \mathrm{BLAKE2b\text{-}512}\!\Bigl(
+  \hash(H),\; \mathrm{LE64}(j),\; \mathrm{LE64}(\tau),\; \mathcal{M}
+\Bigr),
+\]
+where $j$ is the transaction's position in the ordered list, $\hash(H)$ is
+the block header hash, $\tau$ is the block timestamp, and $\mathcal{M}$ is the
+network magic phrase.  This value is injected into the OVM execution context so
+that on-chain programs can derive a unique, bias-resistant, reproducible
+position label without trusting the producer.
+
+\section{Value Index and Currency Mechanics}
+\label{sec:value-index}
+
+\subsection{Fixed-Point Arithmetic}
+
+All currency computation uses signed $128$-bit fixed point with scale
+$\FP = 10^{12}$, so $\FP$ represents $1.000$.  Multiplication and division are
+saturating; a deterministic natural-logarithm (\texttt{ln\_fixed}) and
+exponential (\texttt{exp\_fixed}) are provided via range reduction and the
+\href{https://en.wikipedia.org/wiki/Rapidly_convergent_statements_for_ln}{atanh series}
+\[
+\ln(m) = 2\sum_{k=0}^{\infty} \frac{z^{2k+1}}{2k+1},\qquad z=\frac{m-1}{m+1},\quad m\in[1,2).
+\]
+No floating-point arithmetic is used on-chain, guaranteeing determinism across
+platforms.
+
+\subsection{Window Statistics}
+
+Each block records $\omega_h = (\Phi_h,\, n_{T,h},\, \Phi_{\mathrm{exit},h},\,
+\Phi_{\max,h},\, f_h)$ where $\Phi$ is volume, $n_T$ the transaction count,
+$\Phi_{\mathrm{exit}}$ the exit-sink amount, $\Phi_{\max}$ the highest
+transaction output total, and $f_h$ the Express-Bus flow signal.  The rolling
+window $W = \sum_{j=h-W_0+1}^{h} \omega_j$ aggregates these over the last
+$P = \texttt{block\_window}$ blocks.
+
+\subsection{Index Formula}
+\label{sec:value-formula}
+
+The value index $V_h$ updates via an exponential moving average:
+\[
+V'_h = \lambda\cdot v_0 \cdot \frac{A_h}{X_h} + (1-\lambda)\cdot V_{h-1},
+\]
+where $\lambda = \lambda_{\bps}/10^{4}$ (default $0.10$), $v_0$ is the initial
+index ($\FP$ at genesis), and
+
+\begin{align}
+A_h &= 1 + \alpha\,\ln\!\Bigl(1+\tfrac{T}{t_{\mathrm{ref}}}\Bigr)
+        + \beta\,\ln\!\Bigl(1+\tfrac{A_{\mathrm{mean}}}{a_{\mathrm{ref}}}\Bigr),
+\\
+X_h &= \gamma\cdot\frac{E}{e_{\mathrm{ref}}}\cdot\Bigl(\frac{S_0}{S_h}\Bigr)^{\eta},
+\\
+f_h &= \xi\cdot f_{\mathrm{express},h}.
+\end{align}
+
+Here $T = \Phi_W$ is window volume, $A_{\mathrm{mean}} = T/n_T$, $E=\Phi_{\mathrm{exit},W}$,
+$S_0$ is genesis supply, $S_h$ is current supply, and $f_{\mathrm{express}}$
+is the Express-Bus net-flow signal.  The weights $\alpha,\beta,\gamma,\eta,\xi$
+are basis-point parameters in $\ChainParams$.
+
+\paragraph{Rebound.}
+If $V'_h \le 0$, the chain \emph{rebounds}: it resets
+$V_h = V_{h-1}$ (the last positive value) and increments the generation $g$.
+Rebound credits created at generation $g$ are maturity-locked until
+generation $g+1$ (Section~\ref{sec:bunnyhop}).
+
+\subsection{Guardrails}
+\label{sec:guardrails}
+
+Governance actions are constrained to keep the value index stable:
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Value-impact limit}: any single action may move $V$ by at most
+    $\delta = \texttt{value\_impact\_limit\_bps}/10^{4}$ of its prior value.
+  \item \textbf{Supply-change cap}: mint/burn per epoch $\le$
+    $\epsilon\cdot S_0$ where $\epsilon = \texttt{supply\_change\_limit\_bps}/10^{4}$
+    (default $1\%$).
+  \item \textbf{Fee affordability}: $\phi_{\mathrm{eff}} \le \rho\cdot A_{\min}$.
+  \item \textbf{Withdrawal cap}: server withdrawals per epoch $\le \kappa\cdot S_0$.
+  \item \textbf{Per-account}: at most $\pi = 30\%$ of an account's balance
+    withdrawable per operation.
+\end{itemize}
+
+\section{Consensus}
+\label{sec:consensus}
+
+\ox{} combines Proof-of-Authority (\poa{}) leader selection with a two-phase
+BFT voting protocol.
+
+\subsection{Leader Selection}
+
+For view $v$ at height $h$, the leader is
+\[
+\mathsf{leader}(v) = \mathrm{nodes}[v \bmod |\mathrm{nodes}|],
+\]
+taken from the current server-node set.  Only the leader may propose a block at
+its view.
+
+\subsection{BFT Voting}
+
+Two vote kinds are defined:
+
+\begin{description}
+  \item[Prep\text{{}are}] cast once a node has validated the proposal and
+    replayed the state transition;
+  \item[Comm\text{}it] cast once the Prepare quorum certificate (2/3 super-majority)
+    is observed.
+\end{description}
+
+Each vote $\upsilon = (h, v, B, \kappa, \pi, \sigma_\pi)$ signs
+$\hash(h,\,v,\,\hash(B),\,\kappa)$ under voter key $\pi$, where $\kappa$ is the
+phase.  A \emph{quorum certificate} $Q_\kappa$ collects votes for a common
+$(h,v,B,\kappa)$ and is valid when the count of distinct, authorized, validly
+signed voters is $\ge \texttt{quorum}(n)$, where
+\[
+\texttt{quorum}(n) = \frac{n\cdot\texttt{num}}{\texttt{den}} + 1.
+\]
+With the default $\frac{2}{3}$ threshold and $n$ nodes, a quorum is
+$\lfloor 2n/3\rfloor + 1$.
+
+\subsection{Master Check}
+
+At each epoch boundary, server nodes issue a \emph{MasterCheck} attestation
+$\mu = (e,\, R_M,\, \pi,\, \sigma_\pi)$ signing the epoch number $e$ and the
+\emph{masters root}
+\[
+R_M = \mathsf{MerkleRoot}\bigl(\{\;\hash(\texttt{``master''}\,\|\,\pk)\;|\;\pk\in\mathrm{masters}\;\}\bigr),
+\]
+with leaves sorted by key.  The epoch is accepted only when
+$\texttt{quorum}(n)$ distinct nodes attest the same $(e, R_M)$.
+
+\subsection{Epoch Governance}
+\label{sec:epoch-gov}
+
+Master-set changes proceed in two stages:
+\begin{enumerate}[label=(\arabic*),leftmargin=2em]
+  \item \textbf{Proposal}: a server node proposes a candidate master key.
+    A strict majority of server nodes sign the proposal id.
+  \item \textbf{Transition}: the outgoing master set co-signs an
+    \EpochTransition, valid only with a $\frac{2}{3}$ (default) super-majority
+    of outgoing master signatures.
+\end{enumerate}
+Both stages are broadcast over the wire (Section~\ref{sec:net}).
+
+\section{Coin-Toss Transaction Ordering}
+\label{sec:coin-toss}
+
+Because the leader is a single server node, the \emph{order} in which it
+places transactions in a block $\mathcal{T}$ is a vector of trust.  A
+malicious or biased leader could reorder transactions to front-run,
+censor, or sandwich other participants' transfers.  \ox{} mitigates this
+risk with a \emph{coin-toss} ordering layer that runs \emph{in parallel} to
+the BFT consensus flow: every honest node independently derives the same
+permutation of $\mathcal{T}$, so the producer cannot choose which permutation
+its block commits to.
+
+\subsection{Seed Derivation}
+\label{sec:coin-toss-seed}
+
+The coin-toss seed for block $h$ is an epoch-global random value committed
+to on-chain at the end of the previous epoch and revealed at epoch
+transition time.  Concretely, during epoch $e-1$ each master $\pi_i$
+contributes a commitment
+\[
+c_i = \hash(\texttt{``toss''}\,\|\,\pk_i\,\|\,r_i),
+\]
+where $r_i$ is a 256-bit secret.  The commitments are aggregated into a
+Merkle root $R_{\mathrm{seeds}}$ stored in the final block header of the
+epoch.  At the epoch-$e$ transition, each master reveals $r_i$; the seed
+for epoch $e$ is then
+\[
+s_e = \hash\!\Bigl(\sum_{i} \bigl(\mathrm{LE64}(|r_i|)\,\|\,r_i\bigr)\Bigr).
+\]
+The header field $s_{\mathrm{toss}}$ stores $\hash(s_e \,\|\, \tau)$---a
+commitment binding the seed to the block timestamp so that the producer
+cannot retroactively adjust $\tau$ to influence the draw.
+
+\subsection{Permutation Algorithm}
+\label{sec:coin-toss-perm}
+
+Given the seed-derived digest $\tau = \hash(s_{\mathrm{toss}})$ (a 64-byte
+value) and a block with $n$ transactions, the canonical permutation $\pi$
+of $\{0,\dots,n-1\}$ is computed as a \emph{Fisher--Yates shuffle} driven by
+an AES-256-CTR stream cipher seeded with $\tau$:
+
+\begin{enumerate}[label=(\arabic*),leftmargin=2em]
+  \item Interpret $\tau$ as a 512-bit seed.  Derive the 256-bit AES key
+    $k = \tau[0:32]$ and the 128-bit initial counter block $c_0 = \tau[32:48]$.
+  \item Generate $\lceil n\log_2 n\rceil$ bytes of keystream by encrypting
+    successive counter values $c_0, c_0{+}1, c_0{+}2,\ldots$ under AES-256-CTR
+    with key $k$.
+  \item For $i$ from $n-1$ down to $1$, draw index $j$ uniformly from
+    $\{0,\dots,i\}$ using the next $\lceil\log_2(i+1)\rceil$ unbiased bits
+    from the keystream (rejection-sampled if the drawn value exceeds $i$),
+    and swap positions $i$ and $j$.
+\end{enumerate}
+
+The result is a bijection $\pi : \{0,\dots,n-1\} \to \{0,\dots,n-1\}$ that
+every node computes identically.  The block producer commits to
+$R_{\mathcal{T}}^{\mathrm{ord}} = \mathsf{ordroot}(\mathcal{T}_\pi)$ in the
+header, where $\mathcal{T}_\pi$ denotes the transaction list rearranged
+according to $\pi$.  Any node that re-derives $\pi$ from the published
+seed and re-applies the shuffle obtains the same root and can reject blocks
+that deviate.
+
+\subsection{Non-Interactive and Bias-Resistant}
+
+The protocol is \emph{non-interactive}: no node needs to send anything
+during block construction to influence the draw.  The seed comes from the
+previous epoch's revealed master contributions, which are committed before
+the block in question is ever proposed.  Because at least one master is
+assumed honest (Section~\ref{sec:audit}), the seed is unbiased with
+overwhelming probability, and a malicious leader cannot adapt the seed to
+favor a particular ordering.
+
+\subsection{Relation to Consensus}
+
+The coin-toss layer does not replace BFT consensus; it constrains the
+\emph{proposal} phase.  The leader still proposes the unordered set
+$\mathcal{T}$ and the execution result, but the ordering it commits to in
+$R_{\mathcal{T}}^{\mathrm{ord}}$ must match the deterministic coin-toss
+permutation.  Validators check this root during Prepare voting (Section~\ref{sec:consensus}) and include its verification in the block state-transition
+checks (Section~\ref{sec:block}).  If a leader submits a
+mismatched root, the block is rejected outright.
+
+\section{Node Admission and Software Integrity}
+\label{sec:admission}
+
+\subsection{Code Manifest}
+
+A node's software is summarized by a \emph{CodeManifest}: a sorted map from file
+path to $\hash(\text{file bytes})$.  A single manifest root
+\[
+R_{\mathrm{manifest}} = \mathsf{MerkleRoot}\bigl(\{\;\hash(\mathit{path}\,\|\,\hash(\mathit{file}))\;\}\bigr)
+\]
+commit to the entire on-disk program so that any unmodified-binary proof
+reduces to a Merkle inclusion proof against this root.
+
+\subsection{Admission Certificate}
+
+A server node joins an epoch only if a master has issued an
+\emph{AdmissionCertificate}
+\[
+c = (\pi_{\mathrm{node}},\, R_{\mathrm{manifest}},\, e,\, t_{\mathrm{issue}},\, t_{\mathrm{expiry}},\, \pi_{\mathrm{master}},\, \sigma_{\pi_{\mathrm{master}}}),
+\]
+where the master $\pi_{\mathrm{master}}$ signs the commitment
+$\hash(c_{\mathrm{signed}})$.  The certificate is valid iff the master is a
+current epoch master, the manifest root is in the approved set, and
+$t_{\mathrm{expiry}}$ has not passed.  Masters maintain the approved-manifest
+set and a revocation list.
+
+\section{Audit Architecture}
+\label{sec:audit}
+
+\ox{} separates the full-validation (``server'') role from the
+header-only (``master'') role through a layered audit.
+
+\subsection{Per-Block Master Audit}
+
+For each proposed block, the proposer supplies an \emph{AuditPackage}
+\[
+\mathcal{P} = (B,\; R_{\mathrm{utxo},h{-}1},\; \{\,\pi_{\mathrm{in}}\,))
+\]
+containing Merkle inclusion proofs $\pi_{\mathrm{in}}$ for every transaction
+input against the prior UTXO root.  A master then:
+\begin{enumerate}[label=(\arabic*),leftmargin=2em]
+  \item verifies every $\pi_{\mathrm{in}}$ against $R_{\mathrm{utxo},h-1}$;
+  \item checks the proven entry matches the spent \outpoint{} and recipient;
+  \item checks rebound maturity of inputs;
+  \item replays the state transition and checks \textbf{conservation} per
+    transaction (${\sum I = \sum O + \phi}$);
+  \item verifies header statistics (volume, count, exit amount) match the body;
+  \item verifies total gas fees $\sum r_{\mathrm{gas}} \cdot p_{\mathrm{gas}}$;
+  \item recomputes supply, value index, and generation from operations and
+    checks them against the header;
+  \item enforces all guardrails (supply cap, value-impact, withdraw caps).
+\end{enumerate}
+The master signs the resulting \emph{AuditReport}
+$(\hash(B),\, R_{\mathrm{state}},\, R_{\mathrm{audit}})$, where
+$R_{\mathrm{audit}}$ is the Merkle root over sorted input-leaf hash commitments.
+A block is accepted when $\ge\texttt{quorum}(|\mathrm{masters}|)$ audits are
+collected (\textbf{attestation quorum}).
+
+\subsection{Lineage Invariant}
+\begin{invariant}[Lineage]
+At every block boundary,
+\[
+\sum_{\mathit{live\;UTXO}} \mathit{amount} \;=\; \Sigma_h.
+\]
+\end{invariant}
+This is checked by both server replay and master audit.  A violation
+($\sum\neq\Sigma$) is a fatal state error.
+
+\subsection{Deep Replay}
+
+Every \texttt{audit\_checkpoint\_blocks} ($K$, default $50$) blocks, server
+nodes holding full state perform a \emph{literal deep replay}: they re-apply
+$K$ blocks from scratch and compare the resulting $R_{\mathrm{utxo}}$ to the
+committed value.  This is the only check that independently recomputes the UTXO
+tree root (the per-block audit trusts the proposer's root but verifies
+supply/index/statistics).
+
+\section{The Ox Virtual Machine}
+\label{sec:ovm}
+
+\subsection{Architecture}
+
+The \ovm{} is a deterministic, stack-based bytecode interpreter.  A program
+consists of a fixed-width operand stack, indexed local variables, $u_64$ storage
+slots, and a bounded data stack.  All arithmetic is on $u_{64}$ words with no
+overflow widening, and the interpreter enforces hard caps on stack depth
+($1\,024$), locals ($256$), storage slots ($4\,096$), and contracts
+($10\,000$).  The instruction set is dispatched by an inline-interpreter loop;
+arithmetic opcodes compile to native machine instructions at build time while
+remaining bit-identical across conformant implementations.
+
+\subsection{Instructions}
+
+Instructions operate on typed $u_{64}$ values and include:
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{Push}, \texttt{LoadArg}, \texttt{LoadLocal}, \texttt{StoreLocal},
+    \texttt{LoadStorage}, \texttt{StoreStorage}, \texttt{LoadStorageDyn},
+    \texttt{StoreStorageDyn};
+  \item \texttt{Add}, \texttt{Sub}, \texttt{Mul}, \texttt{Div}, \texttt{Mod},
+    \texttt{Equal}, \texttt{LessThan}, \texttt{GreaterThan}, \texttt{And},
+    \texttt{Or}, \texttt{Not}, \texttt{BitXor}, \texttt{Shl}, \texttt{Shr};
+  \item \texttt{Jump}, \texttt{JumpIfFalse}, \texttt{Emit};
+  \item \texttt{Return}, \texttt{Revert};
+  \item \texttt{XCall}, \texttt{ReadReply} --- contract-originated cross-\ohm{} messaging;
+  \item \texttt{LoadPriceBounds}, \texttt{PeggedConvert},
+    \texttt{LoadPoolState}, \texttt{PoolSwap} --- host oracles;
+  \item \texttt{DataSize}, \texttt{LoadData}, \texttt{StoreData} --- data stack I/O.
+\end{itemize}
+
+The \texttt{Hash} instruction consumes $k$ words (top-first), takes
+$\mathrm{SHA3\text{-}512}$ of their little-endian byte concatenation, and
+pushes the first $8$ bytes as a $u_{64}$ selector (used for mapping-slot
+derivation).
+
+\subsection{Gas}
+
+Each OVM action reserves
+\[
+g = \lceil \mathsf{stack\_bytes} / 6\rceil
+\]
+units of gas, with a per-transaction cap and a block-level aggregate cap
+($10^{7}$ units).  Execution charges gas equal to instructions used; failures
+(OOM, division by zero, overflow, revert, out-of-gas) produce a stable,
+consensus-visible failure code so auditors need not re-execute bytecode to
+confirm a failure.
+
+\subsection{Contract Deployment and Storage}
+
+Two deployment tiers exist:
+\begin{description}
+  \item[Legacy (v2, \ovm)] raw bytecode $\leftrightarrow$
+    $\mathrm{id} = \hash(\texttt{``oxydome-contract-v1''}\,\|\,\txid)$.
+  \item[Smart-contract (v4)] compiled \textbf{Solid-lang} contract artifacts,
+    each containing named entry points.  Entry points are invoked via
+    \texttt{CallContract}, which receives authority words and arguments.
+\end{description}
+A contract has shared $u_{64}\!\to\!u_{64}$ storage ($4\,096$ slots max).  All
+contract state lives under the OVM-state component of $R_{\mathrm{state}}$
+(Section~\ref{sec:state-root}).
+
+\subsection{Solid-lang}
+
+The \emph{Solid} compiler front-end parses a practical subset of Solidity
+syntax (contracts, interfaces, libraries, inheritance, mappings, structs,
+enums, modifiers, events, custom errors, control flow) and compiles a
+restricted native subset to \ovm{} bytecode: $u_{64}$ and \texttt{bool} scalars,
+scalar state, supported arithmetic/logical expressions, assignments,
+conditionals, and loops.  It additionally compiles \DAO{} policies, liquidity-pool
+configurations, and pegged-currency configs into canonical on-chain encodings.
+
+\subsection{Host Oracles}
+
+The \ovm{} execution environment exposes optional \emph{host oracles} that
+contracts may consult:
+\begin{description}
+  \item[PriceOracle] maps an asset id to packed \PriceBounds, used by
+    \texttt{LoadPriceBounds} and \texttt{PeggedConvert};
+  \item[PoolOracle] maps a pool id to packed reserves, $K$, and fee, used by
+    \texttt{LoadPoolState} and \texttt{PoolSwap};
+  \item[CrossHost] carries the originating \ohm{}, an inbox of cross-\ohm
+    message receipts, and the oracles above, enabling \texttt{XCall} and
+    \texttt{ReadReply}.
+\end{description}
+All oracle values are packed to $u_{64}$ via integer division by $10^6$ for
+\ovm{} consumption.
+
+\section{DAO Framework}
+\label{sec:dao}
+
+\subsection{DAO Policy}
+
+A DAO is created by submitting a \DAOAction::Create with a canonical
+\texttt{ODAO$\backslash$0x01}-prefixed policy encoding a sorted maker set
+($\le 128$), an optional voting currency (1--12 uppercase ASCII characters,
+positive initial supply), and an optional peg (target DAO, reduced-ratio
+numerator/denominator).  The DAO id is
+\[
+d = \hash(\texttt{``oxydome-dao-id-v1''}\,\|\,\mathit{id}\,\|\,\mathit{policy}).
+\]
+
+\subsection{DAO State and Governance}
+
+Each DAO maintains its own currency supply, balances, treasury, locked
+reserves, pegged reserves, proposals, and a local value index.  Proposals
+carry one of several actions (treasury transfer, mint, burn, set-peg) and
+progress through holder-voting and maker-voting phases before execution or
+expiration.  Two-tier voting requires both holder and maker majorities.
+
+\subsection{Pegged Currencies}
+\label{sec:pegged}
+
+A pegged currency publishes a price band with upper bound, lower bound,
+midpoint, and current price, recomputed as a moving average over
+$\texttt{window}$ blocks with a $\texttt{spread}$ (default $5\%$).  A
+\emph{guaranteed exchange rate} applies when the current price is in the upper
+half of the band (${\ge \mathrm{midpoint}}$): the pegged token equals the main
+currency at a $1{:}1$ rate.  When out of band, conversions fail.  These bounds
+feed the GAS price multiplier (Section~\ref{sec:gas}).
+
+\subsection{Liquidity Pools}
+\label{sec:pools}
+
+Pools implement a constant-product AMM $x \cdot y = K$.  Reserves and $K$ are
+stored at $\FP$ scale; $K$ is recomputed each block in log-space as
+\[
+\ln K = 2\,V_{\mathrm{norm}}\,\ln(\text{upper}) +
+        \ln(V_{\mathrm{norm}})\,\ln(\text{lower}),
+\]
+where $V_{\mathrm{norm}} = \mathrm{volume}/t_{\mathrm{ref}}$ is the
+fixed-point ratio of accumulated trading volume to a reference.  The packed
+swap executes the standard constant-product formula with a $\texttt{fee\_bps}$
+deduction (default $100$~bps) on the input before ratio change:
+\[
+\Delta y = y - \frac{K}{x + \Delta x_{\mathrm{eff}}}.
+\]
+
+\section{GAS and Speedometer Fuel Currencies}
+\label{sec:fuel}
+
+\subsection{GAS}
+\label{sec:gas}
+
+\gas{} is the fuel token for on-chain program execution.  Key properties:
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Minting:} $20\%$ of every server-node reward is burned as \ox{}
+    and minted as an equal amount of \gas{} to the same node.
+  \item \textbf{Airdrop:} every \texttt{airdrop\_interval\_blocks} blocks, fresh
+    \gas{} is distributed proportionally to balances, sized by
+    \[
+    \mathit{airdrop} = \Phi_{\max}\cdot\frac{\texttt{airdrop\_base\_bps}}{10^4}\cdot
+      \frac{\pi_{\mathrm{ox}}}{\pi_{\mathrm{ref}}}.
+    \]
+  \item \textbf{Price oracle:} the \ox{} price $\pi_{\mathrm{ox}}$ is a
+    master-governed, smoothed oracle bounded by
+    $\texttt{price\_change\_limit\_bps}$ per update interval.
+  \item \textbf{Burn:} \gas{} is consumed (burned) when a program is uploaded
+    or executed.
+\end{itemize}
+\gas{} uses an account-balance ledger with per-account nonces (replay
+protection) but is \emph{not} committed into $R_{\mathrm{state}}$.
+
+\subsection{Speedometer}
+\label{sec:speedometer}
+
+The Speedometer currency is an optional stabilization layer:
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Per-tx mint:} a fixed share
+    ($\texttt{speedometer\_stabilization\_bps} = 10$~bps) of each transaction's
+    output total is freshly minted and accumulated.
+  \item \textbf{Airdrop:} every
+    $\texttt{speedometer\_airdrop\_interval\_blocks}$ blocks, minted amounts are
+    distributed proportionally to current Speedometer balances, scaled by the
+    Ox price oracle.
+  \item \textbf{Accounts:} account-based, signed with nonces, not committed
+    into $R_{\mathrm{state}}$ (like \gas{}).
+\end{itemize}
+
+\section{Ox Hosted Machines (Tenant Chains)}
+\label{sec:ohm}
+
+\subsection{Design}
+
+An \ohm{} is a tenant-owned private blockchain whose transaction contents are
+private yet whose \emph{continuity} is anchored into \ox{} blocks.  A tenant
+builds private \ohm{} blocks and periodically submits an
+\texttt{OhmAction::Update} operation that commits the new OHM context
+(height, previous-hash, timestamp, state root) and the block hash to the \ox{}
+ledger.  Server nodes execute the OHM block body off-radar, re-derive the
+OHM state root, and reject any \ox{} block whose anchor does not match.
+
+\subsection{OHM State}
+
+The Ox chain stores, per \ohm{} $m$, only a lightweight \OhmState (policy, current
+height, previous hash, anchored state root, supply, treasury balance).  The
+live OHM UTXO set and contract state are re-derived by server nodes from the
+private block bodies; only the state root is a consensus commitment.  The well-known
+treasury outpoint $\mathsf{ohm\_treasury\_outpoint}(m) = (h, 0)$ holds the
+\ox{} backing for the OHM treasury.
+
+\subsection{Fee Flow}
+
+Every \ohm{} transaction pays a fee that is split automatically:
+\[
+(\text{server share},\; \text{ohm share}) =
+\textstyle\frac{40\%}{\text{of fees}}\;\;/\;\;\frac{60\%}{\text{of fees}}.
+\]
+The server share is distributed as \LockedReward{} outputs (participation-weighted
+with a $3{:}1$ proposer bonus); the ohm share stays in the OHM treasury.
+
+\subsection{Cross-OHM Messaging}
+\label{sec:xoh}
+
+\ohms{} communicate via a store-and-forward inbox/outbox:
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Outbound:} a contract stages an \texttt{XCall} in \ovm{}; the
+    ledger enqueues an \OutboundMessage into the source OHM's outbox, committed
+    to the OHM state root.  The message id is
+    $\mathsf{msg\_id} = \hash(\texttt{``oxydome-xchain-msg-v1''}\,\|\,m\,\|\,h\,\|\,\mathrm{seq})$.
+  \item \textbf{Relay:} the receiving OHM's maintainer attaches a
+    \texttt{CrossRecvCall} to a transaction, causing the node to execute the
+    target entry point and record an \InboundReceipt{} (with outcome and optional
+    reply id).
+  \item \textbf{Replies:} if the callee set \texttt{want\_reply}, an automatic
+    reply message carrying $(\mathsf{msg\_id},\mathrm{success},\mathrm{value})$
+    is relayed back.
+  \item \textbf{Transfers:} a \texttt{CrossTransferCall} locks value on the
+    source and mints a wrapped asset on the destination; the return leg
+    \texttt{CrossBurnCall} burns wrapped and unlocks the escrow.
+\end{itemize}
+A single OHM transaction may carry at most one cross-chain action (send, recv,
+transfer, or burn) and may not combine a cross action with an \ovm{} action.
+
+\section{Express Bus and the Bridge}
+\label{sec:express-bus}
+
+\subsection{Express Bus}
+
+The Express Bus is a per-route In/Out tracker for value flowing between \ox{}
+and external systems.  Each bus $\beta$ tracks a \PriceAsset{} and accumulates
+\[
+f_\beta = \omega\cdot(\mathit{in} - \mathit{out})
+\]
+over a sampling window of $P$ blocks, where $\omega$ is a fixed-point weight.
+A \emph{deposit} (master-approved, $\ge\texttt{quorum}$ of masters) tags
+existing Spendable UTXOs as \BusReceipt{} outputs; a \emph{withdrawal}
+(node-approved, $\ge\texttt{quorum}$ of servers) spends them and is additionally
+owner-signed.  The signed flow signal is folded into the value-index formula
+(Section~\ref{sec:value-formula}) so sustained outflow raises $V$ and
+inflow lowers it.
+
+\subsection{Bridge Module}
+
+The bridge module provides verifiable cross-chain asset transfer among external
+chains.  It maintains:
+\begin{itemize}[leftmargin=2em]
+  \item a \ConsensusProof{} (validator set, signer count, threshold, aggregated
+    signature, epoch) for finality;
+  \item a \ProofManager{} for Merkle-proof creation, validation, and caching;
+  \item a \VerificationCoordinator{} managing verification sessions and
+    reputation;
+  \item a \SecureCommunicationLayer{} using X25519 key exchange with HKDF
+    derivation and AES-256-GCM or ChaCha20-Poly1305 encryption at AES-128-CBC fallback;
+  \item \emph{Recovery} logic for timed-out or failed sessions.
+\end{itemize}
+External \ChainId{}s are $64$-bit; proofs are verified against the source
+chain's state commitment with a $2/3$ threshold signature.
+
+\section{Network and Wire Protocol}
+\label{sec:net}
+
+\subsection{Transport}
+
+Nodes communicate over a length-framed TCP transport.  Each frame is prefixed
+by its size (little-endian) and capped at $16\,\mathrm{MiB}$.  Messages are
+serialized deterministically and dispatched on the receiving end.
+
+\subsection{Message Set}
+
+The wire \Message{} enum covers liveness (\texttt{Ping}/\texttt{Pong}), chain
+handshake, admission (node--master credential exchange), master governance
+(proposal and epoch-transition broadcasts), consensus (proposal, attestation,
+vote, quorum-certificate, and master-check messages), and wallet-service
+queries (balance, UTXO set, inclusion proofs, block and transaction lookup,
+value-index queries, transaction and operation submission, DAO and OHM state
+queries).
+
+\subsection{Master Selection}
+
+Nodes select a master to connect to by minimum round-trip time, maintaining a
+rolling RTT estimate and preferring the nearest reachable master for wallet
+queries while broadcasting consensus messages to the full node set.
+
+\section{Ephemeral Verification Keys and Secure Channels}
+\label{sec:evk}
+
+\subsection{EVK Key Chain}
+
+Each block carries an optional \emph{ephemeral verification key}: an Ed25519
+public key $\pi_h$ generated for block $h$ and the \emph{previous commitment}
+$c_{h-1}$ from the prior block.  The \emph{chaining commitment} is
+\[
+c_h = \hash_{\mathrm{many}}\bigl(
+  \texttt{``EVK\_CHAIN''}\,\|\,c_{h-1}\,\|\,\pi_h\,\|\,\mathrm{LE64}(h)\,\|\,\hash(B_h)
+\bigr).
+\]
+The header stores $\pi_h$, $c_{h-1}$, and (optionally) $c_h$.  Masters and
+auditors that do not retain private key material can validate the chain of
+commitments from the genesis key ($\emptyroot$).
+
+\subsection{Migration}
+
+An optional \emph{migration} period makes the EVK extension mandatory-but-optional:
+nodes may operate without keys while the fraction of keyed blocks is below
+$\texttt{migration\_threshold\_percent}$ (default $90\%$).  Once the threshold
+is met (or rolled back by an admin-signed transition), keys become mandatory for
+all subsequently proposed blocks.  Checkpoints at fixed intervals
+($\texttt{checkpoint\_interval}$) record commitment snapshots for efficient
+catch-up verification.
+
+\subsection{Secure Node Channels}
+
+Authenticated, confidential peer channels are established via X25519 static key
+exchange with an Ed25519 identity transcript binding.  Messages are AES-256-GCM
+encrypt-then-MAC'd with a per-message sequence number and session identifier as
+associated data; replays are rejected by a per-session sequence-set.  Private key
+material is held in mlock'd, zeroizing buffers and erased on session completion.
+
+\subsection{EVFS (File System Labeling)}
+\label{sec:evfs}
+
+The EVK chain extends to a content-addressable file system:
+\begin{itemize}[label=--,leftmargin=2em]
+  \item A \StorageLabel{} is a self-signed declaration of a node's capacity,
+    used/unavailable bytes, and optional file metadata; v1 and v2 commitment
+    domains are supported during migration.
+  \item A \FileEvkLabel{} is a signed, chained per-file attestation binding
+    content hash, size, and a ``EVFS\_FILE\_CHAIN'' commitment that links to the
+    previous file, enabling stateless integrity verification without storing
+    file bodies on-chain.
+  \item Per-node file counts are capped; an epoch storage audit records
+    compliance; deviations beyond $\texttt{storage\_label\_max\_deviation\_bps}$
+    are rejected.
+\end{itemize}
+Max file size is $8\,\mathrm{MiB}$; max files per node is $10^5$.
+
+\section{Rewards and Departures}
+\label{sec:rewards}
+
+\subsection{Block Rewards and Fees}
+
+Each block's fees are split $4\%$ to masters and $96\%$ to server nodes by
+default (\texttt{fee\_master\_bps}).  Minted block rewards are distributed
+participation-weighted among servers (with a proposer bonus) and equally among
+masters (derived from the server-reward derivative).  All earnings are
+\LockedReward{} outputs, unlockable only through an approved withdrawal.
+
+\subsection{Node Departure}
+\label{sec:departure}
+
+On a verified node departure (graceful or liveness-triggered), a
+\texttt{DepartureEarnings} operation redistributes half of the departed
+node's held earnings equally across connected members of both the server and
+master groups; the confiscation fraction is
+$\texttt{departure\_take\_bps}$ (default $50\%$, adjustable).  The remainder
+stays locked for the departing node subject to the normal withdrawal path and
+cooling-off period.
+
+\section{Security and Invariants}
+\label{sec:security}
+\label{sec:analysis}
+
+The protocol's safety rests on the following invariants, each enforced by the
+master audit and/or server replay:
+
+\begin{invariant}[Conservation]
+For every transaction, $\sum \mathrm{inputs} = \sum \mathrm{outputs} + \mathrm{fee}$,
+and all inputs exist, are owned by the spender, and (if rebound) are mature.
+\end{invariant}
+
+\begin{invariant}[Lineage]
+$\sum_{\mathit{live\;UTXO}} \mathit{amount} = \Sigma_h$ at every block $h$.
+\end{invariant}
+
+\begin{invariant}[Header consistency]
+$R_T, R_O, R_{\mathcal{R}}$, the value index, generation, and supply in the header
+must be independently recomputable from the block body and prior state.
+\end{invariant}
+
+\begin{invariant}[Governance threshold]
+No mint, burn, withdraw, price change, epoch transition, or node admission
+takes effect without the configured super-majority of the appropriate
+governing set, verified against the current epoch's GovernanceSet.
+\end{invariant}
+
+\begin{invariant}[Determinism]
+All on-chain arithmetic is integer fixed-point; no floating point, no
+platform-dependent operations, and no nondeterministic control flow exist in the
+state transition or \ovm{} execution.
+\end{invariant}
+
+\subsection{Treatment of the Value Index}
+\label{sec:bunnyhop}
+
+The value index $V$ is a monotonically tracked scalar in $[0, \infty)$ that
+ratchets downward on exit pressure and upward on activity, smoothed by
+$\lambda$.  When pressure is severe enough to drive the raw value non-positive,
+the protocol \emph{rebounds}: it pins $V$ to the last positive value, increments
+the generation counter, and marks exit-reserve credits as refundable.  Rebound
+credits are subject to bunny-hop maturity (Section~\ref{sec:state}) to prevent
+rapid re-spending of the refund.
+
+\section{Related Subsystems}
+
+\subsection{Timer}
+A betting subsystem supporting timestamp-direction wagers (up/down) with an
+accumulation period, configurable min/max bet amounts, and resolution at
+expiration.  Correct-direction bettors share the losing side's stake.
+
+\subsection{Genesis and Parameters}
+The genesis document allocates the full $S_0$ to recipient addresses and
+declares the initial master and server-node sets, the \texttt{CodeManifest}
+approval registry, and the \ChainParams{} block.  All parameters are rational
+or fixed-point integers chosen so that every node derives identical results.
+
+\section{Conclusion}
+
+\ox{} presents a layered architecture in which a small auditor set can
+transitively trust the full-state chain through Merkle proofs, deterministic
+replay, and supply-conservation checks, while a rich execution environment
+(\ovm{}), tenant chains (\ohms{}), fuel currencies (\gas{}, Speedometer),
+governance (DAO), and cross-chain plumbing (Express Bus, Bridge) are built
+\emph{as state machine extensions} rather than as separate ledgers.  The
+integration of an integer fixed-point value index with bunny-hop rebounds,
+threshold-governed supply changes, and ephemeral per-block verification keys
+yields a self-contained monetary and consensus design that is fully specified
+by the block history and the genesis parameters.
+
+\bibliographystyle{plain}
+\bibliography{oxydome}
+
+\end{document}
