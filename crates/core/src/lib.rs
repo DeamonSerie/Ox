@@ -81,7 +81,7 @@ pub use express_bus::{
     ExpressBusWithdraw, FP as EXPRESS_FP, MAX_EXPRESS_BUSES,
 };
 pub use tx::{
-    transfer_fee, transfer_fee_for_amount, OutPoint, OutputKind, OvmAction, OvmFailureCode, OvmLog,
+    transfer_fee, transfer_fee_for_amount, ChainId, OutPoint, OutputKind, OvmAction, OvmFailureCode, OvmLog,
     OvmReceipt, Transaction, TxError, TxInput, TxOutput, MAX_OVM_ARGUMENTS,
     MAX_OVM_BLOCK_GAS_LIMIT, MAX_OVM_GAS_LIMIT,
 };

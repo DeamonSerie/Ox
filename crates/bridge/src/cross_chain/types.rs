@@ -34,6 +34,7 @@ pub enum CrossChainOperation {
     AtomicSwap,
     ContractCall,
     ContractDeployment,
+    Recover,
 }
 
 /// A cross-chain transaction.

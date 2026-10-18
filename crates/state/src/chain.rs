@@ -2241,9 +2241,15 @@ fn held_earnings(next: &ChainState, node: &PublicKey) -> Vec<TokenAmount> {
                         Some(Hash::zero())
                     }
                 }
+                crate::OutputKind::WrappedToken { .. } => None,
             };
-            let cur = balances.entry(asset_id).or_insert(0);
-            *cur = cur.saturating_add(entry.output.amount);
+            if let Some(asset_id) = asset_id {
+                let cur = balances.entry(Some(asset_id)).or_insert(0);
+                *cur = cur.saturating_add(entry.output.amount);
+            } else {
+                let cur = balances.entry(None).or_insert(0);
+                *cur = cur.saturating_add(entry.output.amount);
+            }
         }
     }
     balances
@@ -2273,9 +2279,15 @@ fn remove_held_earnings(next: &mut ChainState, departed: &[PublicKey]) -> Vec<To
                         Some(Hash::zero())
                     }
                 }
+                crate::OutputKind::WrappedToken { .. } => None,
             };
-            let cur = totals.entry(asset_id).or_insert(0);
-            *cur = cur.saturating_add(entry.output.amount);
+            if let Some(asset_id) = asset_id {
+                let cur = totals.entry(Some(asset_id)).or_insert(0);
+                *cur = cur.saturating_add(entry.output.amount);
+            } else {
+                let cur = totals.entry(None).or_insert(0);
+                *cur = cur.saturating_add(entry.output.amount);
+            }
             to_remove.push(entry.outpoint.clone());
         }
     }

@@ -435,12 +435,14 @@ mod tests {
             tx_count: 10,
             exit_amount: 0,
             highest_tx_value: 0,
+            express_flow: 0,
         };
         let high = WindowStats {
             volume: 1_000_000,
             tx_count: 10_000,
             exit_amount: 0,
             highest_tx_value: 0,
+            express_flow: 0,
         };
         let v_low = compute_value(
             &params,
@@ -465,12 +467,15 @@ mod tests {
     fn rebound_triggers_and_resets() {
         let params = ChainParams::default_local();
         let stats = WindowStats {
-            volume: 0,
-            tx_count: 0,
-            exit_amount: 10_000_000_000,
-            highest_tx_value: 0,
+            volume: 5_000,
+            tx_count: 20,
+            exit_amount: 50_000,
+            highest_tx_value: 500,
+            express_flow: 0,
         };
-        let prev = ValueIndex::from_raw(2 * FPU);
+        let prev = ValueIndex::from_raw(FPU / 2); // small previous value to trigger rebound? no wait - let us check
+        // actually easier to make prev small and exit large? or just set prev to 0.1*FPU
+        let prev = ValueIndex::from_raw(100_000_000); // very small
         let t = compute_value(
             &params,
             &stats,

@@ -423,6 +423,7 @@ mod tests {
                 vec![reward],
                 node_key.public(),
                 1,
+                None,
             )
             .unwrap();
         master.chain.append(&block, &params).unwrap();
@@ -444,6 +445,7 @@ mod tests {
                 vec![reward2],
                 node_key.public(),
                 2,
+                None,
             )
             .unwrap();
         master.chain.append(&block2, &params).unwrap();
@@ -454,7 +456,7 @@ mod tests {
     fn master_rejects_a_self_declared_epoch_change() {
         let (mut master, state, gov, params, _master_key, node_key) = reward_config();
         let mut block = state
-            .build_block(&gov, &params, Vec::new(), Vec::new(), node_key.public(), 1)
+            .build_block(&gov, &params, Vec::new(), Vec::new(), node_key.public(), 1, None)
             .unwrap();
         block.header.epoch = block.header.epoch + 1;
         assert!(master.chain.append(&block, &params).is_err());

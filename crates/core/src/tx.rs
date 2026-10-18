@@ -4,6 +4,19 @@ use crate::{Amount, CoreError, OhmContext};
 use oxydome_crypto::{hash_value, verify, Hash, KeyPair, PublicKey, Sig, tx_position_hash};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ChainId(pub u64);
+
+impl ChainId {
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub fn id(&self) -> u64 {
+        self.0
+    }
+}
+
 /// Reference to a specific output of a previous transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OutPoint {
@@ -40,6 +53,14 @@ pub enum OutputKind {
     /// Ox tagged as a tracked Express Bus receipt (deposit). Non-spendable by ordinary
     /// transactions — only via an `ExpressBusWithdraw` operation.
     BusReceipt { bus_id: Hash, asset: crate::PriceAsset },
+    /// A wrapped token output pegged to the main-chain currency. Fungible and not identity-bound
+    /// to the original depositor. Only usable on the destination chain context and only spendable
+    /// via wrapped token gate operations.
+    WrappedToken {
+        gate_id: Hash,
+        origin_chain: ChainId,
+        origin_token: Hash,
+    },
 }
 
 impl OutputKind {
@@ -65,6 +86,10 @@ impl OutputKind {
 
     pub fn is_bus_receipt(&self) -> bool {
         matches!(self, OutputKind::BusReceipt { .. })
+    }
+
+    pub fn is_wrapped_token(&self) -> bool {
+        matches!(self, OutputKind::WrappedToken { .. })
     }
 }
 
