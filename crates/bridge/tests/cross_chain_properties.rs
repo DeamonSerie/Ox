@@ -61,6 +61,7 @@ fn verification_is_idempotent_and_quorum_is_subset_invariant() {
             fee: 0,
             ovm_action: None,
             ohm_context: None,
+            position_hash: None,
         },
         oxydome_bridge::cross_chain::ChainId::new(1),
         oxydome_bridge::cross_chain::ChainId::new(2),

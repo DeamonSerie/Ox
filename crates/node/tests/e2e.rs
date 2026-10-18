@@ -126,6 +126,7 @@ fn node_refuses_to_vote_for_an_invalid_state_transition() {
             Vec::new(),
             node.public(),
             1,
+            None,
         )
         .unwrap();
     block.header.state_root = Hash::zero();

@@ -10,6 +10,7 @@ cross-chain-verification = []
 
 [dependencies]
 sha3.workspace = true
+blake2.workspace = true
 ed25519-dalek.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

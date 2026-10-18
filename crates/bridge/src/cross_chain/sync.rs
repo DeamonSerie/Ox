@@ -67,6 +67,8 @@ mod tests {
             speedometer_airdrop_amount: 0,
             gas_price: 0,
             total_gas_fees: 0,
+            coin_toss_seed: None,
+            ordered_tx_root: None,
         }
     }
 

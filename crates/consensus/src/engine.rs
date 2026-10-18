@@ -5,7 +5,10 @@
 //! `Prepare` and `Commit` votes, and only finalizes when a `MasterCheck` super-majority also
 //! confirms the master set for the epoch.
 
-use crate::votes::{master_check_quorum, MasterCheck, QuorumCertificate, Vote, VoteKind};
+use crate::votes::{
+    aggregate_coin_toss_seed, master_check_quorum, CoinTossShare, MasterCheck,
+    QuorumCertificate, Vote, VoteKind,
+};
 use oxydome_core::{quorum, BlockHeader, ChainParams, GovernanceSet, Hash, PublicKey};
 use oxydome_crypto::evk::{
     EphemeralVerificationKey, IVerificationChainIntegrator, VerificationSession,
@@ -17,6 +20,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Step {
     Idle,
+    CoinToss,
     Proposed,
     Prepared,
     Committed,
@@ -71,6 +75,8 @@ pub struct ConsensusEngine {
     pub proposal_hash: Option<Hash>,
     pub votes: Vec<Vote>,
     pub master_checks: Vec<MasterCheck>,
+    pub coin_toss_shares: Vec<CoinTossShare>,
+    pub coin_toss_seed: Option<Hash>,
     pub prepare_qc: Option<QuorumCertificate>,
     pub commit_qc: Option<QuorumCertificate>,
     /// Optional ephemeral key integrator for verification chain management.
@@ -87,6 +93,8 @@ impl ConsensusEngine {
             proposal_hash: None,
             votes: Vec::new(),
             master_checks: Vec::new(),
+            coin_toss_shares: Vec::new(),
+            coin_toss_seed: None,
             prepare_qc: None,
             commit_qc: None,
             evk_integrator: None,
@@ -353,6 +361,60 @@ impl ConsensusEngine {
             .map(|h| Vote::sign(key, self.height, self.view, h, kind))
     }
 
+    /// Records a coin-toss entropy share and, once a quorum is reached,
+    /// aggregates them into a deterministic seed.
+    pub fn add_coin_toss_share(
+        &mut self,
+        share: CoinTossShare,
+        gov: &GovernanceSet,
+        params: &ChainParams,
+    ) -> Result<bool, ConsensusError> {
+        if share.height != self.height || share.view != self.view {
+            return Err(ConsensusError::BadVote);
+        }
+        if !gov.contains_node(&share.voter) {
+            return Err(ConsensusError::NotAuthorized);
+        }
+        if !share.is_valid() {
+            return Err(ConsensusError::BadVote);
+        }
+        self.coin_toss_shares.push(share);
+        self.step = Step::CoinToss;
+
+        let threshold = quorum(gov.nodes.len(), params.bft_num, params.bft_den);
+        if self.coin_toss_shares.len() >= threshold {
+            if let Some(seed) = aggregate_coin_toss_seed(
+                &self.coin_toss_shares,
+                self.height,
+                self.view,
+                gov,
+                params,
+            ) {
+                self.coin_toss_seed = Some(seed);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Builds a signed coin-toss entropy share for this round.
+    pub fn make_coin_toss_share(
+        &self,
+        key: &KeyPair,
+        entropy: Hash,
+    ) -> CoinTossShare {
+        CoinTossShare::sign(key, self.height, self.view, entropy)
+    }
+
+    /// Re-derives and validates the coin-toss seed from collected shares.
+    pub fn verify_coin_toss_seed(
+        &self,
+        gov: &GovernanceSet,
+        params: &ChainParams,
+    ) -> Option<Hash> {
+        aggregate_coin_toss_seed(&self.coin_toss_shares, self.height, self.view, gov, params)
+    }
+
     /// Maps coordinator outcomes into consensus decisions. A block may only
     /// proceed when every required cross-chain operation is verified.
     pub fn accept_cross_chain_verification(
@@ -428,6 +490,9 @@ mod tests {
             10,
             Vec::new(),
             Vec::new(),
+            None,
+            None,
+            "",
         )
         .header;
         header.set_ephemeral_verification_key(&key);

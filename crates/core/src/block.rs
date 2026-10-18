@@ -95,6 +95,14 @@ pub struct BlockHeader {
     /// Total GAS fees collected from OVM execution in this block.
     #[serde(default)]
     pub total_gas_fees: Amount,
+    /// Seed used to drive the peer-consensus coin toss ordering of transactions.
+    /// Absent for blocks at or below the coin-toss activation height.
+    #[serde(default)]
+    pub coin_toss_seed: Option<Hash>,
+    /// Merkle root of the transactions **after** coin-toss reordering.
+    /// Absent for legacy blocks; present when `coin_toss_seed` is set.
+    #[serde(default)]
+    pub ordered_tx_root: Option<Hash>,
 }
 
 impl BlockHeader {
@@ -192,13 +200,23 @@ impl Block {
     }
 
     /// Checks that the header's commitments match the block body.
+    ///
+    /// When a `coin_toss_seed` is present, additionally requires that
+    /// `ordered_tx_root` is present. The full ordered-root verification
+    /// (which depends on `ChainParams`) is performed in `apply_inner`.
     pub fn roots_match(&self) -> bool {
         self.header.tx_root == self.tx_root()
             && self.header.operation_root == self.operation_root()
             && self.header.ovm_receipt_root == self.ovm_receipt_root()
+            && self.header.ordered_tx_root.is_some() == self.header.coin_toss_seed.is_some()
     }
 
     /// Constructs a block header with the roots filled in from the body.
+    ///
+    /// `coin_toss_seed` and `ordered_tx_root` are `None` for legacy blocks
+    /// (height < coin-toss activation). When present, each transaction in
+    /// `transactions` receives a BLAKE2b position hash computed from the
+    /// (pre-assignment) header hash.
     pub fn build_header(
         height: u64,
         execution_version: u32,
@@ -213,8 +231,11 @@ impl Block {
         value_index: ValueIndex,
         producer: PublicKey,
         timestamp: u64,
-        transactions: Vec<Transaction>,
+        mut transactions: Vec<Transaction>,
         operations: Vec<Operation>,
+        coin_toss_seed: Option<Hash>,
+        ordered_tx_root: Option<Hash>,
+        network_magic_phrase: &str,
     ) -> Block {
         let tx_root = {
             let leaves: Vec<Hash> = transactions.iter().map(|t| t.txid()).collect();
@@ -235,39 +256,68 @@ impl Block {
             .map(|o| o.amount)
             .fold(0u128, |a, b| a.saturating_add(b));
         let tx_count = transactions.len() as u64;
+
+        // Build the header with all commitments so we can compute its hash.
+        let header = BlockHeader {
+            height,
+            execution_version,
+            ovm_activation_height,
+            smart_contract_activation_height,
+            prev_hash,
+            tx_root,
+            operation_root,
+            ovm_receipt_root: merkle_root(&[]),
+            utxo_root,
+            state_root,
+            supply,
+            epoch,
+            generation,
+            value_index,
+            producer,
+            timestamp,
+            volume,
+            tx_count,
+            exit_amount,
+            ephemeral_public_key: None,
+            previous_verification_commitment: None,
+            verification_state_commitment: None,
+            speedometer_minted: 0,
+            speedometer_airdrop_amount: 0,
+            gas_price: 0,
+            total_gas_fees: 0,
+            coin_toss_seed,
+            ordered_tx_root,
+        };
+
+        // Assign position hashes using the header hash (now that all commitments
+        // including coin_toss_seed and ordered_tx_root are set).
+        if coin_toss_seed.is_some() {
+            let header_hash = hash_value(&header);
+            for (i, tx) in transactions.iter_mut().enumerate() {
+                tx.position_hash = Some(oxydome_crypto::tx_position_hash(
+                    &header_hash,
+                    i as u32,
+                    timestamp,
+                    network_magic_phrase.as_bytes(),
+                ));
+            }
+        }
+
         Block {
-            header: BlockHeader {
-                height,
-                execution_version,
-                ovm_activation_height,
-                smart_contract_activation_height,
-                prev_hash,
-                tx_root,
-                operation_root,
-                ovm_receipt_root: merkle_root(&[]),
-                utxo_root,
-                state_root,
-                supply,
-                epoch,
-                generation,
-                value_index,
-                producer,
-                timestamp,
-                volume,
-                tx_count,
-                exit_amount,
-                ephemeral_public_key: None,
-                previous_verification_commitment: None,
-                verification_state_commitment: None,
-                speedometer_minted: 0,
-                speedometer_airdrop_amount: 0,
-                gas_price: 0,
-                total_gas_fees: 0,
-            },
+            header,
             transactions,
             operations,
             ovm_receipts: Vec::new(),
         }
+    }
+
+    /// Computes the Merkle root over transactions **after** they have been
+    /// reordered by the coin-toss algorithm. This commitment lives in
+    /// `header.ordered_tx_root` and lets validators verify the execution
+    /// order without re-running the coin-toss locally.
+    pub fn ordered_tx_root(ordered: &[Transaction]) -> Hash {
+        let leaves: Vec<Hash> = ordered.iter().map(|t| t.txid()).collect();
+        merkle_root(&leaves)
     }
 }
 
@@ -282,7 +332,7 @@ mod tests {
         let key = manager
             .generate_ephemeral_key(1, Hash::zero(), Hash::zero(), 10)
             .unwrap();
-        let mut header = Block::build_header(
+        let mut block = Block::build_header(
             1,
             1,
             0,
@@ -298,8 +348,11 @@ mod tests {
             10,
             Vec::new(),
             Vec::new(),
-        )
-        .header;
+            None,
+            None,
+            "",
+        );
+        let mut header = block.header;
         assert!(header.validate_ephemeral_keys(true).is_ok());
         assert!(header.validate_ephemeral_keys(false).is_err());
         header.set_ephemeral_verification_key(&key);
@@ -309,7 +362,7 @@ mod tests {
 
     #[test]
     fn evk_optional_fields_round_trip_through_bincode() {
-        let header = Block::build_header(
+        let block = Block::build_header(
             1,
             1,
             0,
@@ -325,8 +378,11 @@ mod tests {
             10,
             Vec::new(),
             Vec::new(),
-        )
-        .header;
+            None,
+            None,
+            "",
+        );
+        let header = block.header;
         let encoded = bincode::serialize(&header).unwrap();
         let decoded: BlockHeader = bincode::deserialize(&encoded).unwrap();
         assert_eq!(header, decoded);

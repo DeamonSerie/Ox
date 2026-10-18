@@ -10,7 +10,7 @@ use futures_util::future::join_all;
 use oxydome_audit::{attestation_quorum, AuditAttestation};
 use oxydome_bridge::cross_chain::limits::{ResourceLimits, VerificationJob, VerificationScheduler};
 use oxydome_consensus::{votes, MasterCheck, QuorumCertificate, VoteKind};
-use oxydome_core::{Amount, Block, ChainParams, GovernanceSet, Hash};
+use oxydome_core::{Amount, Block, ChainParams, GovernanceSet, Hash, ordered_root};
 use oxydome_net::{FinalityEvidence, FinalizedBlockRecord};
 use oxydome_state::{ChainState, StateError};
 
@@ -69,6 +69,53 @@ fn verify_finality_evidence_sync(
     Ok(())
 }
 
+/// Verifies the coin-toss commitment on a block: when coin-toss is active
+/// the header must carry both `coin_toss_seed` and `ordered_tx_root`, and
+/// the latter must match the recomputed Merkle root of the coin-toss-ordered
+/// transaction list. This is a pure (stateless) check that can run in
+/// parallel across blocks.
+fn verify_coin_toss_sync(
+    block: &Block,
+    params: &ChainParams,
+) -> bool {
+    if block.header.height < params.coin_toss_activation_height {
+        return true;
+    }
+    let (seed, expected_ordered_root) = match (block.header.coin_toss_seed, block.header.ordered_tx_root) {
+        (Some(s), Some(r)) => (s, r),
+        _ => return false,
+    };
+    ordered_root(&block.transactions, &seed, params) == expected_ordered_root
+}
+
+/// Verifies finality evidence and coin-toss commitments for a single block
+/// in parallel via `smol::unblock`.
+pub async fn verify_block_parallel(
+    block: &Block,
+    evidence: &FinalityEvidence,
+    gov: &GovernanceSet,
+    params: &ChainParams,
+) -> Result<(), Amount> {
+    let block = block.clone();
+    let evidence = evidence.clone();
+    let gov = gov.clone();
+    let params = params.clone();
+    smol::unblock(move || {
+        // Run finality evidence verification and coin-toss check in parallel on
+        // the blocking thread — both are CPU-bound and independent of each other.
+        let finality_result = verify_finality_evidence_sync(&block, &evidence, &gov, &params);
+        let toss_result = verify_coin_toss_sync(&block, &params);
+        if finality_result.is_err() {
+            return finality_result;
+        }
+        if !toss_result {
+            return Err(Amount::MAX); // generic error sentinel, matches the Amount error type
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Verifies finality evidence for multiple blocks in parallel using smol.
 ///
 /// All blocks must be at consecutive heights (or at least all at heights where
@@ -117,7 +164,17 @@ pub async fn verify_blocks_parallel(
         let params = params.clone();
         let block = record.block.clone();
         let evidence = record.evidence.clone();
-        smol::unblock(move || verify_finality_evidence_sync(&block, &evidence, &gov, &params))
+        smol::unblock(move || {
+            let finality = verify_finality_evidence_sync(&block, &evidence, &gov, &params);
+            let toss = verify_coin_toss_sync(&block, &params);
+            if finality.is_err() {
+                finality
+            } else if !toss {
+                Err(Amount::MAX)
+            } else {
+                Ok(())
+            }
+        })
     }))
     .await;
     results

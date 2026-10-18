@@ -19,6 +19,7 @@ fn create_test_tx() -> Transaction {
         fee: 0,
         ovm_action: None,
         ohm_context: None,
+        position_hash: None,
     }
 }
 
@@ -51,6 +52,8 @@ fn create_test_header() -> BlockHeader {
         speedometer_airdrop_amount: 0,
         gas_price: 0,
         total_gas_fees: 0,
+        coin_toss_seed: None,
+        ordered_tx_root: None,
     }
 }
 

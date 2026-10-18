@@ -248,6 +248,15 @@ pub struct ChainParams {
     /// Impact (basis points) of the express-flow signal on the value index per window.
     #[serde(default = "default_express_bus_impact_bps")]
     pub express_bus_impact_bps: u32,
+
+    // ---- transaction labeling / coin toss ----
+    /// Network-wide magic phrase used as domain-separation salt in BLAKE2b
+    /// position hashes and as a seed component for the peer-consensus coin toss.
+    #[serde(default = "default_network_magic_phrase")]
+    pub network_magic_phrase: String,
+    /// Height at which position-dependent tx labels and coin-toss ordering become active.
+    #[serde(default = "default_coin_toss_activation_height")]
+    pub coin_toss_activation_height: u64,
 }
 
 fn default_chain_name() -> String {
@@ -418,6 +427,14 @@ fn default_express_bus_impact_bps() -> u32 {
     100
 }
 
+fn default_network_magic_phrase() -> String {
+    "Ox-Label-1.0".to_string()
+}
+
+fn default_coin_toss_activation_height() -> u64 {
+    u64::MAX
+}
+
 fn default_liquidity_pool_activation_height() -> u64 {
     crate::pricing::default_liquidity_pool_activation_height()
 }
@@ -534,6 +551,8 @@ impl ChainParams {
             express_bus_window_blocks: default_express_bus_window_blocks(),
             express_bus_default_weight: default_express_bus_weight(),
             express_bus_impact_bps: default_express_bus_impact_bps(),
+            network_magic_phrase: default_network_magic_phrase(),
+            coin_toss_activation_height: default_coin_toss_activation_height(),
         }
     }
 }

@@ -9,6 +9,7 @@ fn main() {
         fee: 0,
         ovm_action: None,
         ohm_context: None,
+        position_hash: None,
     };
     let txid = transaction.txid();
     let start = Instant::now();

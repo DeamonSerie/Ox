@@ -19,6 +19,7 @@ fn source_block() -> (Transaction, Block) {
         fee: 0,
         ovm_action: None,
         ohm_context: None,
+        position_hash: None,
     };
     let mut header = BlockHeader {
         height: 42,
@@ -47,6 +48,8 @@ fn source_block() -> (Transaction, Block) {
         speedometer_airdrop_amount: 0,
         gas_price: 0,
         total_gas_fees: 0,
+        coin_toss_seed: None,
+        ordered_tx_root: None,
     };
     header.tx_root = merkle_root(&[transaction.txid()]);
     (

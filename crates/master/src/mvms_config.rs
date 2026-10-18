@@ -432,6 +432,8 @@ impl MvmsConfig {
             express_bus_window_blocks: 100,
             express_bus_default_weight: oxydome_core::EXPRESS_FP,
             express_bus_impact_bps: 0,
+            network_magic_phrase: "Ox-Label-1.0".to_string(),
+            coin_toss_activation_height: 1,
         }
     }
 

@@ -496,7 +496,7 @@ async fn handle_connection(
                         )
                         .await;
                     let block_to_finalize = if filtered_count > 0 {
-                        oxydome_state::async_verify::rebuild_block(block_clone, valid_txs)
+                        oxydome_state::async_verify::rebuild_block(block_clone, valid_txs, &params_clone)
                     } else {
                         block_clone.clone()
                     };
@@ -966,7 +966,7 @@ fn apply_finalized_record(
         record.block.header.height,
     );
     let block = if filtered_count > 0 {
-        oxydome_state::async_verify::rebuild_block(&record.block, valid_txs)
+        oxydome_state::async_verify::rebuild_block(&record.block, valid_txs, &node.params)
     } else {
         record.block
     };

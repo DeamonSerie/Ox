@@ -738,6 +738,7 @@ mod tests {
             fee: 0,
             ovm_action: None,
             ohm_context: None,
+            position_hash: None,
         }
     }
 

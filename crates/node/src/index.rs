@@ -4,7 +4,7 @@
 //! rebuildable from the block list; the optional [`IndexStore`] persists a bincode snapshot
 //! (alongside the sign-of-life ledger store) so a fresh restart need not rescan every block.
 
-use oxydome_core::{Amount, Block, Hash, PublicKey};
+use oxydome_core::{Amount, Block, Hash, PublicKey, Transaction};
 use oxydome_net::{HistoryEntry, TxLocation};
 use oxydome_state::UtxoLedger;
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,16 @@ impl WalletIndex {
     pub fn record_block(&mut self, block: &Block, pre_utxo: &UtxoLedger) {
         let block_hash = block.hash();
         let height = block.header.height;
-        for (position, tx) in block.transactions.iter().enumerate() {
+
+        // Determine the execution order: when coin-toss is active, transactions
+        // are executed in the ordered sequence; otherwise the canonical order.
+        let exec_txs: Vec<Transaction> = if let Some(seed) = block.header.coin_toss_seed {
+            oxydome_core::ordered_transactions(&block.transactions, &seed)
+        } else {
+            block.transactions.clone()
+        };
+
+        for (position, tx) in exec_txs.iter().enumerate() {
             let location = TxLocation {
                 height,
                 block_hash,
@@ -170,6 +179,9 @@ mod tests {
             1,
             vec![tx],
             vec![],
+            None,
+            None,
+            "",
         );
 
         let mut index = WalletIndex::new();
@@ -230,6 +242,9 @@ mod tests {
             1,
             vec![tx.clone()],
             vec![],
+            None,
+            None,
+            "",
         );
         // In the new reservation model, gas_used = stack_gas = ceil(stack_bytes / 6) = 1.
         // No gas refund: the full reservation is burned.

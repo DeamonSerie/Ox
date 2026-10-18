@@ -264,6 +264,7 @@ impl ProofManager for Arc<DefaultProofManager> {
                     fee: transaction.fee,
                     ovm_action: transaction.ovm_action.clone(),
                     ohm_context: transaction.ohm_context.clone(),
+                    position_hash: transaction.position_hash,
                 },
                 ChainId::new(1),
                 ChainId::new(2),
@@ -451,6 +452,8 @@ mod tests {
             speedometer_airdrop_amount: 0,
             gas_price: 0,
             total_gas_fees: 0,
+            coin_toss_seed: None,
+            ordered_tx_root: None,
         };
         Block {
             header,
@@ -473,6 +476,7 @@ mod tests {
                     fee: 0,
                     ovm_action: None,
                     ohm_context: None,
+                    position_hash: None,
                 },
                 ChainId::new(1),
                 ChainId::new(2),
@@ -523,6 +527,7 @@ mod tests {
             fee: 0,
             ovm_action: None,
             ohm_context: None,
+            position_hash: None,
         };
         let mut header = create_test_block().header;
         header.timestamp = SystemTime::now()
@@ -567,6 +572,7 @@ mod tests {
             fee: 0,
             ovm_action: None,
             ohm_context: None,
+            position_hash: None,
         };
         let mut block = create_test_block();
         block.transactions = vec![tx.clone()];

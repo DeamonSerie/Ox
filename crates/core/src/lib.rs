@@ -4,6 +4,7 @@
 //! vocabulary that every other crate shares.
 
 pub mod block;
+pub mod coin_toss;
 pub mod config;
 pub mod dao;
 pub mod express_bus;
@@ -23,6 +24,7 @@ pub use block::{
     Block, BlockHeader, ValueIndex, LEGACY_EXECUTION_VERSION, OVM_EXECUTION_VERSION,
     SMART_CONTRACT_EXECUTION_VERSION, VALUE_SCALE,
 };
+pub use coin_toss::{aggregate_seed, ordered_root, ordered_transactions};
 pub use config::{AllocationConfig, AppConfig, ConfigError, EndpointConfig};
 pub use dao::{
     DaoAction, DaoCurrency, DaoOperation, DaoPeg, DaoPolicy, DaoProposal, DaoProposalAction,

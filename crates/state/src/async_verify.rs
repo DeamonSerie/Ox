@@ -33,12 +33,13 @@ pub async fn build_block_async(
     operations: Vec<Operation>,
     producer: PublicKey,
     timestamp: u64,
+    coin_toss_seed: Option<Hash>,
 ) -> Result<Block, StateError> {
     let state = state.clone();
     let gov = gov.clone();
     let params = params.clone();
     smol::unblock(move || {
-        state.build_block(&gov, &params, transactions, operations, producer, timestamp)
+        state.build_block(&gov, &params, transactions, operations, producer, timestamp, coin_toss_seed)
     })
     .await
 }
@@ -137,10 +138,32 @@ pub async fn filter_invalid_transactions(
 }
 
 /// Rebuilds a block with a filtered transaction set, fixing the tx_root commitment.
-pub fn rebuild_block(block: &Block, filtered_txs: Vec<oxydome_core::Transaction>) -> Block {
+pub fn rebuild_block(
+    block: &Block,
+    filtered_txs: Vec<oxydome_core::Transaction>,
+    params: &ChainParams,
+) -> Block {
     let mut rebuilt = block.clone();
     rebuilt.transactions = filtered_txs;
     rebuilt.header.tx_root = rebuilt.tx_root();
+    // Recompute position hashes and ordered_tx_root if coin toss is active.
+    if let (Some(seed), Some(_)) = (rebuilt.header.coin_toss_seed, rebuilt.header.ordered_tx_root) {
+        let header_hash = rebuilt.hash();
+        for (i, tx) in rebuilt.transactions.iter_mut().enumerate() {
+            tx.position_hash = Some(oxydome_crypto::tx_position_hash(
+                &header_hash,
+                i as u32,
+                rebuilt.header.timestamp,
+                params.network_magic_phrase.as_bytes(),
+            ));
+        }
+        // ordered_tx_root stays the same (same seed, recomputed from new tx set)
+        rebuilt.header.ordered_tx_root = Some(oxydome_core::ordered_root(
+            &rebuilt.transactions,
+            &seed,
+            params,
+        ));
+    }
     rebuilt
 }
 
@@ -166,7 +189,7 @@ pub async fn verify_and_finalize_block(
 
         // If any transactions were filtered out, rebuild the block.
         let block_to_apply = if filtered_count > 0 {
-            rebuild_block(&block_clone, valid_txs)
+            rebuild_block(&block_clone, valid_txs, &params)
         } else {
             block_clone.clone()
         };
@@ -228,6 +251,7 @@ mod tests {
             fee: 1,
             ovm_action: None,
             ohm_context: None,
+            position_hash: None,
         };
         let block = Block::build_header(
             1,
@@ -245,6 +269,9 @@ mod tests {
             1,
             vec![bad_tx],
             vec![],
+            None,
+            None,
+            &params.network_magic_phrase,
         );
         let (valid, stats, filtered) = filter_sync(&state, &block, &params, 1);
         assert_eq!(filtered, 1);
@@ -267,6 +294,7 @@ mod tests {
             fee: 1,
             ovm_action: None,
             ohm_context: None,
+            position_hash: None,
         };
 
         let block = Block::build_header(
@@ -285,13 +313,16 @@ mod tests {
             1,
             vec![tx.clone()],
             vec![],
+            None,
+            None,
+            &params.network_magic_phrase,
         );
         let original_root = block.header.tx_root;
 
-        let rebuilt = rebuild_block(&block, vec![tx.clone()]);
+        let rebuilt = rebuild_block(&block, vec![tx.clone()], &params);
         assert_eq!(rebuilt.header.tx_root, original_root);
 
-        let empty_rebuilt = rebuild_block(&block, vec![]);
+        let empty_rebuilt = rebuild_block(&block, vec![], &params);
         assert_ne!(empty_rebuilt.header.tx_root, original_root);
     }
 }

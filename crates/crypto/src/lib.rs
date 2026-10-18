@@ -5,6 +5,8 @@
 //!   Merkle trees, state roots and software code manifests.
 //! * **Ed25519** for all signatures: transactions, blocks, admission certificates and
 //!   governance votes.
+//! * **BLAKE2b-512** for position-dependent transaction labels and the coin-toss ordering
+//!   seed — chosen as a cryptographically secure, less-common alternative to the SHA family.
 //!
 //! ## Cross-Chain Verification
 //!
@@ -20,6 +22,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha3::{Digest, Sha3_512};
 use std::collections::BTreeMap;
+use blake2::Blake2b512;
 
 pub const HASH_LEN: usize = 64;
 pub const PUBKEY_LEN: usize = 32;
@@ -168,6 +171,49 @@ pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
 /// Hashes a serializable value. Convenience over `hash(&encode(value))`.
 pub fn hash_value<T: Serialize>(value: &T) -> Hash {
     hash(&encode(value))
+}
+
+/// Position-dependent label computed with BLAKE2b-512 over the block
+/// header hash, the transaction's position index, a timestamp and the
+/// network magic phrase. If a transaction's content changes, its `txid`
+/// changes, but the position hash still validates against the same
+/// block header — so the label binds the transaction to its slot in a
+/// way that survives reordering while detecting content tampering via
+/// the txid check in [`BlockHeader::roots_match`] / `apply_inner`.
+pub fn tx_position_hash(
+    block_header_hash: &Hash,
+    position: u32,
+    timestamp: u64,
+    network_magic: &[u8],
+) -> Hash {
+    let mut h = Blake2b512::new();
+    h.update(block_header_hash.as_bytes());
+    h.update(position.to_le_bytes());
+    h.update(timestamp.to_le_bytes());
+    let magic_len = (network_magic.len() as u64).to_le_bytes();
+    h.update(magic_len);
+    h.update(network_magic);
+    let out = h.finalize();
+    let mut buf = [0u8; HASH_LEN];
+    buf.copy_from_slice(&out);
+    Hash(buf)
+}
+
+/// Convenience wrapper around [`tx_position_hash`] that accepts the
+/// block header as a separate digest and uses [`Hash::zero`] when no
+/// header hash is available (e.g. for standalone tx validation tests).
+pub fn compute_tx_position_hash(
+    block_header_hash: Hash,
+    position: usize,
+    timestamp: u64,
+    network_magic: &str,
+) -> Hash {
+    tx_position_hash(
+        &block_header_hash,
+        position as u32,
+        timestamp,
+        network_magic.as_bytes(),
+    )
 }
 
 // ---------------------------------------------------------------------------

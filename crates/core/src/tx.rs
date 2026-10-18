@@ -1,7 +1,7 @@
 //! Transactions and the UTXO primitive types.
 
 use crate::{Amount, CoreError, OhmContext};
-use oxydome_crypto::{hash_value, verify, Hash, KeyPair, PublicKey, Sig};
+use oxydome_crypto::{hash_value, verify, Hash, KeyPair, PublicKey, Sig, tx_position_hash};
 use serde::{Deserialize, Serialize};
 
 /// Reference to a specific output of a previous transaction.
@@ -166,6 +166,11 @@ pub struct Transaction {
     /// OHM transactions pay fees to Ox network: 40% to server nodes, 60% to OHM.
     #[serde(default)]
     pub ohm_context: Option<OhmContext>,
+    /// Position-dependent label computed during block production.
+    /// Skipped from serialization so it never affects `txid` or signing hashes;
+    /// verified against a recomputed BLAKE2b value during block validation.
+    #[serde(skip)]
+    pub position_hash: Option<Hash>,
 }
 
 /// A versioned OVM action carried by an ordinary, value-conserving transaction.
@@ -364,6 +369,7 @@ impl Transaction {
             fee,
             ovm_action: None,
             ohm_context: None,
+            position_hash: None,
         }
     }
 
@@ -397,6 +403,30 @@ impl Transaction {
 
     pub fn has_rebound_output(&self) -> bool {
         self.outputs.iter().any(|o| o.is_rebound_credit())
+    }
+
+    /// Verifies that `position_hash` matches the BLAKE2b label expected for
+    /// this transaction at `position` within a block identified by
+    /// `block_header_hash` and `timestamp`, using the `network_magic_phrase`.
+    pub fn verify_position_hash(
+        &self,
+        block_header_hash: &Hash,
+        position: usize,
+        timestamp: u64,
+        network_magic: &str,
+    ) -> bool {
+        match &self.position_hash {
+            None => false,
+            Some(stored) => {
+                let expected = tx_position_hash(
+                    block_header_hash,
+                    position as u32,
+                    timestamp,
+                    network_magic.as_bytes(),
+                );
+                stored == &expected
+            }
+        }
     }
 
     /// Performs all stateless validation and signature verification.
@@ -499,6 +529,7 @@ mod tests {
             fee,
             ovm_action: None,
             ohm_context: None,
+            position_hash: None,
         };
         let msg = tx.signing_hash(0);
         tx.inputs[0].signature = kp.sign(&msg.0);

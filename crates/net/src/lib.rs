@@ -2,7 +2,9 @@
 //! round-trip-time based nearest-master selection.
 
 use oxydome_audit::{AuditAttestation, AuditPackage};
-use oxydome_consensus::{AdmissionCertificate, MasterCheck, QuorumCertificate, Vote};
+use oxydome_consensus::{
+    AdmissionCertificate, CoinTossShare, MasterCheck, QuorumCertificate, Vote,
+};
 use oxydome_core::{
     Amount, Block, DaoState, Hash, InboundReceipt, OhmBlock, OhmState, Operation, OutPoint,
     OutboundMessage, OutputKind, OvmFailureCode, OvmLog, PublicKey, Transaction,
@@ -103,6 +105,16 @@ pub enum Message {
     },
     MasterCheckMessage {
         check: MasterCheck,
+    },
+
+    // -- coin-toss entropy shares (node <-> node, parallel to votes) --
+    CoinTossShareMessage {
+        share: CoinTossShare,
+    },
+    CoinTossSeedMessage {
+        height: u64,
+        view: u64,
+        seed: Hash,
     },
 
     // -- wallet queries (walletd <-> node) --

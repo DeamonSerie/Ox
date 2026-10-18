@@ -9,4 +9,4 @@ pub mod votes;
 pub use admission::AdmissionCertificate;
 pub use engine::{ConsensusEngine, ConsensusError, CrossChainVerificationOutcome, Step};
 pub use governance::{majority, EpochTransition, MasterProposal};
-pub use votes::{masters_root, MasterCheck, QuorumCertificate, Vote, VoteKind};
+pub use votes::{aggregate_coin_toss_seed, masters_root, CoinTossShare, MasterCheck, QuorumCertificate, Vote, VoteKind};

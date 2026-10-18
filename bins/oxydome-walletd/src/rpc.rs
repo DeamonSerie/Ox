@@ -1782,6 +1782,7 @@ fn parse_rpc_transaction(value: &Value) -> Result<oxydome_core::Transaction, Rpc
         fee,
         ovm_action,
         ohm_context: None,
+        position_hash: None,
     })
 }
 

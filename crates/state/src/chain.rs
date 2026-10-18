@@ -3,8 +3,9 @@
 
 use crate::utxo::{UtxoEntry, UtxoLedger};
 use oxydome_core::{
-    accumulated_track, actual_direction, bus_flow_delta, conversion_split_with_bps, is_ox_asset,
-    pool_swap, reward_for_bet, timer_burn_outpoint, Amount, Block, BlockRewardDistribution,
+    accumulated_track, actual_direction, bus_flow_delta,
+    conversion_split_with_bps, is_ox_asset, ordered_transactions, pool_swap, reward_for_bet,
+    timer_burn_outpoint, Amount, Block, BlockRewardDistribution,
     ChainParams, DaoOperation, DaoState, DaoWindowStats, ExpressBusDeposit, ExpressBusTracker,
     ExpressBusWithdraw, FileAccessOperation, FileAccessRecord, FileDeleteOperation,
     FileEvkLabel, FileStoreOperation, GasAccount, GasAction, GasOperation, GovernanceSet,
@@ -223,6 +224,10 @@ pub enum StateError {
     BadExpressBusWithdraw,
     #[error("withdrawer is not the bus owner")]
     ExpressBusNotOwner,
+    #[error("coin toss seed or ordered_tx_root mismatch")]
+    CoinTossMismatch,
+    #[error("transaction {0} position hash does not match expected value")]
+    BadPositionHash(usize),
 }
 
 /// The complete accounting state of the chain.
@@ -353,6 +358,9 @@ impl ChainState {
             config.timestamp,
             Vec::new(),
             Vec::new(),
+            None,
+            None,
+            &config.params.network_magic_phrase,
         );
         let block_hash = block.hash();
         let state = ChainState {
@@ -975,6 +983,10 @@ impl ChainState {
     /// Produces a fully-formed block (correct `state_root`, `supply`, `value_index` and
     /// `generation`) from a set of transactions and operations. The block is verified before
     /// it is returned.
+    ///
+    /// `coin_toss_seed` is provided by the leader after the consensus coin-toss phase;
+    /// when `None` the block is produced in legacy mode (no position hashes, no
+    /// ordered execution).
     pub fn build_block(
         &self,
         gov: &GovernanceSet,
@@ -983,7 +995,13 @@ impl ChainState {
         operations: Vec<Operation>,
         producer: PublicKey,
         timestamp: u64,
+        coin_toss_seed: Option<Hash>,
     ) -> Result<Block, StateError> {
+        let coin_toss_active = self.height + 1 >= params.coin_toss_activation_height
+            && coin_toss_seed.is_some();
+        let ordered_tx_root: Option<Hash> = coin_toss_seed
+            .as_ref()
+            .map(|seed| oxydome_core::ordered_root(&transactions, seed, params));
         let mut block = Block::build_header(
             self.height + 1,
             params.execution_version_at(self.height + 1),
@@ -1000,6 +1018,9 @@ impl ChainState {
             timestamp,
             transactions,
             operations,
+            coin_toss_seed,
+            ordered_tx_root,
+            &params.network_magic_phrase,
         );
         let next = self.apply_inner(&block, gov, params, false)?;
         block.ovm_receipts = next.ovm_receipts.clone();
@@ -1094,6 +1115,41 @@ impl ChainState {
         let mut next = self.clone();
         next.ovm_receipts.clear();
 
+        // ---- Coin-toss: verify seed, ordered root and position hashes ----
+        let coin_toss_active =
+            new_height >= params.coin_toss_activation_height;
+        if coin_toss_active {
+            // The seed must be present; ordered_tx_root must match the commitment.
+            let seed = block
+                .header
+                .coin_toss_seed
+                .ok_or(StateError::CoinTossMismatch)?;
+            let ordered_root = block
+                .header
+                .ordered_tx_root
+                .ok_or(StateError::CoinTossMismatch)?;
+
+            // Re-derive the ordered root from the block's transactions and seed.
+            let expected_root =
+                oxydome_core::ordered_root(&block.transactions, &seed, params);
+            if expected_root != ordered_root {
+                return Err(StateError::CoinTossMismatch);
+            }
+
+            // Verify each transaction's position hash.
+            let header_hash = block.hash();
+            for (i, tx) in block.transactions.iter().enumerate() {
+                if !tx.verify_position_hash(
+                    &header_hash,
+                    i,
+                    block.header.timestamp,
+                    &params.network_magic_phrase,
+                ) {
+                    return Err(StateError::BadPositionHash(i));
+                }
+            }
+        }
+
         // Reject duplicate operations up front. Two identical operations share an `id()` (and
         // therefore identical minted outpoints), so applying both would inflate the supply while
         // overwriting the same UTXO entries, breaking the `utxo.total() == supply` invariant.
@@ -1114,7 +1170,17 @@ impl ChainState {
         next.speedometer_airdrop_amount = 0;
         next.block_gas_fees = 0;
         next.block_gas_price = self.compute_gas_price(params);
-        for (tx_idx, tx) in block.transactions.iter().enumerate() {
+
+        // Determine execution order: coin-toss-ordered when active, otherwise
+        // the canonical block order.
+        let exec_txs: Vec<Transaction> = if coin_toss_active {
+            let seed = block.header.coin_toss_seed.unwrap();
+            ordered_transactions(&block.transactions, &seed)
+        } else {
+            block.transactions.clone()
+        };
+
+        for (tx_idx, tx) in exec_txs.iter().enumerate() {
             tx.validate_structure()
                 .map_err(|e| StateError::BadTransaction(tx_idx, e.to_string()))?;
             if let Some(action) = &tx.ovm_action {
@@ -2433,8 +2499,7 @@ mod tests {
                 vec![tx],
                 vec![Operation::Rewards(rewards)],
                 node.public(),
-                1,
-            )
+                1, None)
             .unwrap();
 
         let after = state.apply_block(&block, &gov, &params).unwrap();
@@ -2544,7 +2609,7 @@ mod tests {
     fn rejects_a_block_with_an_unexpected_execution_version() {
         let (state, _, gov, params, _master, node, _user) = setup();
         let mut block = state
-            .build_block(&gov, &params, Vec::new(), Vec::new(), node.public(), 1)
+            .build_block(&gov, &params, Vec::new(), Vec::new(), node.public(), 1, None)
             .unwrap();
         block.header.execution_version = oxydome_core::LEGACY_EXECUTION_VERSION;
         assert!(matches!(
@@ -2568,8 +2633,7 @@ mod tests {
             Vec::new(),
             vec![mint.clone(), mint],
             node.public(),
-            1,
-        );
+            1, None);
         assert!(matches!(result, Err(StateError::DuplicateOperation)));
     }
 
@@ -2582,7 +2646,7 @@ mod tests {
             server_outputs: vec![TxOutput::locked_reward(1_000, user.public())],
             master_outputs: Vec::new(),
         });
-        let result = state.build_block(&gov, &params, Vec::new(), vec![reward], node.public(), 1);
+        let result = state.build_block(&gov, &params, Vec::new(), vec![reward], node.public(), 1, None);
         assert!(matches!(
             result,
             Err(StateError::BadRewardRecipient(recipient)) if recipient == user.public()
@@ -2593,7 +2657,7 @@ mod tests {
     fn rejects_a_self_declared_epoch_change() {
         let (state, _genesis, gov, params, _master, node, _user) = setup();
         let mut block = state
-            .build_block(&gov, &params, Vec::new(), Vec::new(), node.public(), 1)
+            .build_block(&gov, &params, Vec::new(), Vec::new(), node.public(), 1, None)
             .unwrap();
         block.header.epoch = block.header.epoch + 1;
         assert!(matches!(
@@ -2615,8 +2679,7 @@ mod tests {
                 Vec::new(),
                 vec![Operation::Mint(mint.clone())],
                 node.public(),
-                1,
-            )
+                1, None)
             .unwrap();
         let state1 = state.apply_block(&block1, &gov, &params).unwrap();
         assert_eq!(state1.supply, params.genesis_supply + 1_000);
@@ -2631,8 +2694,7 @@ mod tests {
             Vec::new(),
             vec![Operation::Mint(mint)],
             node.public(),
-            2,
-        );
+            2, None);
         assert!(matches!(replay, Err(StateError::AlreadyMinted)));
 
         // A fresh nonce produces a distinct proposal id/outpoint and mints once more.
@@ -2645,8 +2707,7 @@ mod tests {
                 Vec::new(),
                 vec![Operation::Mint(mint2)],
                 node.public(),
-                2,
-            )
+                2, None)
             .unwrap();
         let state2 = state1.apply_block(&block2, &gov, &params).unwrap();
         assert_eq!(state2.supply, params.genesis_supply + 2_000);
@@ -2711,8 +2772,7 @@ mod tests {
                 vec![deploy, call],
                 vec![Operation::Rewards(rewards)],
                 node.public(),
-                1,
-            )
+                1, None)
             .unwrap();
         assert_eq!(block.fee_total(), fees);
 
@@ -2796,8 +2856,7 @@ mod tests {
                 vec![deploy, call],
                 vec![Operation::Rewards(rewards)],
                 node.public(),
-                1,
-            )
+                1, None)
             .unwrap();
         let next = state.apply_block(&block, &gov, &params).unwrap();
         let expected = u64::from_le_bytes(node.public().0[..8].try_into().unwrap());
@@ -2886,8 +2945,7 @@ mod tests {
                 vec![deploy, call],
                 vec![Operation::Rewards(rewards)],
                 node.public(),
-                1,
-            )
+                1, None)
             .unwrap();
         let next = state.apply_block(&block, &gov, &params).unwrap();
 
@@ -2915,8 +2973,7 @@ mod tests {
                 vec![tx1],
                 vec![Operation::Rewards(rewards)],
                 node.public(),
-                1,
-            )
+                1, None)
             .unwrap();
         let after = state.apply_block(&b1, &gov, &params).unwrap();
 
@@ -2934,8 +2991,7 @@ mod tests {
             vec![tx2],
             vec![Operation::Rewards(rewards2)],
             node.public(),
-            2,
-        );
+            2, None);
         assert!(matches!(err, Err(StateError::MissingInput(_))));
     }
 
@@ -2954,8 +3010,7 @@ mod tests {
             Vec::new(),
             vec![Operation::Mint(mint)],
             node.public(),
-            1,
-        );
+            1, None);
         assert!(matches!(err, Err(StateError::MasterApprovalMissing(0, _))));
     }
 
@@ -2980,8 +3035,7 @@ mod tests {
             vec![tx],
             vec![Operation::Rewards(bad)],
             node.public(),
-            1,
-        );
+            1, None);
         assert!(matches!(err, Err(StateError::RewardSplit)));
     }
 
@@ -2999,7 +3053,7 @@ mod tests {
             },
         );
         let op = Operation::Timer(create);
-        let result = state.build_block(&gov, &params, Vec::new(), vec![op], node.public(), 1);
+        let result = state.build_block(&gov, &params, Vec::new(), vec![op], node.public(), 1, None);
         assert!(matches!(
             result,
             Err(StateError::TimerApprovalMissing(0, _))
@@ -3029,7 +3083,7 @@ mod tests {
 
         let op = Operation::Timer(create);
         let block = state
-            .build_block(&gov, &params, Vec::new(), vec![op], node.public(), 1)
+            .build_block(&gov, &params, Vec::new(), vec![op], node.public(), 1, None)
             .unwrap();
         let after = state.apply_block(&block, &gov, &params).unwrap();
         assert_eq!(after.timers.len(), 1);
@@ -3063,7 +3117,7 @@ mod tests {
         });
         let create_op = Operation::Timer(create);
         let block = state
-            .build_block(&gov, &params, Vec::new(), vec![create_op], node.public(), 1)
+            .build_block(&gov, &params, Vec::new(), vec![create_op], node.public(), 1, None)
             .unwrap();
         let state1 = state.apply_block(&block, &gov, &params).unwrap();
 
@@ -3077,7 +3131,7 @@ mod tests {
         bet_op.sign(&user);
         let bet_op = Operation::Timer(bet_op);
         let block2 = state1
-            .build_block(&gov, &params, Vec::new(), vec![bet_op], node.public(), 2)
+            .build_block(&gov, &params, Vec::new(), vec![bet_op], node.public(), 2, None)
             .unwrap();
         let state2 = state1.apply_block(&block2, &gov, &params).unwrap();
         let timer = state2.timers.get(&timer_id).unwrap();
@@ -3107,7 +3161,7 @@ mod tests {
         });
         let create_op = Operation::Timer(create);
         let block = state
-            .build_block(&gov, &params, Vec::new(), vec![create_op], node.public(), 1)
+            .build_block(&gov, &params, Vec::new(), vec![create_op], node.public(), 1, None)
             .unwrap();
         let state1 = state.apply_block(&block, &gov, &params).unwrap();
 
@@ -3121,7 +3175,7 @@ mod tests {
         bet_op.sign(&user);
         let bet_op = Operation::Timer(bet_op);
         let block2 = state1
-            .build_block(&gov, &params, Vec::new(), vec![bet_op], node.public(), 2)
+            .build_block(&gov, &params, Vec::new(), vec![bet_op], node.public(), 2, None)
             .unwrap();
         let state2 = state1.apply_block(&block2, &gov, &params).unwrap();
 
@@ -3146,8 +3200,7 @@ mod tests {
                 Vec::new(),
                 vec![resolve_op],
                 node.public(),
-                101,
-            )
+                101, None)
             .unwrap();
         let state3 = state2.apply_block(&block3, &gov, &params).unwrap();
 
@@ -3179,7 +3232,7 @@ mod tests {
         });
         let create_op = Operation::Timer(create);
         let block = state
-            .build_block(&gov, &params, Vec::new(), vec![create_op], node.public(), 1)
+            .build_block(&gov, &params, Vec::new(), vec![create_op], node.public(), 1, None)
             .unwrap();
         let state1 = state.apply_block(&block, &gov, &params).unwrap();
 
@@ -3200,8 +3253,7 @@ mod tests {
             Vec::new(),
             vec![resolve_op],
             node.public(),
-            2,
-        );
+            2, None);
         assert!(result.is_err());
     }
 
@@ -3215,7 +3267,7 @@ mod tests {
     fn build_block_zero_gas_fees_when_no_ovm() {
         let (state, _genesis, gov, params, _master, node, _user) = setup();
         let block = state
-            .build_block(&gov, &params, Vec::new(), Vec::new(), node.public(), 0)
+            .build_block(&gov, &params, Vec::new(), Vec::new(), node.public(), 0, None)
             .unwrap();
         assert_eq!(block.header.gas_price, params.ox_price_reference);
         assert_eq!(block.header.total_gas_fees, 0);

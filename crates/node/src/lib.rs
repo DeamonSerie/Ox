@@ -110,6 +110,8 @@ pub struct Node {
     pub events: broadcast::Sender<NodeEvent>,
     /// Storage labeler for network capacity reporting.
     labeler: Labeler,
+    /// Coin-toss seed received from the consensus phase; `None` for legacy blocks.
+    pub coin_toss_seed: Option<Hash>,
 }
 
 impl Node {
@@ -148,6 +150,7 @@ impl Node {
             rejected_order: VecDeque::new(),
             mempool_inputs: BTreeSet::new(),
             events: broadcast::channel(2048).0,
+            coin_toss_seed: None,
             labeler: Labeler::new(LabelerConfig {
                 node_keypair: key.clone(),
                 node_public: key.public(),
@@ -160,7 +163,10 @@ impl Node {
         Ok((node, genesis))
     }
 
-    /// Configures the storage labeler with a declared capacity and data paths.
+    /// Sets the coin-toss seed for block production.
+    pub fn set_coin_toss_seed(&mut self, seed: Option<Hash>) {
+        self.coin_toss_seed = seed;
+    }
     pub fn with_storage_capacity(
         mut self,
         capacity_bytes: u64,
@@ -1103,6 +1109,7 @@ impl Node {
             operations,
             self.public(),
             timestamp,
+            self.coin_toss_seed,
         )?;
         Ok(block)
     }
@@ -1154,8 +1161,9 @@ impl Node {
         let gov = self.gov.clone();
         let params = self.params.clone();
         let producer = self.public();
+        let coin_toss_seed = self.coin_toss_seed;
         smol::unblock(move || {
-            state.build_block(&gov, &params, valid_txs, operations, producer, timestamp)
+            state.build_block(&gov, &params, valid_txs, operations, producer, timestamp, coin_toss_seed)
         })
         .await
         .map_err(NodeError::from)
@@ -1280,8 +1288,14 @@ impl Node {
             .flat_map(|t| t.inputs.iter().map(|i| i.prev_out))
             .collect();
 
+        // Determine execution order for event emission.
+        let exec_txs: Vec<Transaction> = match block.header.coin_toss_seed {
+            Some(seed) => oxydome_core::ordered_transactions(&block.transactions, &seed),
+            None => block.transactions.clone(),
+        };
+
         // Confirm the block's transactions, dropping them from the mempool.
-        for (position, tx) in block.transactions.iter().enumerate() {
+        for (position, tx) in exec_txs.iter().enumerate() {
             let txid = tx.txid();
             self.pending.remove(&txid);
             let addresses = tx_addresses(tx);
@@ -1303,7 +1317,7 @@ impl Node {
         self.emit(NodeEvent::BlockCommitted {
             height: block.header.height,
             block_hash: block.hash(),
-            txids: block.transactions.iter().map(|t| t.txid()).collect(),
+            txids: exec_txs.iter().map(|t| t.txid()).collect(),
         });
 
         // Reject pending transactions whose inputs were spent by this block.
@@ -1751,6 +1765,7 @@ mod recovery_tests {
                 vec![Operation::Rewards(rewards)],
                 node.public(),
                 1,
+                None,
             )
             .unwrap();
         let next = node

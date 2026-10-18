@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum VoteKind {
     Prepare,
     Commit,
+    CoinToss,
 }
 
 #[derive(Serialize)]
@@ -179,4 +180,99 @@ pub fn master_check_quorum(
         }
     }
     count >= threshold
+}
+
+// ---------------------------------------------------------------------------
+// Coin-toss entropy shares
+// ---------------------------------------------------------------------------
+
+/// The data that a `CoinTossShare` commits to when signed.
+#[derive(Serialize)]
+struct CoinTossShareData {
+    height: u64,
+    view: u64,
+    entropy: Hash,
+    voter: PublicKey,
+}
+
+/// A validator's entropy contribution to the coin-toss seed.
+///
+/// Each participating node signs its own randomness share. The shares are
+/// collected, sorted by voter and XOR-combined to form the deterministic
+/// `coin_toss_seed` for the block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoinTossShare {
+    pub height: u64,
+    pub view: u64,
+    pub entropy: Hash,
+    pub voter: PublicKey,
+    pub signature: Sig,
+}
+
+impl CoinTossShare {
+    fn data(&self) -> CoinTossShareData {
+        CoinTossShareData {
+            height: self.height,
+            view: self.view,
+            entropy: self.entropy,
+            voter: self.voter,
+        }
+    }
+
+    /// Signs `entropy` as the node's contribution to the coin-toss seed.
+    pub fn sign(key: &KeyPair, height: u64, view: u64, entropy: Hash) -> Self {
+        let mut share = Self {
+            height,
+            view,
+            entropy,
+            voter: key.public(),
+            signature: Sig([0u8; 64]),
+        };
+        share.signature = key.sign(&encode(&share.data()));
+        share
+    }
+
+    /// Verifies the signature on this entropy share.
+    pub fn is_valid(&self) -> bool {
+        verify(&self.voter, &encode(&self.data()), &self.signature)
+    }
+}
+
+/// Collects entropy shares and aggregates them into a deterministic seed.
+///
+/// Returns `None` if fewer than `quorum` valid shares from distinct nodes
+/// are provided. Otherwise the shares are sorted by voter and XOR-ed together.
+pub fn aggregate_coin_toss_seed(
+    shares: &[CoinTossShare],
+    height: u64,
+    view: u64,
+    gov: &GovernanceSet,
+    params: &ChainParams,
+) -> Option<Hash> {
+    let threshold = quorum(gov.nodes.len(), params.bft_num, params.bft_den);
+    let mut seen = std::collections::BTreeSet::new();
+    // Collect valid shares from distinct, recognized voters.
+    let mut valid: Vec<Hash> = shares
+        .iter()
+        .filter(|s| {
+            s.height == height
+                && s.view == view
+                && gov.contains_node(&s.voter)
+                && s.is_valid()
+                && seen.insert(s.voter)
+        })
+        .map(|s| s.entropy)
+        .collect();
+    if valid.len() < threshold {
+        return None;
+    }
+    // Sort for order-independence, then XOR.
+    valid.sort();
+    let mut acc = [0u8; 64];
+    for v in &valid {
+        for (a, b) in acc.iter_mut().zip(v.as_bytes().iter()) {
+            *a ^= b;
+        }
+    }
+    Some(Hash::from_bytes(acc))
 }
