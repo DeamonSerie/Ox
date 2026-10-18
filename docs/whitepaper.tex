@@ -950,8 +950,16 @@ with a $3{:}1$ proposer bonus); the ohm share stays in the OHM treasury.
     reply message carrying $(\mathsf{msg\_id},\mathrm{success},\mathrm{value})$
     is relayed back.
   \item \textbf{Transfers:} a \texttt{CrossTransferCall} locks value on the
-    source and mints a wrapped asset on the destination; the return leg
-    \texttt{CrossBurnCall} burns wrapped and unlocks the escrow.
+    source and mints a wrapped asset on the destination. The wrapped asset
+    is a fungible, pegged token bound to the gate class (not identity-bound to
+    the original depositor); it may only be spent via wrapped token gate
+    operations on the destination chain. The return leg \texttt{CrossBurnCall}
+    burns wrapped and unlocks the escrow.
+  \item \textbf{Loss recovery:} if a wrapped token is lost or consumed in a
+    recognized loss context, a \texttt{WrappedTokenRecover} operation (approved
+    per the wrapped token gate policy) burns the wrapped token and triggers an
+    automatic cross-chain transfer of the original deposited amount back to the
+    current holder, preserving fungibility.
 \end{itemize}
 A single OHM transaction may carry at most one cross-chain action (send, recv,
 transfer, or burn) and may not combine a cross action with an \ovm{} action.
