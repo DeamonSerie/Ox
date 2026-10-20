@@ -25,6 +25,24 @@ pub struct ChainParams {
     pub rebound_lock_blocks: u64,
     /// Audit checkpoint interval `K`, in blocks.
     pub audit_checkpoint_blocks: u64,
+    /// Number of blocks between verification-credit auction clearings.
+    #[serde(default = "default_auction_interval_blocks")]
+    pub auction_interval_blocks: u64,
+    /// Number of blocks a verification credit survives without being earned or spent.
+    #[serde(default = "default_auction_credit_expiry_blocks")]
+    pub auction_credit_expiry_blocks: u64,
+    /// Smallest accepted verification-credit bid.
+    #[serde(default = "default_auction_min_bid")]
+    pub auction_min_bid: u64,
+    /// Largest accepted verification-credit bid.
+    #[serde(default = "default_auction_max_bid")]
+    pub auction_max_bid: u64,
+    /// Verification credits a server node earns per block-reward share.
+    #[serde(default = "default_verification_credit_per_block")]
+    pub verification_credit_per_block: u64,
+    /// Blocks after an auction clearing in which the winning node may still execute its bundle.
+    #[serde(default = "default_auction_execution_deadline_blocks")]
+    pub auction_execution_deadline_blocks: u64,
     /// Height at which version 2 OVM execution rules become mandatory.
     #[serde(default = "default_ovm_activation_height")]
     pub ovm_activation_height: u64,
@@ -459,6 +477,30 @@ fn default_speedometer_stabilization_bps() -> u32 {
     10
 }
 
+fn default_auction_interval_blocks() -> u64 {
+    4
+}
+
+fn default_auction_credit_expiry_blocks() -> u64 {
+    8
+}
+
+fn default_auction_min_bid() -> u64 {
+    1
+}
+
+fn default_auction_max_bid() -> u64 {
+    1_000
+}
+
+fn default_verification_credit_per_block() -> u64 {
+    1
+}
+
+fn default_auction_execution_deadline_blocks() -> u64 {
+    1
+}
+
 impl ChainParams {
     pub fn execution_version_at(&self, height: u64) -> u32 {
         if height >= self.smart_contract_activation_height {
@@ -479,6 +521,12 @@ impl ChainParams {
             block_window: 100,
             rebound_lock_blocks: 100,
             audit_checkpoint_blocks: 50,
+            auction_interval_blocks: default_auction_interval_blocks(),
+            auction_credit_expiry_blocks: default_auction_credit_expiry_blocks(),
+            auction_min_bid: default_auction_min_bid(),
+            auction_max_bid: default_auction_max_bid(),
+            verification_credit_per_block: default_verification_credit_per_block(),
+            auction_execution_deadline_blocks: default_auction_execution_deadline_blocks(),
             ovm_activation_height: 1,
             smart_contract_activation_height: 1,
             gas_activation_height: 1,

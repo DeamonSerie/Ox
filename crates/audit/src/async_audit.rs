@@ -93,6 +93,7 @@ struct OwnedAuditContext {
     prev_server_block_reward: Option<oxydome_core::Amount>,
     ox_price: oxydome_core::Amount,
     price_last_update_height: u64,
+    auction: oxydome_state::AuctionState,
     gov: GovernanceSet,
     params: ChainParams,
 }
@@ -112,6 +113,7 @@ impl OwnedAuditContext {
             prev_server_block_reward: self.prev_server_block_reward,
             ox_price: self.ox_price,
             price_last_update_height: self.price_last_update_height,
+            auction: &self.auction,
             gov: &self.gov,
             params: &self.params,
         }
@@ -133,6 +135,7 @@ impl From<&HeaderAuditContext<'_>> for OwnedAuditContext {
             prev_server_block_reward: ctx.prev_server_block_reward,
             ox_price: ctx.ox_price,
             price_last_update_height: ctx.price_last_update_height,
+            auction: ctx.auction.clone(),
             gov: ctx.gov.clone(),
             params: ctx.params.clone(),
         }

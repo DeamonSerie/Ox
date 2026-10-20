@@ -6,7 +6,10 @@ pub mod chain;
 pub mod ledger_store;
 pub mod utxo;
 
-pub use chain::{ChainState, StateError};
+pub use chain::{
+    receipt_performed_pool_swap_in, AuctionState, AuctionTargetState, AuctionWin, ChainState,
+    StateError,
+};
 pub use ledger_store::{ledger_diff, LedgerDelta, LedgerError, LedgerStore};
 pub use utxo::{UtxoEntry, UtxoLedger};
 pub use oxydome_core::{

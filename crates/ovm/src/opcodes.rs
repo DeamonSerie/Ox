@@ -734,8 +734,9 @@ pub(crate) fn handle_pool_swap(ctx: &mut ExecutionContext) -> Result<(), VmError
         Some(oracle) => oracle,
         None => return Err(VmError::InvalidProgram),
     };
-    let pool_id = ctx.pop()?;
+    // Pop order (top first): `input_amount`, then `pool_id`.
     let input_amount = ctx.pop()?;
+    let pool_id = ctx.pop()?;
     let state = oracle.pools.get(&pool_id).ok_or(VmError::InvalidProgram)?;
     if state.k == 0 || state.reserve_x == 0 || state.reserve_y == 0 {
         return Err(VmError::ArithmeticOverflow);
@@ -760,5 +761,11 @@ pub(crate) fn handle_pool_swap(ctx: &mut ExecutionContext) -> Result<(), VmError
         return Err(VmError::ArithmeticOverflow);
     }
     let output = y_reserve.saturating_sub(new_y);
+    // Record the swap so that the transaction can be recognised as a swap (the
+    // verification-credit auction only accepts swaps).
+    ctx.logs.push(crate::Log {
+        topic: crate::POOL_SWAP_LOG_TOPIC,
+        value: (output / scale) as u64,
+    });
     ctx.push((output / scale) as u64)
 }

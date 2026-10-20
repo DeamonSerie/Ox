@@ -48,23 +48,26 @@ pub use ohm::{
     OHM_SERVER_FEE_BPS,
 };
 pub use operation::{
+    auction_bundle_id, AuctionBidOperation, AuctionPayoutOperation, AuctionTargetOperation,
     BlockRewardDistribution, DepartureEarningsDistribution, DepartureType, MasterApproval,
-    NodeApproval, NodeKind, NodeLeaveRequest, Operation, RewardDistribution, TokenAmount,
-    TreasuryBurn, TreasuryMint, WithdrawRequest,
+    NodeApproval, NodeKind, NodeLeaveRequest, Operation, RewardDistribution, SwapIntent,
+    TokenAmount, TreasuryBurn, TreasuryMint, WithdrawRequest,
 };
 pub use operation::{FileAccessOperation, FileDeleteOperation, FileStoreOperation, LiquidityPoolAction, LiquidityPoolOperation};
 pub use operation::{StorageAuditOperation, StorageLabelOperation};
 pub use oxydome_crypto::evk::{FileEvkLabel, FileKeyChain};
 pub use oxydome_crypto::{Hash, PublicKey, Sig};
 pub use params::ChainParams;
+/// The OVM log topic emitted by a liquidity-pool swap.
+pub use oxydome_ovm::POOL_SWAP_LOG_TOPIC;
 pub use pricing::{
     compute_gas_price, compute_gas_price_premium, compute_price_bounds,
     default_liquidity_pool_activation_height, default_liquidity_pool_fee_bps,
     default_max_liquidity_pools, default_pegged_currency_activation_height,
-    default_pegged_spread_bps, default_pegged_window_blocks, is_in_upper_half, pack_pool_state,
-    pegged_convert, pool_swap, scale_to_u64, LiquidityPoolConfig, LiquidityPoolState,
-    PeggedCurrencyConfig, PeggedCurrencyState, PoolKParams, PoolStatePacked, PriceAsset,
-    PriceBounds, PriceSample, LIQUIDITY_POOL_SCALE,
+    default_pegged_spread_bps, default_pegged_window_blocks, is_in_upper_half,
+    liquidity_pool_id, pack_pool_state, pegged_convert, pool_swap, scale_to_u64,
+    LiquidityPoolConfig, LiquidityPoolState, PeggedCurrencyConfig, PeggedCurrencyState,
+    PoolKParams, PoolStatePacked, PriceAsset, PriceBounds, PriceSample, LIQUIDITY_POOL_SCALE,
 };
 pub use speedometer::{SpeedometerAccount, SpeedometerAction, SpeedometerOperation};
 pub use storage::{

@@ -310,6 +310,25 @@ enum SignableOperation {
         nonce: u64,
         action: LiquidityPoolAction,
     },
+    AuctionBid {
+        bidder: PublicKey,
+        target: Hash,
+        amount: u64,
+        nonce: u64,
+    },
+    AuctionTarget {
+        target: Hash,
+        swaps: Vec<Hash>,
+        intent: SwapIntent,
+        registrar: PublicKey,
+        nonce: u64,
+    },
+    AuctionPayout {
+        target: Hash,
+        txid: Hash,
+        winner: PublicKey,
+        amount: Amount,
+    },
     ExpressBusDeposit {
         bus_id: Hash,
         asset: PriceAsset,
@@ -395,6 +414,8 @@ pub enum LiquidityPoolAction {
     RemoveLiquidity { amounts: std::collections::BTreeMap<PriceAsset, Amount> },
     /// Swap one asset for another through the pool.
     Swap {
+        /// The pool's currency set, used to derive the pool identifier.
+        currencies: Vec<PriceAsset>,
         input_asset: PriceAsset,
         input_amount: Amount,
         min_output: Amount,
@@ -412,6 +433,91 @@ pub struct LiquidityPoolOperation {
     pub nonce: u64,
     /// Signature over the signing payload.
     pub signature: Sig,
+}
+
+/// The public summary of a swap that a user submitted for the verification-credit auction.
+///
+/// The summary is public on-chain while the swap transaction itself stays in the nodes'
+/// private auction pool until the auction clears, so a sandwicher learns the shape of the
+/// trade but cannot get in front of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapIntent {
+    /// The liquidity pool the swap routes through.
+    pub pool_id: Hash,
+    /// The asset being sold into the pool.
+    pub input_asset: PriceAsset,
+    /// The amount being sold into the pool.
+    pub input_amount: Amount,
+    /// The minimum output the submitter is willing to accept (slippage bound).
+    pub min_output: Amount,
+}
+
+/// Computes the deterministic bundle identifier for a set of swap transaction ids.
+///
+/// The ids are sorted, so the identifier does not depend on the order in which the
+/// swaps were listed. A bundle of one transaction is a single (large) swap.
+pub fn auction_bundle_id(swaps: &[Hash]) -> Hash {
+    let mut sorted = swaps.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    hash_value(&("oxydome-auction-bundle-v1", &sorted))
+}
+
+/// A user registration of a bundle of swap transactions for the verification-credit auction.
+///
+/// The registration is signed by the submitter and committed on-chain; the swap
+/// transactions themselves are withheld from the public mempool until the auction clears.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuctionTargetOperation {
+    /// The bundle identifier (`auction_bundle_id` over `swaps`).
+    pub target: Hash,
+    /// The swap transaction ids in the bundle. A single-element bundle is one big swap.
+    pub swaps: Vec<Hash>,
+    /// The public summary of the swap.
+    pub intent: SwapIntent,
+    /// The submitter registering the bundle.
+    pub registrar: PublicKey,
+    /// Replay-prevention nonce.
+    pub nonce: u64,
+    /// Signature over the proposal id.
+    pub signature: Sig,
+}
+
+/// A server node's bid in the verification-credit auction.
+///
+/// `amount` is denominated in (non-financial) verification credits, which are
+/// escrowed when the bid is applied. The winner of the auction for `target`
+/// receives the right to execute that bundle in the next block and
+/// collects 100% of its fees.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuctionBidOperation {
+    /// The bidding server node.
+    pub bidder: PublicKey,
+    /// The bundle identifier being bid on.
+    pub target: Hash,
+    /// Number of verification credits bid.
+    pub amount: u64,
+    /// Replay-prevention nonce.
+    pub nonce: u64,
+    /// Signature over the proposal id.
+    pub signature: Sig,
+}
+
+/// The payout of an auctioned transaction's fee to the node that won the auction.
+///
+/// The block producer includes one payout per executed auctioned transaction. The state
+/// machine matches it against the auction outcome it derived itself, so a producer cannot
+/// redirect the fee, and masters can verify the routing from the block body alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuctionPayoutOperation {
+    /// The bundle that was won at auction.
+    pub target: Hash,
+    /// The executed transaction.
+    pub txid: Hash,
+    /// The server node that won the bundle.
+    pub winner: PublicKey,
+    /// The fee paid to the winner (the full fee of the transaction).
+    pub amount: Amount,
 }
 
 /// A block operation.
@@ -434,6 +540,13 @@ pub enum Operation {
     FileAccess(FileAccessOperation),
     FileDelete(FileDeleteOperation),
     LiquidityPool(LiquidityPoolOperation),
+    /// A server-node bid in the verification-credit auction for the right to execute
+    /// a (potentially sandwich-prone) transaction and receive 100% of its fees.
+    AuctionBid(AuctionBidOperation),
+    /// A user registration of a swap bundle for the verification-credit auction.
+    AuctionTarget(AuctionTargetOperation),
+    /// The payout of an auctioned transaction's fee to the node that won the auction.
+    AuctionPayout(AuctionPayoutOperation),
     /// A master-approved deposit into an Express Bus route (tags UTXOs as BusReceipt).
     ExpressBusDeposit(ExpressBusDeposit),
     /// A node-approved, owner-signed withdrawal from an Express Bus route
@@ -542,6 +655,25 @@ impl Operation {
                 nonce: op.nonce,
                 action: op.action.clone(),
             },
+            Operation::AuctionBid(op) => SignableOperation::AuctionBid {
+                bidder: op.bidder,
+                target: op.target,
+                amount: op.amount,
+                nonce: op.nonce,
+            },
+            Operation::AuctionTarget(op) => SignableOperation::AuctionTarget {
+                target: op.target,
+                swaps: op.swaps.clone(),
+                intent: op.intent.clone(),
+                registrar: op.registrar,
+                nonce: op.nonce,
+            },
+            Operation::AuctionPayout(op) => SignableOperation::AuctionPayout {
+                target: op.target,
+                txid: op.txid,
+                winner: op.winner,
+                amount: op.amount,
+            },
             Operation::ExpressBusDeposit(op) => SignableOperation::ExpressBusDeposit {
                 bus_id: op.bus_id,
                 asset: op.asset,
@@ -624,6 +756,9 @@ impl Operation {
                 | Operation::DepartureEarnings(_)
                 | Operation::ExpressBusDeposit(_)
                 | Operation::ExpressBusWithdraw(_)
+                | Operation::AuctionBid(_)
+                | Operation::AuctionTarget(_)
+                | Operation::AuctionPayout(_)
         )
     }
 

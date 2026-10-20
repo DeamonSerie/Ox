@@ -180,6 +180,41 @@ pub enum Message {
         accepted: bool,
         error: Option<String>,
     },
+    // -- verification-credit auction --
+    /// A bundle of swap transactions offered for the verification-credit auction.
+    ///
+    /// The swaps travel out of band: they are kept in the receiving node's private
+    /// auction pool and are not gossiped through the public mempool, so the trade cannot
+    /// be sandwiched.
+    AuctionTarget {
+        target: Hash,
+        swaps: Vec<Hash>,
+        intent: oxydome_core::SwapIntent,
+        registrar: PublicKey,
+        transactions: Vec<Box<Transaction>>,
+    },
+    AuctionTargetResponse {
+        target: Hash,
+        accepted: bool,
+        error: Option<String>,
+    },
+    /// A server node's bid in the verification-credit auction.
+    AuctionBid {
+        bid: Box<oxydome_core::AuctionBidOperation>,
+    },
+    AuctionBidResponse {
+        target: Hash,
+        accepted: bool,
+        error: Option<String>,
+    },
+    /// The verification-credit balance of a node.
+    GetVerificationCredits {
+        node: PublicKey,
+    },
+    VerificationCreditsResponse {
+        node: PublicKey,
+        credits: u64,
+    },
     GetDao {
         dao_id: Hash,
     },

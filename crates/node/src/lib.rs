@@ -112,6 +112,15 @@ pub struct Node {
     labeler: Labeler,
     /// Coin-toss seed received from the consensus phase; `None` for legacy blocks.
     pub coin_toss_seed: Option<Hash>,
+    /// The node's private auction pool: the swap transactions that were offered for the
+    /// verification-credit auction, keyed by bundle id.
+    ///
+    /// These transactions are deliberately **not** part of the public mempool: a swap that
+    /// sits in the open mempool can be sandwiched. They are only revealed when the auction
+    /// clears and the winning node executes the bundle.
+    pub auction_pool: BTreeMap<Hash, Vec<Transaction>>,
+    /// The bundles this node has registered for auction, keyed by bundle id.
+    pub auction_targets: BTreeMap<Hash, Operation>,
 }
 
 impl Node {
@@ -151,6 +160,8 @@ impl Node {
             mempool_inputs: BTreeSet::new(),
             events: broadcast::channel(2048).0,
             coin_toss_seed: None,
+            auction_pool: BTreeMap::new(),
+            auction_targets: BTreeMap::new(),
             labeler: Labeler::new(LabelerConfig {
                 node_keypair: key.clone(),
                 node_public: key.public(),
@@ -829,11 +840,191 @@ impl Node {
         Ok(())
     }
 
+    /// The verification-credit balance of this node.
+    ///
+    /// Verification credits are a non-financial unit earned by taking part in block
+    /// verification. They are spent in the verification-credit auction.
+    pub fn verification_credits(&self) -> u64 {
+        self.state.verification_credit_balance(&self.public())
+    }
+
+    /// The verification-credit balances of every server node, keyed by node public key.
+    pub fn verification_credit_balances(&self) -> BTreeMap<PublicKey, u64> {
+        self.state.auction.credits.clone()
+    }
+
+    /// Offers a bundle of swap transactions for the verification-credit auction.
+    ///
+    /// The swaps are kept in the node's private auction pool instead of the public mempool,
+    /// so the trade is not visible to sandwichers. The bundle is registered on-chain by a
+    /// signed [`oxydome_core::AuctionTargetOperation`], which commits to the bundle id and
+    /// the public swap summary but not to the transactions themselves.
+    ///
+    /// Returns the bundle id.
+    pub fn submit_auction_target(
+        &mut self,
+        swaps: Vec<Transaction>,
+        intent: oxydome_core::SwapIntent,
+    ) -> Result<Hash, NodeError> {
+        if swaps.is_empty() {
+            return Err(NodeError::Operation(
+                "an auction bundle must contain at least one swap".into(),
+            ));
+        }
+        let mut txids = Vec::with_capacity(swaps.len());
+        for tx in &swaps {
+            tx.validate_structure()
+                .map_err(|e| NodeError::Tx(e.to_string()))?;
+            let txid = tx.txid();
+            if self.mempool.iter().any(|pending| pending.txid() == txid) {
+                return Err(NodeError::Tx(
+                    "the swap is already in the public mempool".into(),
+                ));
+            }
+            txids.push(txid);
+        }
+        let target = oxydome_core::auction_bundle_id(&txids);
+        if self.state.auction.targets.contains_key(&target) {
+            return Err(NodeError::Operation(
+                "the bundle is already registered for auction".into(),
+            ));
+        }
+        let mut operation = oxydome_core::AuctionTargetOperation {
+            target,
+            swaps: txids,
+            intent,
+            registrar: self.public(),
+            nonce: self.state.height,
+            signature: oxydome_crypto::Sig([0u8; 64]),
+        };
+        // The registration is signed by the node that submits it.
+        let proposal_id = Operation::AuctionTarget(operation.clone()).proposal_id();
+        operation.signature = self.key.sign(&proposal_id.0);
+        let op = Operation::AuctionTarget(operation);
+        self.submit_operation(op.clone())?;
+        self.auction_pool.insert(target, swaps);
+        self.auction_targets.insert(target, op);
+        Ok(target)
+    }
+
+    /// Places a bid for the right to execute an auctioned swap bundle.
+    ///
+    /// The bid is denominated in verification credits, which are escrowed when the bid is
+    /// applied and burned if the bid wins. Losing bids are refunded when the auction
+    /// clears.
+    pub fn submit_auction_bid(&mut self, target: Hash, amount: u64) -> Result<(), NodeError> {
+        if !self.state.auction.targets.contains_key(&target) {
+            return Err(NodeError::Operation(
+                "the auction target is not registered".into(),
+            ));
+        }
+        if amount < self.params.auction_min_bid || amount > self.params.auction_max_bid {
+            return Err(NodeError::Operation(format!(
+                "the bid must be between {} and {} credits",
+                self.params.auction_min_bid, self.params.auction_max_bid
+            )));
+        }
+        if self.verification_credits() < amount {
+            return Err(NodeError::Operation(
+                "not enough verification credits for this bid".into(),
+            ));
+        }
+        let mut bid = oxydome_core::AuctionBidOperation {
+            bidder: self.public(),
+            target,
+            amount,
+            nonce: self.state.height,
+            signature: oxydome_crypto::Sig([0u8; 64]),
+        };
+        let proposal_id = Operation::AuctionBid(bid.clone()).proposal_id();
+        bid.signature = self.key.sign(&proposal_id.0);
+        self.submit_operation(Operation::AuctionBid(bid))
+    }
+
+    /// The swap bundles this node won at auction and may still execute.
+    pub fn won_auction_bundles(&self) -> Vec<(Hash, PublicKey, Vec<Transaction>)> {
+        let mut bundles = Vec::new();
+        for (target, win) in &self.state.auction.winners {
+            if win.winner != self.public() {
+                continue;
+            }
+            let Some(swaps) = self.auction_pool.get(target) else {
+                continue;
+            };
+            let pending: Vec<Transaction> = swaps
+                .iter()
+                .filter(|tx| win.swaps.contains(&tx.txid()))
+                .cloned()
+                .collect();
+            if !pending.is_empty() {
+                bundles.push((*target, win.winner, pending));
+            }
+        }
+        bundles
+    }
+
+    /// Accepts an auction bundle that was pushed to this node by a peer.
+    ///
+    /// The swap transactions are kept in the node's private auction pool; the registration
+    /// is queued as an operation so that it is committed on-chain.
+    pub fn accept_auction_target(
+        &mut self,
+        target: Hash,
+        swaps: Vec<Transaction>,
+        intent: oxydome_core::SwapIntent,
+        registrar: PublicKey,
+    ) -> Result<(), NodeError> {
+        if swaps.is_empty() {
+            return Err(NodeError::Operation(
+                "an auction bundle must contain at least one swap".into(),
+            ));
+        }
+        let txids: Vec<Hash> = swaps.iter().map(|tx| tx.txid()).collect();
+        if oxydome_core::auction_bundle_id(&txids) != target {
+            return Err(NodeError::Operation(
+                "the bundle id does not match the swap transactions".into(),
+            ));
+        }
+        let mut operation = oxydome_core::AuctionTargetOperation {
+            target,
+            swaps: txids,
+            intent,
+            registrar,
+            nonce: self.state.height,
+            signature: oxydome_crypto::Sig([0u8; 64]),
+        };
+        let proposal_id = Operation::AuctionTarget(operation.clone()).proposal_id();
+        operation.signature = self.key.sign(&proposal_id.0);
+        let op = Operation::AuctionTarget(operation);
+        self.submit_operation(op.clone())?;
+        self.auction_pool.insert(target, swaps);
+        self.auction_targets.insert(target, op);
+        Ok(())
+    }
+
+    /// Accepts an auction bid that was pushed to this node by a peer.
+    pub fn accept_auction_bid(&mut self, bid: oxydome_core::AuctionBidOperation) -> Result<(), NodeError> {
+        let proposal_id = Operation::AuctionBid(bid.clone()).proposal_id();
+        if !oxydome_crypto::verify(&bid.bidder, &proposal_id.0, &bid.signature) {
+            return Err(NodeError::Operation(
+                "the auction bid signature is invalid".into(),
+            ));
+        }
+        self.submit_operation(Operation::AuctionBid(bid))
+    }
+
     /// Queues a governance operation for the next block this node produces.
     pub fn submit_operation(&mut self, op: Operation) -> Result<(), NodeError> {
         if !op.is_governance() {
             return Err(NodeError::Operation(
                 "only governance operations can be submitted".into(),
+            ));
+        }
+        if matches!(op, Operation::AuctionPayout(_)) {
+            // The payout of an auctioned transaction is derived by the producer from the
+            // auction outcome; it must never be supplied by a peer.
+            return Err(NodeError::Operation(
+                "auction payouts are derived by the block producer".into(),
             ));
         }
         if let Operation::Dao(dao_operation) = &op {
@@ -1074,9 +1265,19 @@ impl Node {
         if !self.is_leader(height) {
             return Err(NodeError::NotLeader);
         }
-        let transactions: Vec<Transaction> = self.mempool.clone();
-        let total_fees = self.state.settled_fee_total(&transactions, &self.params)?;
+        let mut transactions: Vec<Transaction> = self.mempool.clone();
+        // Verification-credit auction: a bundle that was won at the last clearing is
+        // executed in this very block. The winner collects 100% of the transaction's fees,
+        // so those fees are kept out of the normal master/server split.
+        let (auction_transactions, auction_payouts, auction_fees) =
+            self.prepare_auction_execution(height, &mut transactions);
+        let _ = &auction_transactions;
+        let total_fees = self
+            .state
+            .settled_fee_total(&transactions, &self.params)?
+            .saturating_sub(auction_fees);
         let mut operations = self.pending_ops.clone();
+        operations.extend(auction_payouts);
         if total_fees > 0 {
             operations.push(self.reward_operation(total_fees, &self.public()));
         }
@@ -1132,8 +1333,17 @@ impl Node {
         .await;
         let valid_txs = mempool_block;
 
-        let total_fees = self.state.settled_fee_total(&valid_txs, &self.params)?;
+        // Verification-credit auction: a bundle that was won at the last clearing is
+        // executed in this very block.
+        let mut transactions = valid_txs;
+        let (auction_transactions, auction_payouts, auction_fees) =
+            self.prepare_auction_execution(height, &mut transactions);
+        let total_fees = self
+            .state
+            .settled_fee_total(&transactions, &self.params)?
+            .saturating_sub(auction_fees);
         let mut operations = self.pending_ops.clone();
+        operations.extend(auction_payouts);
         if total_fees > 0 {
             operations.push(self.reward_operation(total_fees, &self.public()));
         }
@@ -1163,10 +1373,97 @@ impl Node {
         let producer = self.public();
         let coin_toss_seed = self.coin_toss_seed;
         smol::unblock(move || {
-            state.build_block(&gov, &params, valid_txs, operations, producer, timestamp, coin_toss_seed)
+            state.build_block(
+                &gov,
+                &params,
+                transactions,
+                operations,
+                producer,
+                timestamp,
+                coin_toss_seed,
+            )
         })
         .await
         .map_err(NodeError::from)
+    }
+
+    /// Prepares the execution of the bundles that were won at the last auction clearing.
+    ///
+    /// Returns the transactions to append to the block, the matching `AuctionPayout`
+    /// operations and the total fees that are paid out through the auction instead of the
+    /// normal master/server split. A swap that no longer validates against the current
+    /// state is skipped: the auction right simply lapses.
+    fn prepare_auction_execution(
+        &self,
+        height: u64,
+        transactions: &mut Vec<Transaction>,
+    ) -> (Vec<Transaction>, Vec<Operation>, Amount) {
+        let mut included = Vec::new();
+        let mut payouts = Vec::new();
+        let mut fees: Amount = 0;
+        for (target, win) in &self.state.auction.winners {
+            if win.deadline < height {
+                // The execution window closed: the right lapses.
+                continue;
+            }
+            let Some(swaps) = self.auction_pool.get(target) else {
+                continue;
+            };
+            for tx in swaps.iter().filter(|tx| win.swaps.contains(&tx.txid())) {
+                if transactions.iter().any(|other| other.txid() == tx.txid()) {
+                    continue;
+                }
+                if !self.auction_swap_is_valid(tx) {
+                    continue;
+                }
+                if !self.state.preview_is_pool_swap(tx, 0, &self.params) {
+                    // Only swaps can be auctioned.
+                    continue;
+                }
+                let txid = tx.txid();
+                included.push(tx.clone());
+                payouts.push(Operation::AuctionPayout(
+                    oxydome_core::AuctionPayoutOperation {
+                        target: *target,
+                        txid,
+                        winner: win.winner,
+                        amount: tx.fee,
+                    },
+                ));
+                fees = fees.saturating_add(tx.fee);
+            }
+        }
+        transactions.extend(included.iter().cloned());
+        (included, payouts, fees)
+    }
+
+    /// Checks that an auctioned swap still validates against the current state.
+    fn auction_swap_is_valid(&self, tx: &Transaction) -> bool {
+        if tx.validate_structure().is_err() {
+            return false;
+        }
+        let mut input_total: Amount = 0;
+        for input in &tx.inputs {
+            let Some(entry) = self.state.utxo.get(&input.prev_out) else {
+                return false;
+            };
+            if !entry.output.kind.is_spendable() || entry.output.recipient != input.owner {
+                return false;
+            }
+            if !rebound_utxo_spendable(
+                self.next_height(),
+                entry.created_height,
+                entry.output.rebound_gen,
+                &self.params,
+            ) {
+                return false;
+            }
+            input_total = input_total.saturating_add(entry.output.amount);
+        }
+        let Ok(output_total) = tx.output_total() else {
+            return false;
+        };
+        input_total == output_total.saturating_add(tx.fee)
     }
 
     /// Builds the audit package (with Merkle proofs) for a proposed block.
@@ -1364,6 +1661,23 @@ impl Node {
             .collect();
         let applied_ops: BTreeSet<Hash> = block.operations.iter().map(|o| o.id()).collect();
         self.pending_ops.retain(|o| !applied_ops.contains(&o.id()));
+
+        // The verification-credit auction: a bundle that was executed is now public, so
+        // the private swap transactions are dropped from the auction pool.
+        let executed_bundles: BTreeSet<Hash> = block
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                Operation::AuctionPayout(payout) => Some(payout.target),
+                _ => None,
+            })
+            .collect();
+        if !executed_bundles.is_empty() {
+            self.auction_pool
+                .retain(|target, _| !executed_bundles.contains(target));
+            self.auction_targets
+                .retain(|target, _| !executed_bundles.contains(target));
+        }
 
         self.state = next;
         self.ohm_ledgers = next_ohm_ledgers;

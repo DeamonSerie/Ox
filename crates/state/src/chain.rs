@@ -5,7 +5,7 @@ use crate::utxo::{UtxoEntry, UtxoLedger};
 use oxydome_core::{
     accumulated_track, actual_direction, bus_flow_delta,
     conversion_split_with_bps, is_ox_asset, ordered_transactions, pool_swap, reward_for_bet,
-    timer_burn_outpoint, Amount, Block, BlockRewardDistribution,
+    timer_burn_outpoint, Amount, AuctionBidOperation, Block, BlockRewardDistribution,
     ChainParams, DaoOperation, DaoState, DaoWindowStats, ExpressBusDeposit, ExpressBusTracker,
     ExpressBusWithdraw, FileAccessOperation, FileAccessRecord, FileDeleteOperation,
     FileEvkLabel, FileStoreOperation, GasAccount, GasAction, GasOperation, GovernanceSet,
@@ -31,6 +31,7 @@ use oxydome_speedometer::{
     airdrop_amount as speedometer_airdrop_amount,
     distribute_airdrop as speedometer_distribute_airdrop, stabilization_mint,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -54,6 +55,22 @@ pub enum StateError {
     BadRoots,
     #[error("producer {0:?} is not an authorized node")]
     UnauthorizedProducer(PublicKey),
+    #[error("insufficient verification credits")]
+    InsufficientCredits,
+    #[error("auction target {0:?} is not registered")]
+    AuctionTargetUnknown(Hash),
+    #[error("auction target {0:?} is closed")]
+    AuctionTargetClosed(Hash),
+    #[error("auction bid {0} is outside the permitted range")]
+    AuctionBidOutOfRange(u64),
+    #[error("auction target is invalid: {0}")]
+    AuctionTargetInvalid(String),
+    #[error("auction payout for transaction {0:?} does not match the auction outcome")]
+    AuctionPayoutUnknown(Hash),
+    #[error("auction payout for transaction {0:?} does not match the auction outcome")]
+    AuctionPayoutMismatch(Hash),
+    #[error("auction payout for transaction {0:?} is missing")]
+    AuctionPayoutMissing(Hash),
     #[error("transaction {0} invalid: {1}")]
     BadTransaction(usize, String),
     #[error("input {0:?} does not exist")]
@@ -309,6 +326,312 @@ pub struct ChainState {
     pub departures: Vec<DepartureEarningsDistribution>,
     /// Active Express Bus trackers, keyed by bus_id.
     pub express_buses: BTreeMap<Hash, ExpressBusTracker>,
+    /// The verification-credit auction: credit balances, registered swap bundles,
+    /// pending bids and the outstanding auction wins.
+    pub auction: AuctionState,
+}
+
+/// The verification-credit auction state.
+///
+/// Verification credits are a **non-financial** unit: they are not a token, they are never
+/// part of the Ox supply and they cannot be transferred between nodes. Server nodes earn
+/// them by taking part in block verification and spend them to bid for the right to
+/// execute a swap bundle. Unspent credits expire so that the auction stays open to new
+/// entrants.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuctionState {
+    /// Verification credits earned by server nodes, keyed by node public key.
+    pub credits: BTreeMap<PublicKey, u64>,
+    /// The last block height at which each node earned or spent credits.
+    pub credit_last_activity: BTreeMap<PublicKey, u64>,
+    /// Bids awaiting the next clearing.
+    pub pending_bids: Vec<AuctionBidOperation>,
+    /// Registered auction targets (swap bundles), keyed by bundle id.
+    pub targets: BTreeMap<Hash, AuctionTargetState>,
+    /// Outstanding auction wins: bundle id -> winner and execution window.
+    pub winners: BTreeMap<Hash, AuctionWin>,
+}
+
+/// A registered auction target: a bundle of swap transactions offered for auction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuctionTargetState {
+    /// The swap transaction ids in the bundle.
+    pub swaps: Vec<Hash>,
+    /// The public summary of the swap.
+    pub intent: oxydome_core::SwapIntent,
+    /// The submitter that registered the bundle.
+    pub registrar: PublicKey,
+    /// The height at which the bundle was registered.
+    pub registered_height: u64,
+    /// Whether the bundle has already been executed by its winner.
+    pub executed: bool,
+}
+
+/// The outcome of an auction clearing for one bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuctionWin {
+    /// The server node that won the auction.
+    pub winner: PublicKey,
+    /// The swap transaction ids the winner may execute.
+    pub swaps: Vec<Hash>,
+    /// The last height at which the winner may still execute the bundle.
+    pub deadline: u64,
+    /// The height at which the auction cleared.
+    pub cleared_height: u64,
+}
+
+impl AuctionState {
+    /// The verification-credit balance of a node.
+    pub fn credit_balance(&self, node: &PublicKey) -> u64 {
+        self.credits.get(node).copied().unwrap_or(0)
+    }
+
+    /// Credits a server node for taking part in block verification.
+    pub fn earn(&mut self, node: &PublicKey, amount: u64, height: u64) {
+        if amount == 0 {
+            return;
+        }
+        let balance = self.credits.entry(*node).or_insert(0);
+        *balance = balance.saturating_add(amount);
+        self.credit_last_activity.insert(*node, height);
+    }
+
+    /// Returns escrowed credits to a bidder.
+    pub fn refund(&mut self, bidder: &PublicKey, amount: u64, height: u64) {
+        if amount == 0 {
+            return;
+        }
+        let balance = self.credits.entry(*bidder).or_insert(0);
+        *balance = balance.saturating_add(amount);
+        self.credit_last_activity.insert(*bidder, height);
+    }
+
+    /// Expires credits that have not been earned or spent recently.
+    pub fn expire_credits(&mut self, height: u64, params: &ChainParams) {
+        let cutoff = height.saturating_sub(params.auction_credit_expiry_blocks);
+        let expired: Vec<PublicKey> = self
+            .credit_last_activity
+            .iter()
+            .filter(|(_, h)| **h <= cutoff)
+            .map(|(k, _)| *k)
+            .collect();
+        for node in expired {
+            self.credits.remove(&node);
+            self.credit_last_activity.remove(&node);
+        }
+    }
+
+    /// Drops auction wins whose execution window has closed.
+    pub fn expire_wins(&mut self, height: u64) {
+        self.winners.retain(|_, win| win.deadline >= height);
+    }
+
+    /// Registers a swap bundle for auction.
+    pub fn register_target(
+        &mut self,
+        target_op: &oxydome_core::AuctionTargetOperation,
+        op: &Operation,
+        height: u64,
+    ) -> Result<(), StateError> {
+        // The registrar signs the proposal id.
+        if !oxydome_crypto::verify(
+            &target_op.registrar,
+            &op.proposal_id().0,
+            &target_op.signature,
+        ) {
+            return Err(StateError::AuctionTargetInvalid(
+                "registration signature is invalid".into(),
+            ));
+        }
+        // The bundle must be non-empty and free of duplicates.
+        if target_op.swaps.is_empty() {
+            return Err(StateError::AuctionTargetInvalid(
+                "bundle must contain at least one swap".into(),
+            ));
+        }
+        let mut unique = target_op.swaps.clone();
+        unique.sort();
+        unique.dedup();
+        if unique.len() != target_op.swaps.len() {
+            return Err(StateError::AuctionTargetInvalid(
+                "bundle contains duplicate swaps".into(),
+            ));
+        }
+        // The bundle id must match the swaps it claims to contain.
+        if oxydome_core::auction_bundle_id(&target_op.swaps) != target_op.target {
+            return Err(StateError::AuctionTargetInvalid(
+                "bundle id does not match the swap list".into(),
+            ));
+        }
+        // The summary must describe a real swap.
+        if target_op.intent.input_amount == 0 || target_op.intent.min_output == 0 {
+            return Err(StateError::AuctionTargetInvalid(
+                "swap intent must declare a non-zero amount and minimum output".into(),
+            ));
+        }
+        // A bundle may only be registered once.
+        if self.targets.contains_key(&target_op.target) {
+            return Err(StateError::AuctionTargetClosed(target_op.target));
+        }
+        // A swap may only belong to one bundle.
+        for swap in &target_op.swaps {
+            for (other_id, other) in &self.targets {
+                if other.swaps.contains(swap) {
+                    return Err(StateError::AuctionTargetInvalid(format!(
+                        "swap {swap:?} is already registered in bundle {other_id:?}"
+                    )));
+                }
+            }
+        }
+        self.targets.insert(
+            target_op.target,
+            AuctionTargetState {
+                swaps: target_op.swaps.clone(),
+                intent: target_op.intent.clone(),
+                registrar: target_op.registrar,
+                registered_height: height,
+                executed: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Escrows a bid and remembers it for the next clearing.
+    pub fn escrow_bid(
+        &mut self,
+        bid: &AuctionBidOperation,
+        op: &Operation,
+        height: u64,
+        params: &ChainParams,
+    ) -> Result<(), StateError> {
+        // Verify the node's signature over the proposal id.
+        if !oxydome_crypto::verify(&bid.bidder, &op.proposal_id().0, &bid.signature) {
+            return Err(StateError::BadWithdrawSignature);
+        }
+        // The bid must name a registered, still-open auction target.
+        let target = self
+            .targets
+            .get(&bid.target)
+            .ok_or(StateError::AuctionTargetUnknown(bid.target))?;
+        if target.executed {
+            return Err(StateError::AuctionTargetClosed(bid.target));
+        }
+        // The bid must be within the configured bounds.
+        if bid.amount < params.auction_min_bid || bid.amount > params.auction_max_bid {
+            return Err(StateError::AuctionBidOutOfRange(bid.amount));
+        }
+        // The bidder must have enough credits to cover the bid.
+        let balance = self.credits.get(&bid.bidder).copied().unwrap_or(0);
+        if bid.amount > balance {
+            return Err(StateError::InsufficientCredits);
+        }
+        // Escrow the bid.
+        if let Some(balance) = self.credits.get_mut(&bid.bidder) {
+            *balance = balance.saturating_sub(bid.amount);
+        }
+        self.credit_last_activity.insert(bid.bidder, height);
+        self.pending_bids.push(bid.clone());
+        Ok(())
+    }
+
+    /// Settles the pending bids.
+    ///
+    /// The highest bid on a bundle wins the right to execute it in the very next block and
+    /// to collect 100% of its fees. Every other bid is refunded; the winner's credits stay
+    /// burned, they are the price of the right.
+    pub fn clear(&mut self, height: u64, params: &ChainParams) {
+        let interval = params.auction_interval_blocks.max(1);
+        if height % interval != 0 {
+            return;
+        }
+        let mut by_target: BTreeMap<Hash, Vec<AuctionBidOperation>> = BTreeMap::new();
+        for bid in self.pending_bids.drain(..) {
+            by_target.entry(bid.target).or_default().push(bid);
+        }
+        for (target, mut bids) in by_target {
+            // Bids on bundles that are unknown or already executed are refunded in full.
+            let open = self
+                .targets
+                .get(&target)
+                .map(|target| !target.executed)
+                .unwrap_or(false);
+            if !open {
+                for bid in &bids {
+                    self.refund(&bid.bidder, bid.amount, height);
+                }
+                continue;
+            }
+            // The highest bid wins; ties are broken by the lowest bidder key so every node
+            // derives the same outcome.
+            bids.sort_by(|a, b| {
+                b.amount
+                    .cmp(&a.amount)
+                    .then_with(|| a.bidder.cmp(&b.bidder))
+            });
+            let Some(winner_bid) = bids.first().cloned() else {
+                continue;
+            };
+            for loser in bids.iter().skip(1) {
+                self.refund(&loser.bidder, loser.amount, height);
+            }
+            self.credit_last_activity.insert(winner_bid.bidder, height);
+            let swaps = self
+                .targets
+                .get(&target)
+                .map(|target| target.swaps.clone())
+                .unwrap_or_default();
+            let deadline = height.saturating_add(params.auction_execution_deadline_blocks.max(1));
+            self.winners.insert(
+                target,
+                AuctionWin {
+                    winner: winner_bid.bidder,
+                    swaps,
+                    deadline,
+                    cleared_height: height,
+                },
+            );
+        }
+    }
+
+    /// Claims the auction award for `txid`, if the transaction belongs to a bundle that was
+    /// won at auction and is still inside its execution window.
+    ///
+    /// Returns the winning node. The claim is consumed: every transaction of a bundle can
+    /// only be executed once.
+    pub fn take_award(
+        &mut self,
+        txid: &Hash,
+        height: u64,
+        gov: &GovernanceSet,
+    ) -> Option<(Hash, PublicKey)> {
+        let target = self
+            .winners
+            .iter()
+            .find(|(_, win)| win.swaps.contains(txid))
+            .map(|(target, _)| *target)?;
+        let win = self.winners.get_mut(&target)?;
+        if win.deadline < height {
+            // The execution window closed: the right lapses and the bundle becomes
+            // available for the next auction.
+            self.winners.remove(&target);
+            return None;
+        }
+        if !gov.contains_node(&win.winner) {
+            // The winner is no longer an active server node; the fee falls back to the
+            // normal split and the right lapses.
+            self.winners.remove(&target);
+            return None;
+        }
+        win.swaps.retain(|swap| swap != txid);
+        let winner = win.winner;
+        if win.swaps.is_empty() {
+            self.winners.remove(&target);
+            if let Some(entry) = self.targets.get_mut(&target) {
+                entry.executed = true;
+            }
+        }
+        Some((target, winner))
+    }
 }
 
 impl ChainState {
@@ -406,6 +729,7 @@ impl ChainState {
             block_gas_price: 0,
             departures: Vec::new(),
             express_buses: BTreeMap::new(),
+            auction: AuctionState::default(),
         };
         let gov = GovernanceSet::new(config.masters.clone(), config.nodes.clone());
         Ok((state, block, gov))
@@ -421,6 +745,17 @@ impl ChainState {
     /// When `pegged_currencies` is non-empty, a new domain separator family (`v5`/`v6`) is used
     /// so that pre-pegged chains retain byte-identical roots.
     pub fn state_root(&self) -> Hash {
+        let base = self.base_state_root();
+        let auction = self.auction_root();
+        if auction.is_zero() {
+            base
+        } else {
+            hash_value(&("oxydome-auction-wrap-v1", base, auction))
+        }
+    }
+
+    /// The state root without the verification-credit auction commitment.
+    fn base_state_root(&self) -> Hash {
         if self.contracts.is_empty()
             && self.daos.is_empty()
             && self.ohm_states.is_empty()
@@ -799,9 +1134,112 @@ impl ChainState {
         }
     }
 
+    /// The verification-credit auction commitment.
+    ///
+    /// Commits to the credit balances, the registered auction targets, the pending bids and
+    /// the outstanding auction wins. Returns [`Hash::zero`] when no auction state exists, so
+    /// chains that never use the auction keep their original state root.
+    fn auction_root(&self) -> Hash {
+        if self.auction.credits.is_empty()
+            && self.auction.credit_last_activity.is_empty()
+            && self.auction.pending_bids.is_empty()
+            && self.auction.targets.is_empty()
+            && self.auction.winners.is_empty()
+        {
+            return Hash::zero();
+        }
+        hash_value(&("oxydome-auction-state-v1", &self.auction))
+    }
+
     /// Returns the GAS balance for `owner`.
     pub fn gas_balance(&self, owner: &PublicKey) -> Amount {
         self.gas.get(owner).map_or(0, |account| account.balance)
+    }
+
+    /// The verification-credit balance of a server node.
+    ///
+    /// Verification credits are a non-financial unit: they cannot be transferred and are
+    /// never part of the Ox supply. They are earned by participating in block verification
+    /// and are spent in the verification-credit auction.
+    pub fn verification_credit_balance(&self, node: &PublicKey) -> u64 {
+        self.auction.credit_balance(node)
+    }
+
+    /// Whether the execution of `txid` performed a liquidity-pool swap.
+    ///
+    /// The OVM emits a dedicated log for every pool swap, so a swap transaction is
+    /// recognisable from its receipt alone. The verification-credit auction only accepts
+    /// swaps.
+    pub fn receipt_performed_pool_swap(&self, txid: &Hash) -> bool {
+        receipt_performed_pool_swap_in(&self.ovm_receipts, txid)
+    }
+
+    /// Whether the transaction would perform a liquidity-pool swap.
+    ///
+    /// The OVM action is executed against a copy of the state so that the caller can tell
+    /// a swap from an ordinary transfer before the transaction is put in a block. This is
+    /// what the verification-credit auction uses to accept only swaps.
+    pub fn preview_is_pool_swap(
+        &self,
+        tx: &Transaction,
+        tx_index: usize,
+        params: &ChainParams,
+    ) -> bool {
+        let Some(action) = &tx.ovm_action else {
+            return false;
+        };
+        let mut preview = self.clone();
+        match preview.apply_ovm_action(action, tx.txid(), tx_index, tx, params) {
+            Ok(receipt) => receipt
+                .logs
+                .iter()
+                .any(|log| log.topic == oxydome_core::POOL_SWAP_LOG_TOPIC),
+            Err(_) => false,
+        }
+    }
+
+    /// Claims the auction award for `txid`, if the transaction belongs to a bundle that
+    /// was won at auction and is still inside its execution window.
+    ///
+    /// Returns the winning bundle and the winning node. The claim is consumed: a bundle's
+    /// transactions can only be executed once.
+    pub fn take_auction_award(
+        &mut self,
+        txid: &Hash,
+        height: u64,
+        gov: &GovernanceSet,
+    ) -> Option<(Hash, PublicKey)> {
+        self.auction.take_award(txid, height, gov)
+    }
+
+    /// Pays a node reward, converting the configured share of Ox into GAS fuel exactly
+    /// like the block-reward path does.
+    fn mint_reward(
+        &mut self,
+        outpoint: OutPoint,
+        amount: Amount,
+        recipient: PublicKey,
+        height: u64,
+        params: &ChainParams,
+    ) {
+        let convert = height >= params.gas_activation_height && params.gas_server_fee_bps > 0;
+        let (ox_kept, gas_minted) = if convert {
+            conversion_split_with_bps(amount, params.gas_server_fee_bps)
+        } else {
+            (amount, 0)
+        };
+        if ox_kept > 0 {
+            self.utxo = self.utxo.insert(UtxoEntry::new(
+                outpoint,
+                TxOutput::locked_reward(ox_kept, recipient),
+                height,
+            ));
+        }
+        if gas_minted > 0 {
+            // Burn the converted Ox and mint the GAS fuel to the same recipient.
+            self.supply = self.supply.saturating_sub(gas_minted);
+            self.mint_gas(recipient, gas_minted);
+        }
     }
 
     /// Computes the current GAS price from the pegged currency state for `PriceAsset::Gas`.
@@ -1115,6 +1553,17 @@ impl ChainState {
         let mut next = self.clone();
         next.ovm_receipts.clear();
 
+        // ---- Verification-credit expiry ----
+        // Credits that have not been earned or spent for `auction_credit_expiry_blocks`
+        // blocks (two auction windows by default) expire, keeping the auction competitive.
+        next.auction.expire_credits(new_height, params);
+
+        // ---- Lapsed auction rights ----
+        // A winning node may only execute its bundle within the execution window that
+        // followed the clearing. Once the window closes the right lapses and the bundle
+        // becomes available for the next auction.
+        next.auction.expire_wins(new_height);
+
         // ---- Coin-toss: verify seed, ordered root and position hashes ----
         let coin_toss_active =
             new_height >= params.coin_toss_activation_height;
@@ -1179,6 +1628,12 @@ impl ChainState {
         } else {
             block.transactions.clone()
         };
+
+        // Verification-credit auction awards collected while applying the transactions:
+        // (bundle id, transaction id, winning node, fee paid to the winner).
+        let mut auction_awards: Vec<(Hash, Hash, PublicKey, Amount)> = Vec::new();
+        // The auction payouts that were actually applied: (transaction id, fee).
+        let mut paid_auction_awards: Vec<(Hash, Amount)> = Vec::new();
 
         for (tx_idx, tx) in exec_txs.iter().enumerate() {
             tx.validate_structure()
@@ -1310,14 +1765,27 @@ impl ChainState {
                     let receipt = next.apply_ovm_action(action, tx.txid(), tx_idx, tx, params)?;
                     next.ovm_receipts.push(receipt);
                 }
-                total_fees = total_fees.checked_add(tx.fee).ok_or_else(|| {
-                    StateError::BadTransaction(tx_idx, "block fee total overflows".into())
-                })?;
-            } else {
-                total_fees = total_fees.checked_add(tx.fee).ok_or_else(|| {
-                    StateError::BadTransaction(tx_idx, "block fee total overflows".into())
-                })?;
             }
+
+            // Verification-credit auction: a swap bundle that was won at auction is
+            // executed by the winning node, which collects 100% of the transaction's
+            // fees instead of the normal master/server split. Only a transaction that
+            // really performed a liquidity-pool swap qualifies.
+            let auction_winner = if next.receipt_performed_pool_swap(&tx.txid()) {
+                next.take_auction_award(&tx.txid(), new_height, gov)
+            } else {
+                None
+            };
+            let normal_fee = match auction_winner {
+                Some((target, winner)) => {
+                    auction_awards.push((target, tx.txid(), winner, tx.fee));
+                    0
+                }
+                None => tx.fee,
+            };
+            total_fees = total_fees.checked_add(normal_fee).ok_or_else(|| {
+                StateError::BadTransaction(tx_idx, "block fee total overflows".into())
+            })?;
 
             // Per-transaction Speedometer stabilization: mint a small fraction of the tx value
             // and distribute to active liquidity pool owners proportionally to their pool's share
@@ -1334,6 +1802,12 @@ impl ChainState {
                 }
             }
         }
+
+        // ---- Verification-credit auction payouts ----
+        // The winner collects 100% of the fees of the transaction it executed, paid
+        // exactly like a server-node reward (including the Ox -> GAS conversion). The
+        // payout itself is carried by an `AuctionPayout` operation, which is matched
+        // against the award derived above.
         if enforce_header && next.ovm_receipts != block.ovm_receipts {
             return Err(StateError::OvmReceiptMismatch);
         }
@@ -1598,6 +2072,41 @@ impl ChainState {
                 Operation::LiquidityPool(lp_op) => {
                     apply_liquidity_pool_operation(&mut next, lp_op, op, new_height, params, gov)?;
                 }
+                Operation::AuctionTarget(target_op) => {
+                    next.auction.register_target(target_op, op, new_height)?;
+                }
+                Operation::AuctionPayout(payout) => {
+                    // The payout must match an award derived while applying the
+                    // transactions of this block: the bundle, the transaction, the
+                    // winning node and the fee.
+                    let award = auction_awards.iter().find(|(_, txid, _, _)| {
+                        *txid == payout.txid
+                    });
+                    let Some((target, txid, winner, fee)) = award else {
+                        return Err(StateError::AuctionPayoutUnknown(payout.txid));
+                    };
+                    if *target != payout.target
+                        || *winner != payout.winner
+                        || *fee != payout.amount
+                    {
+                        return Err(StateError::AuctionPayoutMismatch(payout.txid));
+                    }
+                    if paid_auction_awards.iter().any(|(txid, _)| *txid == payout.txid) {
+                        return Err(StateError::DuplicateOperation);
+                    }
+                    paid_auction_awards.push((payout.txid, *fee));
+                    if payout.amount > 0 {
+                        let outpoint = OutPoint::new(auction_reward_outpoint(&payout.txid), 0);
+                        next.mint_reward(outpoint, payout.amount, payout.winner, new_height, params);
+                    }
+                }
+                Operation::AuctionBid(bid) => {
+                    // Only admitted server nodes may bid.
+                    if !gov.contains_node(&bid.bidder) {
+                        return Err(StateError::UnauthorizedProducer(bid.bidder));
+                    }
+                    next.auction.escrow_bid(bid, op, new_height, params)?;
+                }
                 Operation::Speedometer(speedometer_op) => {
                     apply_speedometer_operation(&mut next, speedometer_op, op, new_height, params)?;
                 }
@@ -1752,16 +2261,18 @@ impl ChainState {
             let mut updated: BTreeMap<Hash, LiquidityPoolState> = BTreeMap::new();
             for (id, state) in next.liquidity_pools.iter() {
                 let mut cloned = state.clone();
-                let (upper_bound, lower_bound) = if let Some(asset) = cloned.other_asset() {
-                    next.pegged_currencies
-                        .values()
-                        .find(|pc| pc.config.asset == asset)
-                        .map_or((1u128, 1u128), |pc| {
-                            (pc.bounds.upper_bound, pc.bounds.lower_bound)
-                        })
-                } else {
-                    (1u128, 1u128)
-                };
+                let (upper_bound, lower_bound): (u128, u128) =
+                    if let Some(asset) = cloned.other_asset() {
+                        next.pegged_currencies
+                            .values()
+                            .find(|pc| pc.config.asset == asset)
+                            .map_or((FP as u128, FP as u128), |pc| {
+                                (pc.bounds.upper_bound, pc.bounds.lower_bound)
+                            })
+                    } else {
+                        // The bounds are fixed-point values: 1.0 is `FP`, not 1.
+                        (FP as u128, FP as u128)
+                    };
                 cloned.k = compute_pool_k(
                     upper_bound,
                     lower_bound,
@@ -1785,6 +2296,20 @@ impl ChainState {
                 output.kind = oxydome_core::tx::OutputKind::Spendable;
                 output.rebound_gen = Some(transition.generation);
                 next.utxo = ledger.insert(UtxoEntry::new(outpoint, output, new_height));
+            }
+        }
+
+        // ---- 5a. Verification-credit auction clearing ----
+        // Every `auction_interval_blocks` the pending bids are settled: the highest bid
+        // on a bundle wins the right to execute it in the very next block and to collect
+        // 100% of its fees. Every other bid is refunded.
+        next.auction.clear(new_height, params);
+
+        // Every auctioned transaction that was executed in this block must have been
+        // paid out through an `AuctionPayout` operation.
+        for (_, txid, _, _) in &auction_awards {
+            if !paid_auction_awards.iter().any(|(paid, _)| paid == txid) {
+                return Err(StateError::AuctionPayoutMissing(*txid));
             }
         }
 
@@ -2103,7 +2628,14 @@ fn apply_block_rewards(
         }
     }
 
-    let op_id = Operation::BlockRewards(r.clone()).id();
+    // The reward outputs are addressed by the operation **and** the height: two blocks
+    // that carry the same distribution would otherwise share their outpoints and the
+    // second one would overwrite the first.
+    let op_id = hash_value(&(
+        "oxydome-block-rewards-v1",
+        &Operation::BlockRewards(r.clone()).id(),
+        &height,
+    ));
     let convert = height >= params.gas_activation_height && params.gas_server_fee_bps > 0;
     let mut out_idx = 0u32;
 
@@ -2126,6 +2658,14 @@ fn apply_block_rewards(
             next.mint_gas(output.recipient, gas_minted);
         }
         out_idx += 1;
+    }
+
+    // Verification credits: server nodes participating in block rewards earn
+    // (non-financial) credits for the work they did verifying this block. Credits are
+    // non-transferable and are spent in the verification-credit auction.
+    for output in &r.server_outputs {
+        next.auction
+            .earn(&output.recipient, params.verification_credit_per_block, height);
     }
 
     // Apply master rewards
@@ -2160,6 +2700,31 @@ fn apply_block_rewards(
     Ok(())
 }
 
+/// Whether the receipts contain a liquidity-pool swap for `txid`.
+///
+/// The OVM emits a dedicated log for every pool swap, so a swap transaction is
+/// recognisable from its receipt alone. The verification-credit auction only accepts
+/// swaps.
+pub fn receipt_performed_pool_swap_in(receipts: &[OvmReceipt], txid: &Hash) -> bool {
+    receipts
+        .iter()
+        .filter(|receipt| receipt.txid == *txid)
+        .any(|receipt| {
+            receipt
+                .logs
+                .iter()
+                .any(|log| log.topic == oxydome_core::POOL_SWAP_LOG_TOPIC)
+        })
+}
+
+/// The outpoint under which the auction winner's fee reward is recorded.
+///
+/// Derived from the executed transaction id so that it can never collide with a
+/// transaction output (which is indexed from zero) and is identical on every node.
+pub fn auction_reward_outpoint(txid: &Hash) -> Hash {
+    oxydome_crypto::hash_value(&("oxydome-auction-reward-v1", txid))
+}
+
 fn apply_rewards(
     next: &mut ChainState,
     r: &RewardDistribution,
@@ -2186,7 +2751,14 @@ fn apply_rewards(
             return Err(StateError::BadRewardRecipient(output.recipient));
         }
     }
-    let op_id = Operation::Rewards(r.clone()).id();
+    // The reward outputs are addressed by the operation **and** the height: two blocks
+    // that collect the same fees would otherwise share their outpoints and the second
+    // one would overwrite the first.
+    let op_id = hash_value(&(
+        "oxydome-fee-rewards-v1",
+        &Operation::Rewards(r.clone()).id(),
+        &height,
+    ));
     let convert = height >= params.gas_activation_height && params.gas_server_fee_bps > 0;
     let mut out_idx = 0u32;
     for output in &r.master_outputs {
@@ -4185,7 +4757,15 @@ fn apply_liquidity_pool_operation(
     if !verify(&lp_op.actor, &op.proposal_id().0, &lp_op.signature) {
         return Err(StateError::BadPoolSignature);
     }
-    let pool_id = op.id();
+    // A pool is addressed by its owner and currency set, so every operation on the pool
+    // resolves to the same entry.
+    let pool_currencies: Vec<PriceAsset> = match &lp_op.action {
+        LiquidityPoolAction::Create { currencies } => currencies.clone(),
+        LiquidityPoolAction::Provide { amounts }
+        | LiquidityPoolAction::RemoveLiquidity { amounts } => amounts.keys().copied().collect(),
+        LiquidityPoolAction::Swap { currencies, .. } => currencies.clone(),
+    };
+    let pool_id = oxydome_core::liquidity_pool_id(&lp_op.actor, &pool_currencies);
     match &lp_op.action {
         LiquidityPoolAction::Create { currencies } => {
             if next.liquidity_pools.contains_key(&pool_id) {
@@ -4255,6 +4835,7 @@ fn apply_liquidity_pool_operation(
             pool.volume = pool.volume.saturating_sub(pool.volume.min(removed));
         }
         LiquidityPoolAction::Swap {
+            currencies: _,
             input_asset,
             input_amount,
             min_output,

@@ -344,6 +344,14 @@ impl MvmsConfig {
             audit_checkpoint_blocks: 100,
             departure_take_bps: None,
 
+            // verification-credit auction
+            auction_interval_blocks: 4,
+            auction_credit_expiry_blocks: 8,
+            auction_min_bid: 1,
+            auction_max_bid: 1_000,
+            verification_credit_per_block: 1,
+            auction_execution_deadline_blocks: 1,
+
             // OVM activation
             ovm_activation_height: 1,
             smart_contract_activation_height: u64::MAX,

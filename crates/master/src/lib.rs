@@ -76,6 +76,11 @@ pub struct HeaderChain {
     pub ox_price: Amount,
     /// Last height at which the GAS price was updated.
     pub price_last_update_height: u64,
+    /// The verification-credit auction state, tracked from the block bodies.
+    ///
+    /// Masters keep this so that they can re-derive the auction outcome and audit the
+    /// payout of an auctioned transaction's fee without holding the UTXO set.
+    pub auction: oxydome_state::AuctionState,
 }
 
 impl HeaderChain {
@@ -94,6 +99,7 @@ impl HeaderChain {
             prev_server_block_reward: None,
             ox_price: params.ox_price_reference,
             price_last_update_height: 0,
+            auction: oxydome_state::AuctionState::default(),
         }
     }
 
@@ -119,7 +125,26 @@ impl HeaderChain {
     }
 
     /// Records a finalized block header.
-    pub fn append(&mut self, block: &Block, params: &ChainParams) -> Result<(), String> {
+    pub fn append(
+        &mut self,
+        block: &Block,
+        params: &ChainParams,
+        gov: &GovernanceSet,
+    ) -> Result<(), String> {
+        // The master's auction state follows the state machine exactly: credits expire,
+        // lapsed execution rights drop, the executed transactions consume their award,
+        // the operations are applied in block order and the auction clears at the end of
+        // the window.
+        let height = block.header.height;
+        self.auction.expire_credits(height, params);
+        self.auction.expire_wins(height);
+        for tx in &block.transactions {
+            // Consume the award of an auctioned transaction exactly like the state machine:
+            // only a transaction that really performed a pool swap qualifies.
+            if oxydome_state::receipt_performed_pool_swap_in(&block.ovm_receipts, &tx.txid()) {
+                self.auction.take_award(&tx.txid(), height, gov);
+            }
+        }
         // An epoch change is effectuated by a governance-co-signed `EpochTransition`, never by
         // a self-declared header field. Rejecting it here (and in `MasterNode::audit`) stops a
         // proposer from resetting the per-epoch mint/burn/withdraw caps by bumping the header.
@@ -158,6 +183,15 @@ impl HeaderChain {
                     // tracking it, `header_audit` would derive a different master-reward total
                     // than the proposer and reject every reward-bearing block.
                     self.prev_server_block_reward = Some(r.server_total());
+                    // Server nodes that took part in verifying this block earn
+                    // (non-financial) verification credits, exactly like in the state machine.
+                    for output in &r.server_outputs {
+                        self.auction.earn(
+                            &output.recipient,
+                            params.verification_credit_per_block,
+                            height,
+                        );
+                    }
                 }
                 oxydome_core::Operation::Gas(g) => {
                     if let oxydome_core::GasAction::SetOxPrice { price } = &g.action {
@@ -181,8 +215,21 @@ impl HeaderChain {
                 oxydome_core::Operation::DepartureEarnings(_) => {}
                 oxydome_core::Operation::ExpressBusDeposit(_) => {}
                 oxydome_core::Operation::ExpressBusWithdraw(_) => {}
+                oxydome_core::Operation::AuctionTarget(target_op) => {
+                    self.auction
+                        .register_target(target_op, op, height)
+                        .map_err(|error| error.to_string())?;
+                }
+                oxydome_core::Operation::AuctionBid(bid) => {
+                    self.auction
+                        .escrow_bid(bid, op, height, params)
+                        .map_err(|error| error.to_string())?;
+                }
+                oxydome_core::Operation::AuctionPayout(_) => {}
             }
         }
+        // The auction clears at the end of every window, exactly like in the state machine.
+        self.auction.clear(height, params);
         self.supply = block.header.supply;
         self.value_index = block.header.value_index;
         self.generation = block.header.generation;
@@ -272,6 +319,7 @@ impl MasterNode {
             prev_server_block_reward: self.chain.prev_server_block_reward,
             ox_price: self.chain.ox_price,
             price_last_update_height: self.chain.price_last_update_height,
+            auction: &self.chain.auction,
             gov: &self.gov,
             params: &self.params,
         };
@@ -317,7 +365,7 @@ impl MasterNode {
         ) {
             return Err("finalized block lacks a valid master-check quorum".into());
         }
-        self.chain.append(block, &self.params)?;
+        self.chain.append(block, &self.params, &self.gov)?;
         Ok(())
     }
 
@@ -426,7 +474,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        master.chain.append(&block, &params).unwrap();
+        master.chain.append(&block, &params, &gov).unwrap();
         assert_eq!(master.chain.prev_server_block_reward, Some(42));
 
         // The baseline rolls forward to the next reward-bearing block so `header_audit` can
@@ -448,7 +496,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        master.chain.append(&block2, &params).unwrap();
+        master.chain.append(&block2, &params, &gov).unwrap();
         assert_eq!(master.chain.prev_server_block_reward, Some(88));
     }
 
@@ -459,7 +507,7 @@ mod tests {
             .build_block(&gov, &params, Vec::new(), Vec::new(), node_key.public(), 1, None)
             .unwrap();
         block.header.epoch = block.header.epoch + 1;
-        assert!(master.chain.append(&block, &params).is_err());
+        assert!(master.chain.append(&block, &params, &gov).is_err());
         assert_eq!(master.chain.epoch_minted, 0);
     }
 }

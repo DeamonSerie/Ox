@@ -226,6 +226,54 @@ async fn handle_connection(
                     error,
                 })
             }
+            Message::AuctionTarget {
+                target,
+                swaps,
+                intent,
+                registrar,
+                transactions,
+            } => {
+                // The swap transactions are stored in the node's private auction pool; they
+                // never enter the public mempool, so a sandwicher cannot get in front of
+                // the trade.
+                let swaps: Vec<Transaction> =
+                    transactions.into_iter().map(|tx| *tx).collect();
+                let result = node.lock().unwrap().accept_auction_target(
+                    target,
+                    swaps,
+                    intent,
+                    registrar,
+                );
+                let (accepted, error) = match result {
+                    Ok(()) => (true, None),
+                    Err(error) => (false, Some(error.to_string())),
+                };
+                Some(Message::AuctionTargetResponse {
+                    target,
+                    accepted,
+                    error,
+                })
+            }
+            Message::AuctionBid { bid } => {
+                let target = bid.target;
+                let result = node.lock().unwrap().accept_auction_bid(*bid);
+                let (accepted, error) = match result {
+                    Ok(()) => (true, None),
+                    Err(error) => (false, Some(error.to_string())),
+                };
+                Some(Message::AuctionBidResponse {
+                    target,
+                    accepted,
+                    error,
+                })
+            }
+            Message::GetVerificationCredits { node: owner } => {
+                let credits = node.lock().unwrap().state.verification_credit_balance(&owner);
+                Some(Message::VerificationCreditsResponse {
+                    node: owner,
+                    credits,
+                })
+            }
             Message::GetDao { dao_id } => {
                 let state = node.lock().unwrap().state.daos.get(&dao_id).cloned();
                 Some(Message::DaoResponse { dao_id, state })

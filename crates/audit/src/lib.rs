@@ -255,6 +255,12 @@ pub struct HeaderAuditContext<'a> {
     pub prev_server_block_reward: Option<Amount>,
     pub ox_price: Amount,
     pub price_last_update_height: u64,
+    /// The master's verification-credit auction state as of the previous block.
+    ///
+    /// It holds the outstanding auction wins, so a master can verify that an
+    /// `AuctionPayout` operation pays the fee of an auctioned transaction to the node
+    /// that actually won the bundle.
+    pub auction: &'a oxydome_state::AuctionState,
     pub gov: &'a GovernanceSet,
     pub params: &'a ChainParams,
 }
@@ -353,6 +359,17 @@ pub fn header_audit(
     let mut epoch_minted = ctx.epoch_minted;
     let mut epoch_burned = ctx.epoch_burned;
     let mut epoch_withdrawn = ctx.epoch_withdrawn;
+    // The total fees that were paid out through the verification-credit auction instead
+    // of the normal master/server split. The state machine applies the reward operation
+    // before the governance operations, so the total is computed up front.
+    let auction_payout_total: Amount = block
+        .operations
+        .iter()
+        .filter_map(|op| match op {
+            Operation::AuctionPayout(payout) => Some(payout.amount),
+            _ => None,
+        })
+        .fold(0u128, |a, b| a.saturating_add(b));
     for op in &block.operations {
         match op {
             Operation::Mint(m) => {
@@ -375,7 +392,23 @@ pub fn header_audit(
                 }
                 epoch_withdrawn = epoch_withdrawn.saturating_add(w.amount);
             }
-            Operation::Rewards(_) => {}
+            Operation::Rewards(r) => {
+                // The fee split must cover exactly the fees that were not paid out
+                // through the verification-credit auction.
+                let block_fees: Amount = block
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.fee)
+                    .fold(0u128, |a, b| a.saturating_add(b));
+                let expected = block_fees.saturating_sub(auction_payout_total);
+                if r.total() != expected {
+                    return Err(AuditError::Guardrail(format!(
+                        "reward distribution total {} does not match the block fees {}",
+                        r.total(),
+                        expected
+                    )));
+                }
+            }
             Operation::BlockRewards(r) => {
                 // Verify minted block rewards match calculated expectations
                 let server_rewards = calculate_server_block_rewards(
@@ -549,6 +582,65 @@ pub fn header_audit(
             }
             Operation::ExpressBusWithdraw(_) => {
                 // Node-approved; state machine enforces thresholds and owner identity.
+            }
+            Operation::AuctionBid(bid) => {
+                if !verify(&bid.bidder, &op.proposal_id().0, &bid.signature) {
+                    return Err(AuditError::Guardrail(
+                        "auction bid signature is invalid".into(),
+                    ));
+                }
+            }
+            Operation::AuctionTarget(target_op) => {
+                if !verify(
+                    &target_op.registrar,
+                    &op.proposal_id().0,
+                    &target_op.signature,
+                ) {
+                    return Err(AuditError::Guardrail(
+                        "auction target signature is invalid".into(),
+                    ));
+                }
+            }
+            Operation::AuctionPayout(payout) => {
+                // The payout must pay the node that won the bundle, for a transaction the
+                // bundle contains, and for exactly that transaction's fee.
+                let win = ctx.auction.winners.get(&payout.target).ok_or_else(|| {
+                    AuditError::Guardrail(format!(
+                        "auction payout names bundle {:?} which was not won",
+                        payout.target
+                    ))
+                })?;
+                if win.winner != payout.winner {
+                    return Err(AuditError::Guardrail(
+                        "auction payout names a winner that did not win the bundle".into(),
+                    ));
+                }
+                if !win.swaps.contains(&payout.txid) {
+                    return Err(AuditError::Guardrail(
+                        "auction payout names a transaction outside the bundle".into(),
+                    ));
+                }
+                if !ctx.gov.contains_node(&payout.winner) {
+                    return Err(AuditError::Guardrail(
+                        "auction payout winner is not a server node".into(),
+                    ));
+                }
+                let fee = block
+                    .transactions
+                    .iter()
+                    .find(|tx| tx.txid() == payout.txid)
+                    .map(|tx| tx.fee)
+                    .ok_or_else(|| {
+                        AuditError::Guardrail(
+                            "auction payout names a transaction that is not in the block".into(),
+                        )
+                    })?;
+                if fee != payout.amount {
+                    return Err(AuditError::Guardrail(format!(
+                        "auction payout amount {} does not match the transaction fee {}",
+                        payout.amount, fee
+                    )));
+                }
             }
         }
     }

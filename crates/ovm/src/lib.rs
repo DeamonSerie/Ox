@@ -505,6 +505,12 @@ pub struct Log {
     pub value: u64,
 }
 
+/// The log topic emitted when a contract performs a liquidity-pool swap.
+///
+/// The verification-credit auction uses it to recognise swap transactions: only a
+/// transaction whose execution produced this log can be auctioned.
+pub const POOL_SWAP_LOG_TOPIC: u32 = 0x504F_4F4C;
+
 /// A cross-OHM message staged by a contract via the `XCall` instruction.
 ///
 /// The executing ledger assigns each call a message id in execution order (its own outbox
@@ -1469,8 +1475,10 @@ mod tests {
             argument_count: 0,
             local_count: 0,
             instructions: vec![
-                Instruction::Push(1),
+                // The pool id is pushed first, the input amount on top: `PoolSwap` pops
+                // the input amount and then the pool id.
                 Instruction::Push(pool_id),
+                Instruction::Push(1),
                 Instruction::PoolSwap,
                 Instruction::Return,
             ],

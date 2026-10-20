@@ -195,6 +195,24 @@ pub fn scale_to_u64(price: u128) -> u64 {
     (price / PRICE_SCALE_DIVISOR) as u64
 }
 
+impl LiquidityPoolConfig {
+    /// The canonical identifier of the pool.
+    ///
+    /// A pool is addressed by its owner and its currency set, so every operation on the
+    /// pool (create, provide, remove, swap) resolves to the same entry.
+    pub fn pool_id(&self) -> Hash {
+        liquidity_pool_id(&self.owner, &self.currencies)
+    }
+}
+
+/// The canonical identifier of a liquidity pool owned by `owner` over `currencies`.
+pub fn liquidity_pool_id(owner: &oxydome_crypto::PublicKey, currencies: &[PriceAsset]) -> Hash {
+    let mut currencies = currencies.to_vec();
+    currencies.sort();
+    currencies.dedup();
+    hash_value(&("oxydome-liquidity-pool-v1", owner, &currencies))
+}
+
 /// Pegged currency configuration, set at Solid compile time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeggedCurrencyConfig {
